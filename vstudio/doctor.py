@@ -201,9 +201,7 @@ def check_fonts():
     detail = "%d font faces; caption fonts: %s" % (len(faces), ", ".join(have) if have else "none of the recommended")
     if missing:
         detail += "; missing " + ", ".join(missing)
-    try:
-        import fontTools  # noqa: F401 - only its presence matters
-    except ImportError:
+    if importlib.util.find_spec("fontTools") is None:
         # libass ignores variable fonts (Google ships Montserrat as one): without fontTools captions use the
         # closest static font instead of the exact one
         detail += "; for exact variable-font captions: python -m pip install fonttools"

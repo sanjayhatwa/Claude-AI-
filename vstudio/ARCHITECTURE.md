@@ -154,6 +154,8 @@ transitions; the producer overlaps layers by the duration). `whip-*` = fast
 slide with horizontal motion blur. `glitch` = RGB split + offset jitter.
 Enter/exit animations multiply with `animate` values (scale, opacity) and
 add to them (x, y, rotation).
+`animate` keyframes are absolute values of the property (an `x` key of 540
+means x = 540 px); the static field applies only to a property without keys.
 
 ### `video`
 
@@ -210,7 +212,8 @@ add to them (x, y, rotation).
 with thickness `h`. `ring` is a circle outline (`stroke.width` thickness).
 `draw`: `{"from": 0, "to": 1, "ease": "out-cubic"}` progressively reveals the
 shape over the enter duration (left→right for rect/line, clockwise for
-circle/ring).
+circle/ring), from `enter.delay`, whatever the enter type (`"none"` draws
+without also fading in). A stroke with a transparent `color` is an outline.
 
 ### `progress`
 
@@ -258,7 +261,9 @@ Burned last, with libass, through `captions.build_ass` (existing skill).
 case, fill, highlight, outline, outline_pct, box, words_per_card, lines_per_card,
 align, font_candidates, font_look`), else `style_dna` path, else
 `captions.DEFAULT_CAPTION`. `font` overrides the font; `pop` adds the
-bounce-in.
+bounce-in. Across a silence longer than 0.6 s a card ends 0.4 s after its
+last word (it never lingers into a stretch without words), and trailing
+`. , ; :` are dropped on screen (words keep them, `chunk` ends cards on them).
 
 ### `audio`
 
@@ -393,7 +398,7 @@ def mixdown(spec, video_duration, out_wav, base_dir=None, workdir=None) -> str |
 
 ### templates.py
 ```python
-CATALOG: dict[str, dict]   # name -> {"description", "params": {p: {"type","default","doc"}}, "fn"}
+CATALOG: dict[str, dict]   # name -> {"description", "category", "params": {p: {"type","default","doc"[, "choices"]}}, "fn"}
 DEFAULT_STYLE = {"font": "Montserrat Black", "font_secondary": "Inter Bold", "text": "#FFFFFF",
                  "accent": "#FFE500", "bg": "#0E0E12", "bg2": "#1B1B24", "energy": "high"}
 def build(name, params, start, end, canvas, style=None) -> list[dict]   # layer dicts valid per timeline spec
@@ -477,6 +482,9 @@ def main(argv=None) -> int
 ```
 Writes `DIR/BRIEF.md`, `DIR/plan.json`, `DIR/spec.json`, `DIR/reel.mp4`,
 `DIR/QA.md` (output re-extracted and compared to the reference DNA).
+Compiled specs carry `meta.beats` (beat times and lines) and
+`meta.spoken_words` (every spoken word, also where a graphic shows the line
+instead of a caption); QA measures pace on the latter.
 
 ### jobs.py / server.py
 ```python
