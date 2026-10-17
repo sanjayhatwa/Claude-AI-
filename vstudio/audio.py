@@ -129,8 +129,8 @@ def _chain(i, src):
 def _mix(labels, out_label):
     if len(labels) == 1:
         return "%sanull[%s]" % (labels[0], out_label)
-    return "%samix=inputs=%d:normalize=0:duration=longest:dropout_transition=0[%s]" % ("".join(labels), len(labels),
-                                                                                     out_label)
+    return "%samix=inputs=%d:normalize=0:duration=longest:dropout_transition=0[%s]" % (
+        "".join(labels), len(labels), out_label)
 
 
 def build_graph(srcs, D):
@@ -143,10 +143,11 @@ def build_graph(srcs, D):
             args += ["-ss", "%.6f" % s["in"]]
         args += ["-i", s["path"]]
         chains.append(_chain(i, s))
-    key = ["[s%d]" % i for i, s in enumerate(srcs) if s["role"] in ("voice", "clip")]
-    ducked = ["[s%d]" % i for i, s in enumerate(srcs) if s["role"] == "music" and s["duck"]]
-    rest = ["[s%d]" % i for i, s in enumerate(srcs) if not (s["role"] in ("voice", "clip")
-                                                           or (s["role"] == "music" and s["duck"]))]
+    is_key = [s["role"] in ("voice", "clip") for s in srcs]           # what music ducks under
+    is_ducked = [s["role"] == "music" and s["duck"] for s in srcs]
+    key = ["[s%d]" % i for i in range(len(srcs)) if is_key[i]]
+    ducked = ["[s%d]" % i for i in range(len(srcs)) if is_ducked[i]]
+    rest = ["[s%d]" % i for i in range(len(srcs)) if not (is_key[i] or is_ducked[i])]
     final = list(rest)
     if ducked and key:
         chains.append(_mix(key, "keymix"))

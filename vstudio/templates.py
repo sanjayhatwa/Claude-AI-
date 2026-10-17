@@ -34,16 +34,24 @@ How the designs are made
     energy high = snappy overshoot, stamps, drift and pulses; medium =
     smooth slides with a light overshoot; calm = fades and soft blur-ins,
     no overshoot and no idle motion.
+  * Cards and lists sit in a centred column (at most ~1100 design px wide)
+    so on 16:9 they read as a block instead of stretching edge to edge.
   * Cards made of several layers move as one rigid group: their scale pop
     is written as matching scale + x/y keyframes about one pivot, so parts
-    never drift apart mid-animation.
+    never drift apart mid-animation. Inside templates x/y keyframes are
+    offsets; _Ctx.add turns them into the absolute positions the spec uses.
   * Icons are polygons in a 0..1 box (ICONS), not emoji, so they render the
     same on every machine.
+  * Sloppy input is safe: params are coerced to their declared types, bad
+    values fall back to defaults, blank text never becomes a layer, and a
+    template whose essential params are all blank draws nothing (_REQUIRES)
+    instead of an empty card or placeholder words.
 
-Limits: text heights are estimates (the renderer wraps and measures the
-final glyphs), so stacked layouts leave a little slack; templates draw
-nothing from the footage itself (highlight_box, arrow and callout take the
-target position as a fraction of the frame from the caller).
+Limits: text heights follow textrender's cap-to-baseline box but are still
+estimates, so stacked layouts leave a little slack; templates know nothing
+about the footage (highlight_box, arrow and callout take the target as a
+fraction of the frame from the caller); image_card reads the image's
+aspect from the file when it can, relative to the current folder.
 """
 
 import argparse
@@ -51,8 +59,10 @@ import copy
 import json
 import math
 import os
+import random
 import re
 import sys
+import zlib
 
 DEFAULT_STYLE = {"font": "Montserrat Black", "font_secondary": "Inter Bold", "text": "#FFFFFF",
                  "accent": "#FFE500", "bg": "#0E0E12", "bg2": "#1B1B24", "energy": "high"}
@@ -763,6 +773,9 @@ class _Ctx:
         return lay
 
     def text(self, part, blk, x, y, anchor="center", color=None, font=None, align="center", **kw):
+        """A text layer from a fitted block (nothing at all when the text is blank)."""
+        if not blk.text.strip():
+            return None
         fields = {"text": blk.text, "font": font or blk.font, "size": blk.size,
                   "color": color or self.s["text"], "case": blk.case, "max_width": blk.mw,
                   "align": align, "line_spacing": blk.ls, "x": x, "y": y, "anchor": anchor}
@@ -1069,6 +1082,25 @@ def _highlight_idx(text, targets, case):
     return sorted(out)
 
 
+# The params a template cannot do without: when all of them are blank (or empty
+# lists) the template draws nothing rather than an empty card or a placeholder.
+_REQUIRES = {
+    "hook_title": ["text"], "title_card": ["title"], "chapter_marker": ["number", "title"], "question": ["text"],
+    "alert_banner": ["text"], "kinetic_text": ["text"], "emphasis_word": ["word"], "word_stack": ["words"],
+    "underline_reveal": ["text"], "quote": ["text"], "stat": ["value"], "bar_chart": ["values"],
+    "price_tag": ["price"], "big_number_bg": ["number"], "list_item": ["text"], "checklist": ["items"],
+    "ranking": ["items"], "timeline_steps": ["steps"], "step_number": ["text", "label"], "pros_cons": ["pros", "cons"],
+    "versus": ["left", "right"], "myth_vs_fact": ["myth", "fact"], "comment_bubble": ["text"],
+    "post_card": ["text"], "notification_pop": ["title", "text"], "text_message": ["messages"],
+    "search_bar": ["query"], "poll": ["question", "options"], "callout": ["text"], "cta": ["text"],
+    "subscribe": ["text"], "lower_third": ["name"], "source_card": ["title"], "location_tag": ["place"],
+}
+
+
+def _blank(v):
+    return (isinstance(v, str) and not v.strip()) or (isinstance(v, list) and not any(str(x).strip() for x in v))
+
+
 def build(name, params=None, start=0.0, end=3.0, canvas=None, style=None):
     """Layer dicts (timeline spec v1) for one template call inside [start, end] on `canvas`.
 
@@ -1086,7 +1118,10 @@ def build(name, params=None, start=0.0, end=3.0, canvas=None, style=None):
     st = _resolve_style(style)
     prof = _ENERGY[st["energy"]]
     ctx = _Ctx(name, _Frame(canvas), _Clock(start, end, prof), st, prof, st["energy"])
-    entry["fn"](ctx, _resolve_params(entry, params or {}))
+    p = _resolve_params(entry, params or {})
+    if name in _REQUIRES and all(_blank(p[k]) for k in _REQUIRES[name]):
+        return []
+    entry["fn"](ctx, p)
     return ctx.layers
 
 
@@ -1250,9 +1285,9 @@ def _chapter_marker(c, p):
     npad, nh = _pill(c, num, (18, 14))
     tpad, th = _pill(c, title, (22, 14))
     tpad[1] = _r(max(0, (nh - title.h) / 2))
-    nw = num.w + 2 * npad[0]
-    tw = title.w + 2 * tpad[0]
-    gap = f.d(10)
+    nw = num.w + 2 * npad[0] if num.text else 0.0
+    tw = title.w + 2 * tpad[0] if title.text else 0.0
+    gap = f.d(10) if nw and tw else 0.0
     total = nw + gap + tw
     if p["corner"] == "top-right":
         x0 = f.R - total
@@ -1464,7 +1499,7 @@ def _emphasis_word(c, p):
 )
 def _word_stack(c, p):
     f, s, acc = c.f, c.s, c.s["accent"]
-    lines = [w for w in p["words"] if w.strip()][:7] or ["STOP"]
+    lines = [w for w in p["words"] if w.strip()][:7]
     width = f.SW * 0.92
     hl = set(_highlight_idx(" ".join(x.replace(" ", "_") for x in lines),
                             [h if isinstance(h, int) else str(h).replace(" ", "_") for h in p["highlight"]], p["case"]))
@@ -1638,14 +1673,14 @@ def _counter_reveal(c, p):
     num = c.fit(p["prefix"] + longest + p["suffix"], f.d(230), f.SW * 0.94, lines=1, min_size=f.d(80))
     lab = c.body(p["label"], f.d(50), f.SW * 0.86, lines=2, min_size=f.d(34)) if p["label"] else None
     life = c.clk.dur
-    cd = p["duration"] or {"high": 1.3, "medium": 1.7, "calm": 2.2}[c.energy]
-    cd = max(0.3, min(cd, life * 0.62))
+    cd = p["duration"] if p["duration"] > 0 else {"high": 1.3, "medium": 1.7, "calm": 2.2}[c.energy]
+    cd = max(min(0.3, life * 0.5), min(cd, life * 0.62))
     bar_w, bar_h, gap = min(f.d(560), f.SW * 0.7), f.d(14), f.d(34)
     total = num.h + gap + bar_h + ((gap + lab.h) if lab else 0)
     y = f.place(p["position"], total) + num.h
     ease = c.prof["count_ease"]
     keys = [[0, 0.85], [c.clk.din, 1.0, "out-cubic"]]
-    if c.prof["over"] > 0 and cd + 0.35 < life - c.clk.dout:
+    if c.prof["over"] > 0 and cd > c.clk.din and cd + 0.35 < life - c.clk.dout:   # a punch when the count lands
         keys += [[cd, 1.0], [cd + 0.09, 1.1, "out-quad"], [cd + 0.32, 1.0, "out-back"]]
     c.counter("number", num, f.CX, y, p["from"], p["value"], dec, p["prefix"], p["suffix"], p["separator"], cd, ease,
               anchor="bottom", color=col, shadow=c.text_shadow(), enter=("fade", c.clk.din * 0.5),
@@ -1673,6 +1708,7 @@ def _percent_ring(c, p):
     f, s = c.f, c.s
     col = c.color(p["color"])
     value = max(0.0, min(100.0, p["value"]))
+    dec = max(0, min(6, p["decimals"]))
     lab = c.body(p["label"], f.d(48), f.SW * 0.86, lines=2, min_size=f.d(32)) if p["label"] else None
     gap = f.d(48)
     D = min(f.d(500), f.SW * 0.8, (f.SH - (gap + lab.h if lab else 0)) * 0.9)
@@ -1687,8 +1723,8 @@ def _percent_ring(c, p):
     grp.ring("track", f.CX, cy, D, _alpha(s["text"], 0.14), width)
     grp.ring("arc", f.CX, cy, D, col, width, draw={"from": 0.0, "to": round(value / 100.0, 4), "ease": ease},
              enter=("none", cd))
-    num = c.fit(_fmt_number(value, p["decimals"], "") + p["suffix"], D * 0.3, D * 0.62, lines=1)
-    grp.counter("number", num, f.CX, cy, 0, round(value, 6), p["decimals"], "", p["suffix"], "", cd, ease)
+    num = c.fit(_fmt_number(value, dec, "") + p["suffix"], D * 0.3, D * 0.62, lines=1)
+    grp.counter("number", num, f.CX, cy, 0, round(value, 6), dec, "", p["suffix"], "", cd, ease)
     if lab:
         c.text("label", lab, f.CX, top + D + gap, anchor="top", shadow=c.text_shadow(0.8), enter=c.prof["rise"],
                at=c.clk.gap * 2)
@@ -1707,7 +1743,7 @@ def _percent_ring(c, p):
 )
 def _bar_chart(c, p):
     f, s, acc = c.f, c.s, c.s["accent"]
-    vals = [max(0.0, v) for v in p["values"]][:7] or [1.0]
+    vals = [max(0.0, v) for v in p["values"]][:7]
     labels = (p["labels"] + [""] * len(vals))[:len(vals)]
     n = len(vals)
     vmax = max(vals) or 1.0
@@ -1988,7 +2024,7 @@ def _list_item(c, p):
 def _checklist(c, p):
     c.f = c.f.column(1100)
     f, s, acc = c.f, c.s, c.s["accent"]
-    items = p["items"][:7] or ["Item"]
+    items = p["items"][:7]
     n = len(items)
 
     def rows(k):
@@ -2042,7 +2078,7 @@ def _checklist(c, p):
 def _ranking(c, p):
     c.f = c.f.column(1100)
     f, s, acc = c.f, c.s, c.s["accent"]
-    items = p["items"][:6] or ["Item"]
+    items = p["items"][:6]
     n = len(items)
 
     def rows(k):
@@ -2096,7 +2132,7 @@ def _ranking(c, p):
 )
 def _timeline_steps(c, p):
     f, s, acc = c.f, c.s, c.s["accent"]
-    steps = p["steps"][:6] or ["Start", "Finish"]
+    steps = p["steps"][:6]
     n = len(steps)
     vertical = p["layout"] == "vertical" or (p["layout"] == "auto" and not f.wide)
     title = c.fit(p["title"], f.d(76), f.SW, lines=2, min_size=f.d(44), case="upper", ls=1.0) if p["title"] else None
@@ -2202,8 +2238,10 @@ def _step_number(c, p):
 )
 def _pros_cons(c, p):
     f = c.f
-    sections = [(p["pro_label"], p["pros"][:4], _GOOD, "check"), (p["con_label"], p["cons"][:4], _BAD, "cross")]
-    side = f.wide
+    sections = [(label, items, col, icon) for label, items, col, icon in
+                ((p["pro_label"], p["pros"][:4], _GOOD, "check"), (p["con_label"], p["cons"][:4], _BAD, "cross"))
+                if items]           # a side with nothing to say is left out, not shown empty
+    side = f.wide and len(sections) == 2
     col_w = (f.SW - f.d(60)) / 2 if side else f.SW
 
     def rows(k):
@@ -2611,8 +2649,6 @@ def _text_message(c, p):
         body = (m.group(2) if m else line).strip()
         if body:
             msgs.append((mine, body))
-    if not msgs:
-        msgs = [(False, "...")]
     them_col, them_ink = ("#2C2C2E", "#FFFFFF") if p["theme"] == "dark" else ("#E9E9EB", _INK)
     n = len(msgs)
 
@@ -2720,12 +2756,12 @@ def _search_bar(c, p):
 )
 def _poll(c, p):
     f, acc = c.f, c.s["accent"]
-    opts = p["options"][:4] or ["Yes", "No"]
+    opts = p["options"][:4]
     n = len(opts)
     res = [max(0.0, v) for v in (p["results"] + [0.0] * n)[:n]]
     tot = sum(res) or 1.0
     pct = [round(100.0 * v / tot) for v in res]
-    best = pct.index(max(pct))
+    best = pct.index(max(pct)) if pct else -1
     width = min(f.SW, f.d(840))
     pad, row_h, gap = f.d(38), f.d(116), f.d(18)
     q = c.fit(p["question"], f.d(62), width - pad * 2, lines=3, min_size=f.d(36), ls=1.05)
@@ -2773,32 +2809,32 @@ def _like_burst(c, p):
     n = max(3, min(20, p["count"]))
     ox = min(f.R, max(f.L, f.W * _clamp01(p["x"])))
     oy = min(f.B, max(f.T + f.SH * 0.35, f.H * _clamp01(p["y"])))
-    seed = sum(ord(ch) for ch in p["icon"] + col) + n
-
-    def rnd(i, k):
-        # small deterministic hash -> 0..1, so the same params always give the same burst
-        v = math.sin((seed + i * 12.9898 + k * 78.233) * 43758.5453)
-        return v - math.floor(v)
-
+    # seeded from the params: the same call always gives the same burst, on every machine
+    rng = random.Random(zlib.crc32(("%s|%s|%d|%.3f|%.3f" % (p["icon"], col, n, p["x"], p["y"])).encode("utf-8")))
     spread = min(c.clk.dur * 0.6, 1.4)
     for i in range(n):
+        r_size, r_rise, r_sway, r_tilt, r_drift = (rng.random() for _ in range(5))
         at = spread * i / n
         life = min(1.5, c.clk.dur - at)
         if life < 0.4:
             break
-        size = f.d(p["size"]) * (0.7 + 0.55 * rnd(i, 1))
-        rise = min(oy - f.T, f.d(620) * (0.75 + 0.5 * rnd(i, 2)))
-        sway = f.d(80) * (rnd(i, 3) * 2 - 1)
-        tilt = 18 * (rnd(i, 4) * 2 - 1)
+        size = f.d(p["size"]) * (0.7 + 0.55 * r_size)
+        rise = min(oy - f.T, f.d(620) * (0.75 + 0.5 * r_rise))
+        sway = f.d(70) * (0.5 + r_sway)                       # wobble amplitude
+        drift = f.d(260) * (r_drift * 2 - 1)                  # where it ends up sideways: the burst fans out
+        drift = min(f.R - sway, max(f.L + sway, ox + drift)) - ox   # but never off the frame
+        side = 1 if i % 2 else -1
+        tilt = 18 * (r_tilt * 2 - 1)
         anim = {"y": _keys([[0, 0], [life, -rise, "out-cubic"]]),
-                "x": _keys([[0, 0], [life * 0.35, sway, "in-out-quad"], [life * 0.7, -sway * 0.5, "in-out-quad"],
-                            [life, sway * 0.3, "in-out-quad"]]),
+                "x": _keys([[0, 0], [life * 0.35, drift * 0.35 + side * sway, "in-out-quad"],
+                            [life * 0.7, drift * 0.7 - side * sway * 0.6, "in-out-quad"],
+                            [life, drift, "in-out-quad"]]),
                 "scale": _keys([[0, 0.3], [0.22, 1.08 if c.prof["over"] > 0 else 1.0,
                                             "out-back" if c.prof["over"] > 0 else "out-cubic"], [life, 0.8, "linear"]]),
                 "opacity": _keys([[0, 0], [0.08, 1], [life * 0.65, 1], [life, 0, "in-quad"]]),
                 "rotation": _keys([[0, -tilt], [life, tilt, "in-out-quad"]])}
         tint = col if i % 3 else _mix(col, "#FFFFFF", 0.3)
-        c.icon("particle", p["icon"], ox, oy, size, tint, _mix(tint, "#000000", 0.3), animate=anim, enter=None,
+        c.icon("particle%d_" % (i + 1), p["icon"], ox, oy, size, tint, _mix(tint, "#000000", 0.3), animate=anim, enter=None,
                exit=None, at=at, until=c.clk.dur - at - life, min_life=0.1)
 
 
@@ -2840,10 +2876,12 @@ def _highlight_box(c, p):
     f = c.f
     c.fixed = False
     col = c.color(p["color"])
-    cx, cy = f.W * _clamp01(p["x"]), f.H * _clamp01(p["y"])
-    w = max(f.d(60), f.W * _clamp01(p["w"]))
-    h = max(f.d(60), f.H * _clamp01(p["h"]))
-    th = max(2.0, f.d(p["thickness"]))
+    th = max(2.0, min(f.d(40), f.d(p["thickness"])))
+    w = min(f.W - th * 2, max(f.d(60), f.W * _clamp01(p["w"])))
+    h = min(f.H - th * 2, max(f.d(60), f.H * _clamp01(p["h"])))
+    # the whole box stays on the frame even when the target hugs an edge
+    cx = min(f.W - w / 2 - th, max(w / 2 + th, f.W * _clamp01(p["x"])))
+    cy = min(f.H - h / 2 - th, max(h / 2 + th, f.H * _clamp01(p["y"])))
     life = c.clk.dur
     land = c.clk.din
     pulse = c.pulse_keys(land + 0.2, life - c.clk.dout, period=1.0, amp=c.prof["pulse"] * 0.5)
@@ -2913,7 +2951,7 @@ def _arrow(c, p):
     vy = (1 if "top" in d else -1 if "bottom" in d else 0)
     ln = math.hypot(vx, vy) or 1.0
     ux, uy = vx / ln, vy / ln                       # unit vector the arrow points along
-    L = f.d(p["length"])
+    L = f.d(max(80.0, min(900.0, p["length"])))
     # path in a square 0..1 box from tail to head, bent sideways when curved
     a, b = [0.5 - 0.42 * ux, 0.5 - 0.42 * uy], [0.5 + 0.42 * ux, 0.5 + 0.42 * uy]
     bend = 0.2 if p["curve"] else 0.0
@@ -3183,7 +3221,7 @@ def _progress_bar(c, p):
     h = max(2.0, f.d(p["thickness"]))
     top = p["position"] == "top"
     c.add("progress", "bar", {"x": 0, "y": 0 if top else f.H, "anchor": "top-left" if top else "bottom-left",
-                              "w": f.W, "h": h, "color": c.color(p["color"]), "track": p["track"] or "#FFFFFF33",
+                              "w": f.W, "h": h, "color": c.color(p["color"]), "track": c.color(p["track"]) if p["track"] else "#FFFFFF33",
                               "from": _clamp01(p["from"]), "to": _clamp01(p["to"])},
           enter=("fade", min(0.3, c.clk.din)), exit=None)
 

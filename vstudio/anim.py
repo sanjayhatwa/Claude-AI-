@@ -263,7 +263,8 @@ def enter_state(kind, p, layer=None, canvas=(1080, 1920), fps=30, frame=0):
         impact = 0.55
         if p < impact:
             q = ease("in-quad", p / impact)
-            return _state(scale=2.2 - 1.2 * q, rotation=-7 * (1 - q), opacity=ease("out-quad", _clamp01(p / (impact * 0.5))))
+            return _state(scale=2.2 - 1.2 * q, rotation=-7 * (1 - q),
+                          opacity=ease("out-quad", _clamp01(p / (impact * 0.5))))
         q = (p - impact) / (1 - impact)
         squash = 1 - 0.035 * math.sin(math.pi * q) * (1 - q)
         # a two-frame shake right at the impact

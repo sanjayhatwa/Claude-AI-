@@ -26,6 +26,12 @@ anchor, camera). A layer at rest with no scaling is copied at whole pixels,
 so static text stays perfectly crisp; moving layers use sub-pixel warps so
 they glide without judder.
 
+The camera (zoom about the canvas centre, then `x`/`y` offsets that move the
+picture: +x shifts the scene right, then `rotation`) is folded into each
+non-fixed layer's transform instead of resampling the finished composite:
+the same picture, one resample fewer, and a zoom-out shows the background
+at the edges rather than smeared pixels.
+
 Video layers are decoded by one ffmpeg process each, streaming raw frames
 already scaled and cropped, at the timeline fps, from `in` with `speed`
 (the frame at timeline t is source time in + (t - start) * speed); a
@@ -233,15 +239,19 @@ def _to_rgba(spr):
     return spr if spr.shape[2] == 4 else cv2.cvtColor(spr, cv2.COLOR_RGB2RGBA)  # alpha = 1
 
 
-def _pad(spr, l, t, r, b):
-    l, t, r, b = (max(0, int(math.ceil(v))) for v in (l, t, r, b))
-    if not (l or t or r or b):
+def _pad(spr, left, top, right, bottom):
+    """Transparent border around a sprite; returns (sprite, left, top) as whole pixels added."""
+    left, top, right, bottom = (max(0, int(math.ceil(v))) for v in (left, top, right, bottom))
+    if not (left or top or right or bottom):
         return spr, 0, 0
-    return cv2.copyMakeBorder(spr, t, b, l, r, cv2.BORDER_CONSTANT, value=(0, 0, 0, 0)), l, t
+    return cv2.copyMakeBorder(spr, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(0, 0, 0, 0)), left, top
 
 
 def _apply_looks(spr, box, st, R, layer, frame):
-    """Blur, motion blur, wipe, RGB split and glitch slices in sprite space. Returns (sprite, box) shifted for padding."""
+    """Wipe, blur, motion blur, RGB split and glitch slices in sprite space.
+
+    Returns (sprite, box) with the box shifted by any padding added.
+    """
     bx0, by0, bx1, by1 = box
     shift_x = shift_y = 0
 
@@ -333,7 +343,9 @@ def _shape_sprite(L, R, draw_p):
     if kind in ("rect", "line"):
         r = float(L.get("radius") or 0) * R
         fill = textrender.rrect_mask(H, W, m, m, m + w, m + h, r)
-        inner = textrender.rrect_mask(H, W, m + sw, m + sw, m + w - sw, m + h - sw, max(0.0, r - sw)) if sw > 0 else None
+        inner = None
+        if sw > 0:
+            inner = textrender.rrect_mask(H, W, m + sw, m + sw, m + w - sw, m + h - sw, max(0.0, r - sw))
     elif kind in ("circle", "ellipse"):
         fill = ellipse_cov(w / 2, h / 2)
         inner = ellipse_cov(w / 2 - sw, h / 2 - sw) if sw > 0 else None
@@ -350,8 +362,8 @@ def _shape_sprite(L, R, draw_p):
         inner = None
         if sw > 0:
             edge = np.zeros_like(big)
-            cv2.polylines(edge, [np.round(pts * 16).astype(np.int32)], True, 255, thickness=max(1, int(round(sw * 2 * ss))),
-                          lineType=cv2.LINE_AA, shift=4)
+            cv2.polylines(edge, [np.round(pts * 16).astype(np.int32)], True, 255,
+                          thickness=max(1, int(round(sw * 2 * ss))), lineType=cv2.LINE_AA, shift=4)
             stroke_m = cv2.resize(edge, (W, H), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
             inner = np.clip(fill - np.minimum(fill, stroke_m), 0, 1)
 
@@ -387,7 +399,8 @@ def _progress_sprite(L, R, frac):
     if L.get("track"):
         textrender.over(arr, textrender.rgba01(L["track"]), textrender.rrect_mask(H, W, 0, 0, w, h, r))
     if frac > 0:
-        textrender.over(arr, textrender.rgba01(L["color"]), textrender.rrect_mask(H, W, 0, 0, max(frac * w, 2 * r if r else 0), h, r))
+        fill_w = max(frac * w, 2 * r)  # a rounded bar starts as a dot, not a sliver
+        textrender.over(arr, textrender.rgba01(L["color"]), textrender.rrect_mask(H, W, 0, 0, fill_w, h, r))
     return arr, (0, 0, w, h)
 
 
@@ -503,8 +516,8 @@ class VideoReader:
             if self.err is not None:
                 self.err.seek(0)
                 msg = self.err.read()[-600:]
-            raise RenderError("could not decode %s: %s" % (self.L["src"], msg.decode("utf-8", "replace").strip()
-                                                            or "no frames"))
+            detail = msg.decode("utf-8", "replace").strip() or "no frames"
+            raise RenderError("could not decode %s: %s" % (self.L["src"], detail))
         self.last_k = k
         return self.last
 
@@ -754,7 +767,7 @@ class Compositor:
         return rgb, inv3
 
     # ----- effects
-    def _effects(self, img, t, frame_idx):
+    def _effects(self, img, t):
         effects = [(i, e) for i, e in enumerate(self.spec["effects"]) if isinstance(e, dict)]
         effects.sort(key=lambda ie: (EFFECT_ORDER.index(ie[1]["type"]), ie[0]))
         tick = int(math.floor(t * 24))  # randomness changes 24 times a second whatever the fps
@@ -894,7 +907,7 @@ class Compositor:
                     self._draw_layer(canvas, L, t, frame_idx, c)
                 elif L["type"] == "video" and id(L) in self.readers and t >= L["end"]:
                     self.readers.pop(id(L)).close()  # done with this clip: free its decoder
-        return self._effects(canvas, t, frame_idx)
+        return self._effects(canvas, t)
 
     def frame_u8(self, t, frame_idx=None):
         """uint8 RGB frame at timeline time t."""

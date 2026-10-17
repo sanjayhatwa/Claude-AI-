@@ -131,9 +131,10 @@ class Frames(unittest.TestCase):
     def test_shapes_image_progress(self):
         layers = [
             {"type": "shape", "shape": "circle", "w": 60, "h": 60, "x": 50, "y": 50, "color": "#00FF00"},
-            {"type": "shape", "shape": "ring", "w": 60, "h": 60, "x": 130, "y": 50, "color": "#0000FF", "stroke": {"width": 8}},
-            {"type": "shape", "shape": "polygon", "w": 60, "h": 60, "x": 50, "y": 130, "points": [[0, 0], [1, 0], [0, 1]],
-             "color": "#FF0000"},
+            {"type": "shape", "shape": "ring", "w": 60, "h": 60, "x": 130, "y": 50, "color": "#0000FF",
+             "stroke": {"width": 8}},
+            {"type": "shape", "shape": "polygon", "w": 60, "h": 60, "x": 50, "y": 130,
+             "points": [[0, 0], [1, 0], [0, 1]], "color": "#FF0000"},
             {"type": "image", "src": "logo.png", "x": 130, "y": 130},
             {"type": "progress", "y": 300, "h": 10, "color": "#FFFFFF", "track": "#FF000080", "end": 2},
         ]
@@ -243,18 +244,21 @@ class FullRender(unittest.TestCase):
             "background": {"gradient": ["#101018", "#000000"], "angle": 90},
             "layers": [
                 {"type": "video", "src": "clip.mp4", "kenburns": [1.0, 1.1], "volume": 0.8},
-                {"type": "shape", "w": 190, "h": 60, "y": 90, "color": "#000000AA", "radius": 12, "enter": "wipe-right"},
+                {"type": "shape", "w": 190, "h": 60, "y": 90, "color": "#000000AA", "radius": 12,
+                 "enter": "wipe-right"},
                 {"type": "text", "text": "THE HOOK", "font": "Montserrat Black", "size": 40, "y": 90,
-                 "stroke": {"color": "#000000", "width": 3}, "highlight": {"words": [1]}, "enter": "pop", "exit": "whip-left",
-                 "shadow": True},
+                 "stroke": {"color": "#000000", "width": 3}, "highlight": {"words": [1]}, "enter": "pop",
+                 "exit": "whip-left", "shadow": True},
                 {"type": "counter", "from": 0, "to": 900, "suffix": "K", "y": 200, "size": 44, "enter": "slide-up",
                  "count_duration": 1.0},
                 {"type": "image", "src": "logo.png", "x": 180, "y": 330, "enter": "bounce"},
                 {"type": "progress", "h": 4},
             ],
             "camera": {"zoom": [[0.8, 1.0], [1.0, 1.15, "out-cubic"], [1.4, 1.0, "in-out-cubic"]]},
-            "effects": [{"type": "flash", "start": 1.0, "duration": 0.2}, {"type": "shake", "start": 1.0, "duration": 0.3},
-                        {"type": "glitch", "start": 1.5, "duration": 0.2}, {"type": "zoom-blur", "start": 0.8, "duration": 0.3},
+            "effects": [{"type": "flash", "start": 1.0, "duration": 0.2},
+                        {"type": "shake", "start": 1.0, "duration": 0.3},
+                        {"type": "glitch", "start": 1.5, "duration": 0.2},
+                        {"type": "zoom-blur", "start": 0.8, "duration": 0.3},
                         {"type": "vignette"}, {"type": "grade", "contrast": 1.1, "saturation": 1.2, "warmth": 0.1},
                         {"type": "grain", "strength": 0.03}, {"type": "letterbox", "start": 1.6, "duration": 0.4}],
             "captions": {"words": words, "pop": True},
@@ -327,6 +331,12 @@ class AudioMix(unittest.TestCase):
             x = np.frombuffer(w.readframes(n), "<i2").reshape(-1, ch).astype(np.float32) / 32768
         return sr, ch, x
 
+    def test_validate_checks_streams(self):
+        errs = timeline.validate(S(layers=[{"type": "video", "src": "music.wav"}], audio=[{"src": "counter.mkv"}]),
+                                 T["tmp"])
+        self.assertTrue(any("has no video stream" in e for e in errs), errs)
+        self.assertTrue(any("has no audio stream" in e for e in errs), errs)
+
     def test_nothing_audible(self):
         res, _ = self.mix({"layers": [{"type": "video", "src": "counter.mkv"}], "audio": [{"sfx": "pop", "volume": 0}]})
         self.assertIsNone(res)
@@ -352,8 +362,9 @@ class AudioMix(unittest.TestCase):
         self.assertAlmostEqual(integrated, -14.0, delta=1.5)
 
     def test_clip_audio_sfx_and_speed(self):
-        spec = timeline.normalize(S(duration=2, layers=[{"type": "video", "src": "clip.mp4", "speed": 4.0, "volume": 1}],
-                                    audio=[{"sfx": "ding", "start": 0.5}]), T["tmp"])
+        spec = timeline.normalize(S(duration=2, audio=[{"sfx": "ding", "start": 0.5}],
+                                    layers=[{"type": "video", "src": "clip.mp4", "speed": 4.0, "volume": 1}]),
+                                  T["tmp"])
         srcs = audio.sources(spec, 2.0)
         self.assertEqual(sorted(s["role"] for s in srcs), ["clip", "sfx"])
         clip = [s for s in srcs if s["role"] == "clip"][0]

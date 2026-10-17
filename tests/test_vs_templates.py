@@ -554,6 +554,24 @@ class TestParams(unittest.TestCase):
                         spec = {"version": 1, "width": W, "height": H, "fps": 30, "duration": 3, "layers": layers}
                         self.assertEqual(timeline.validate(spec), [], name)
 
+    def test_each_param_blank_or_odd(self):
+        """One param at a time set to a blank or extreme value still gives valid, on-canvas layers."""
+        odd = {"str": ["", "x" * 80], "int": [0, -5, 999], "float": [0.0, -3.0, 1e6], "bool": [False],
+               "list[str]": [[], ["a"] * 20], "list[float]": [[], [0, 0, 0]], "highlight": [[], [99]],
+               "color": ["", "accent", "#12345678"]}
+        for name, e in templates.CATALOG.items():
+            for pn, ps in e["params"].items():
+                values = odd.get(ps["type"], []) + list(ps.get("choices", []))
+                for v in values:
+                    for key in ("9:16", "16:9"):
+                        W, H = CANVASES[key]
+                        with self.subTest(template=name, param=pn, value=str(v)[:20], aspect=key):
+                            layers = templates.build(name, {pn: v}, 0, 3, {"width": W, "height": H, "fps": 30})
+                            errs = []
+                            for L in layers:
+                                errs += check_layer(L, W, H, 0, 3)
+                            self.assertEqual(errs, [])
+
     def test_errors(self):
         with self.assertRaises(KeyError):
             templates.build("no_such_template", {}, 0, 1, None)
@@ -564,6 +582,22 @@ class TestParams(unittest.TestCase):
         a = templates.build("like_burst", {}, 0, 3, None)
         b = templates.build("like_burst", {}, 0, 3, None)
         self.assertEqual(a, b)
+
+    def test_works_without_the_font_engine(self):
+        """With no font module the conservative width table still yields valid layouts."""
+        saved = templates._font_obj
+        templates._FONT_OBJ.clear()
+        templates._WIDTH_CACHE.clear()
+        templates._font_obj = lambda font: None
+        try:
+            for name, layers, W, H in build_all("9:16"):
+                errs = []
+                for L in layers:
+                    errs += check_layer(L, W, H, 1.0, 4.0) + check_safe(name, L, W, H)
+                self.assertEqual(errs, [], name)
+        finally:
+            templates._font_obj = saved
+            templates._WIDTH_CACHE.clear()
 
     def test_fit_text_keeps_words_inside(self):
         blk = templates.fit_text("SUPERCALIFRAGILISTIC", "Montserrat Black", 200, 400, lines=1)
@@ -595,7 +629,9 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(code, 2)
 
     def test_preview_without_render_writes_the_spec(self):
+        import vstudio
         saved = sys.modules.get("vstudio.render", "missing")
+        saved_attr = vstudio.__dict__.pop("render", None)   # an imported submodule is found here first
         sys.modules["vstudio.render"] = None        # makes `from . import render` raise ImportError
         try:
             with tempfile.TemporaryDirectory() as d:
@@ -611,17 +647,23 @@ class TestCLI(unittest.TestCase):
                 del sys.modules["vstudio.render"]
             else:
                 sys.modules["vstudio.render"] = saved
+            if saved_attr is not None:
+                vstudio.render = saved_attr
 
 
 @unittest.skipUnless(HAVE_RENDER, "render engine or ffmpeg not available")
 class TestRender(unittest.TestCase):
+    def preview(self, argv):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return templates.main(["preview"] + argv)
+
     def test_stills_draw_inside_the_frame(self):
         import numpy as np
         from PIL import Image
         with tempfile.TemporaryDirectory() as d:
             for name in ("hook_title", "list_item", "percent_ring", "comment_bubble", "versus", "highlight_box"):
                 out = os.path.join(d, name + ".png")
-                code = templates.main(["preview", name, "--out", out, "--size", "216x384", "--fps", "10"])
+                code = self.preview([name, "--out", out, "--size", "216x384", "--fps", "10"])
                 self.assertEqual(code, 0, name)
                 img = np.asarray(Image.open(out).convert("RGB")).astype(int)
                 bg = img[2, 2]
@@ -631,8 +673,7 @@ class TestRender(unittest.TestCase):
     def test_mp4_preview(self):
         with tempfile.TemporaryDirectory() as d:
             out = os.path.join(d, "stat.mp4")
-            code = templates.main(["preview", "stat", "--out", out, "--size", "180x320", "--fps", "10",
-                                   "--duration", "1.2"])
+            code = self.preview(["stat", "--out", out, "--size", "180x320", "--fps", "10", "--duration", "1.2"])
             self.assertEqual(code, 0)
             self.assertGreater(os.path.getsize(out), 1000)
 

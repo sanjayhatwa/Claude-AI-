@@ -29,7 +29,6 @@ peak-normalized to about -3 dBFS.
 """
 
 import argparse
-import math
 import os
 import shutil
 import sys

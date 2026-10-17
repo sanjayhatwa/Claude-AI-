@@ -62,7 +62,8 @@ class TimelineValidate(unittest.TestCase):
         self.assertError(self.errors(background="#12345"), "background")
 
     def test_end_before_start(self):
-        self.assertError(self.errors(layers=[{"type": "shape", "start": 2, "end": 1}]), "end (1) must be after start (2)")
+        self.assertError(self.errors(layers=[{"type": "shape", "start": 2, "end": 1}]),
+                         "end (1) must be after start (2)")
 
     def test_missing_source_file(self):
         self.assertError(self.errors(layers=[{"type": "video", "src": "nope.mp4"}]), "src file not found")
@@ -84,14 +85,16 @@ class TimelineValidate(unittest.TestCase):
         self.assertError(self.errors(camera={"pan": []}), "camera: unknown property 'pan'")
 
     def test_typo_in_field_name(self):
-        self.assertError(self.errors(layers=[{"type": "shape", "animte": {}}]), "unknown field 'animte' (did you mean 'animate'?)")
+        self.assertError(self.errors(layers=[{"type": "shape", "animte": {}}]),
+                         "unknown field 'animte' (did you mean 'animate'?)")
 
     def test_canvas_and_misc(self):
         self.assertError(timeline.validate({"width": 181, "height": 320, "layers": []}), "width must be even")
         self.assertError(self.errors(effects=[{"type": "flash"}]), "needs a start time")
         self.assertError(self.errors(captions={"words": [{"w": "a", "s": 1, "e": 0.5}]}), "ends (0.5) before it starts")
         self.assertError(self.errors(layers=[{"type": "shape", "shape": "polygon"}]), "polygon needs points")
-        self.assertError(self.errors(layers=[{"type": "text", "text": "a b", "highlight": {"words": [5]}}]), "out of range")
+        self.assertError(self.errors(layers=[{"type": "text", "text": "a b", "highlight": {"words": [5]}}]),
+                         "out of range")
         self.assertEqual(timeline.validate([]), ["the spec must be a JSON object, got list"])
 
 
@@ -214,7 +217,8 @@ class Presets(unittest.TestCase):
         a = anim.enter_state("glitch", 0.3, G, frame=4)
         self.assertEqual(a, anim.enter_state("glitch", 0.3, G, frame=4))  # deterministic
         self.assertGreater(a["rgb_split"], 0)
-        self.assertNotEqual([anim.enter_state("glitch", 0.3, G, frame=f)["rgb_split"] for f in range(5)].count(a["rgb_split"]), 5)
+        splits = [anim.enter_state("glitch", 0.3, G, frame=f)["rgb_split"] for f in range(5)]
+        self.assertGreater(len(set(splits)), 1)  # changes from frame to frame
         self.assertEqual(anim.enter_state("wipe-right", 0.5)["wipe"][:2], (0.0, anim.ease("out-quart", 0.5)))
         self.assertEqual(anim.exit_state("wipe-left", 0.0)["wipe"], None)
 
@@ -313,7 +317,8 @@ class Fonts(unittest.TestCase):
             self.skipTest("no .ttf font to serve")
         with open(src, "rb") as f:
             data = f.read()
-        meta = 'name: "Fake Sans"\nfonts {\n  filename: "FakeSans[wght].ttf"\n}\nfonts {\n  filename: "FakeSans-Italic.ttf"\n}\n'
+        meta = ('name: "Fake Sans"\nfonts {\n  filename: "FakeSans[wght].ttf"\n}\n'
+                'fonts {\n  filename: "FakeSans-Italic.ttf"\n}\n')
         calls = []
 
         def fake_get(url, timeout=60):
@@ -374,12 +379,13 @@ class TextRender(unittest.TestCase):
         self.assertGreater(min(widths) / max(widths), 0.6)  # no lonely last word
 
     def test_highlight_stroke_box_colours(self):
-        img = textrender.render_text(text_layer(text="AAA BBB", color="#FFFFFF", highlight={"words": [1], "color": "#FF0000"},
+        img = textrender.render_text(text_layer(text="AAA BBB", color="#FFFFFF",
+                                                highlight={"words": [1], "color": "#FF0000"},
                                                 stroke={"color": "#0000FF", "width": 4}))
         px = np.asarray(img).reshape(-1, 4)
         solid = px[px[:, 3] == 255][:, :3].astype(int)
-        has = lambda c: bool((np.abs(solid - c).sum(axis=1) < 30).any())  # noqa: E731
-        self.assertTrue(has([255, 255, 255]) and has([255, 0, 0]) and has([0, 0, 255]))
+        for colour in ([255, 255, 255], [255, 0, 0], [0, 0, 255]):   # fill, highlight, stroke
+            self.assertTrue((np.abs(solid - colour).sum(axis=1) < 30).any(), colour)
         boxed = textrender.render_text(text_layer(text="HI", box={"color": "#00FF00", "pad": [30, 20], "radius": 10}))
         x0, y0, x1, y1 = boxed.info["box"]
         self.assertEqual(boxed.getpixel((int(x0) + 15, int((y0 + y1) / 2)))[:3], (0, 255, 0))
@@ -435,7 +441,10 @@ class TextRender(unittest.TestCase):
     def test_letter_spacing_and_tabular(self):
         tight = text_layer(text="ABCD")
         wide = text_layer(text="ABCD", letter_spacing=20)
-        w = lambda L: textrender.render_text(L).info["box"][2] - textrender.render_text(L).info["box"][0]  # noqa: E731
+
+        def w(L):
+            box = textrender.render_text(L).info["box"]
+            return box[2] - box[0]
         self.assertAlmostEqual(w(wide) - w(tight), 60, delta=2)
         a = text_layer(text="1111", _tabular=True)
         b = text_layer(text="0000", _tabular=True)

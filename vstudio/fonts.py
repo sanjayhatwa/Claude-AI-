@@ -99,8 +99,8 @@ def parse_name(name):
     if len(tokens) == 1 and "-" in tokens[0]:  # PostScript style: Montserrat-BlackItalic
         fam, _, sty = tokens[0].rpartition("-")
         sty_tokens = re.findall(r"[A-Z][a-z]*|[a-z]+", sty)
-        if fam and sty_tokens and all(_key(t) in WEIGHTS or _key(t) in ITALIC_WORDS or _key(t) in ("extra", "semi", "ultra", "demi")
-                                      for t in sty_tokens):
+        style_words = set(WEIGHTS) | ITALIC_WORDS | {"extra", "semi", "ultra", "demi"}
+        if fam and sty_tokens and all(_key(t) in style_words for t in sty_tokens):
             tokens = [fam] + sty_tokens
     italic = False
     while len(tokens) > 1 and _key(tokens[-1]) in ITALIC_WORDS:
@@ -254,7 +254,8 @@ def _family_matches(name, weight, italic, entries):
         return _best(hits, weight, italic)
     # legacy names: family "Montserrat Black" + style "Regular", or a full-name match
     full = _key(name + (" " + WEIGHT_NAMES.get(weight, "") if weight else ""))
-    hits = [e for e in entries if _key(e["family"] + ("" if _key(e["style"]) in ("regular", "") else e["style"])) == full
+    hits = [e for e in entries
+            if _key(e["family"] + ("" if _key(e["style"]) in ("regular", "") else e["style"])) == full
             or _key(os.path.splitext(os.path.basename(e["path"]))[0]) == full]
     return _best(hits, weight, italic)
 
@@ -266,7 +267,8 @@ def _fc_match(family, weight, italic):
     w = fc_weight.get(int(round((weight or 400) / 100.0)) * 100, 80)
     pattern = "%s:weight=%d%s" % (family, w, ":slant=100" if italic else "")
     try:
-        r = subprocess.run(["fc-match", "-f", "%{file}\n%{family}", pattern], capture_output=True, text=True, timeout=10)
+        r = subprocess.run(["fc-match", "-f", "%{file}\n%{family}", pattern], capture_output=True, text=True,
+                           timeout=10)
     except (OSError, subprocess.SubprocessError):
         return None
     lines = r.stdout.splitlines()
@@ -305,7 +307,8 @@ def _entry(name_or_path, fallback_bold=True):
             e = _best([x for x in entries if not x["italic"]] or entries, weight, False)
         if name and name not in _warned:
             _warned.add(name)
-            got = "%s at weight %d" % (e["family"], weight if e["variable"] else e["weight"]) if e else "Pillow's built-in font"
+            got = ("%s at weight %d" % (e["family"], weight if e["variable"] else e["weight"])) if e \
+                else "Pillow's built-in font"
             print("font %r not found; using %s (try: python -m vstudio fonts install \"%s\")" % (name, got, family),
                   file=sys.stderr)
     if e is not None:
@@ -554,10 +557,12 @@ def _list(show_all):
         styles = []
         for f in sorted(faces, key=lambda f: (f["italic"], f["weight"])):
             if f["variable"] and f.get("wght"):
-                styles.append("%s %d-%d (variable)" % ("italic" if f["italic"] else "upright", f["wght"][0], f["wght"][1]))
+                styles.append("%s %d-%d (variable)"
+                              % ("italic" if f["italic"] else "upright", f["wght"][0], f["wght"][1]))
             else:
                 styles.append(f["style"])
-        print("%-28s %s\n%28s   in %s" % (fam, ", ".join(dict.fromkeys(styles)), "", dirs[rank] if rank < len(dirs) else "?"))
+        where = dirs[rank] if rank < len(dirs) else "?"
+        print("%-28s %s\n%28s   in %s" % (fam, ", ".join(dict.fromkeys(styles)), "", where))
     if not show_all and many:
         print("\n(system fonts hidden; --all to show them)")
 

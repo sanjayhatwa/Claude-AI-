@@ -600,7 +600,7 @@ def _check_num(errs, where, field, v, lo=None, hi=None, lo_open=False, allow_non
     return True
 
 
-def _check_keys(errs, where, field, keys, allow_pct=False):
+def _check_keys(errs, where, field, keys):
     if keys is None:
         return
     if not errs.need(isinstance(keys, list), where, "%s must be a list of keyframes [[t, value], ...]" % field):
@@ -619,7 +619,8 @@ def _check_file(errs, where, field, path):
     if not errs.need(isinstance(path, str) and path, where, "%s is missing" % field):
         return
     if re.match(r"^[a-z][a-z0-9+.-]*://", path, re.I):
-        errs.append("%s: %s %r is a URL; download it first and point %s at the local file" % (where, field, path, field))
+        errs.append("%s: %s %r is a URL; download it first and point %s at the local file"
+                    % (where, field, path, field))
     elif not os.path.isfile(path):
         errs.append("%s: %s file not found: %s" % (where, field, path))
 
@@ -699,7 +700,7 @@ def _check_text(errs, where, L):
         errs.need(isinstance(wt, list) and all(_isnum(x) for x in wt), where, "word_times must be a list of seconds")
 
 
-def _check_layer(errs, i, L, spec):
+def _check_layer(errs, i, L):
     if not isinstance(L, dict):
         errs.append("layers[%d]: a layer must be an object, got %r" % (i, L))
         return
@@ -737,7 +738,8 @@ def _check_layer(errs, i, L, spec):
     if isinstance(en, dict) and en.get("type") in ("typewriter", "words") and t not in ("text", "counter"):
         errs.append("%s: enter %r only works on text and counter layers" % (where, en["type"]))
     sh = L.get("shadow")
-    if sh is not None and errs.need(isinstance(sh, dict), where, "shadow must be {\"color\", \"dx\", \"dy\", \"blur\"}"):
+    if sh is not None and errs.need(isinstance(sh, dict), where,
+                                    "shadow must be {\"color\", \"dx\", \"dy\", \"blur\"}"):
         _check_color(errs, where, "shadow.color", sh.get("color"))
         for k in ("dx", "dy"):
             _check_num(errs, where, "shadow." + k, sh.get(k))
@@ -757,6 +759,9 @@ def _check_layer(errs, i, L, spec):
             errs.need(isinstance(kb, list) and len(kb) == 2 and all(_isnum(v) and v > 0 for v in kb), where,
                       "kenburns must be [scale_from, scale_to], got %r" % (kb,))
         if t == "video":
+            info = probe(L["src"]) if isinstance(L.get("src"), str) and os.path.isfile(L["src"]) else None
+            if info is not None and not info.get("has_video"):
+                errs.append("%s: %s has no video stream (put sound files in \"audio\")" % (where, L["src"]))
             _check_num(errs, where, "in", L.get("in"), 0)
             _check_num(errs, where, "speed", L.get("speed"), 0, lo_open=True)
             _check_num(errs, where, "volume", L.get("volume"), 0)
@@ -792,7 +797,8 @@ def _check_layer(errs, i, L, spec):
                 isinstance(p, (list, tuple)) and len(p) == 2 and all(_isnum(v) for v in p) for p in pts), where,
                 "a polygon needs points [[x, y], ...] (at least 3, in 0..1 of the w x h box)")
         g = L.get("gradient")
-        if g is not None and errs.need(isinstance(g, list) and len(g) >= 2, where, "gradient must be [\"#hex\", \"#hex\"]"):
+        if g is not None and errs.need(isinstance(g, list) and len(g) >= 2, where,
+                                       "gradient must be [\"#hex\", \"#hex\"]"):
             for c in g:
                 _check_color(errs, where, "gradient colour", c)
         d = L.get("draw")
@@ -800,7 +806,8 @@ def _check_layer(errs, i, L, spec):
             _check_num(errs, where, "draw.from", d.get("from"), 0, 1)
             _check_num(errs, where, "draw.to", d.get("to"), 0, 1)
             if d.get("ease") not in anim.EASINGS:
-                errs.append("%s: unknown draw.ease %r%s" % (where, d.get("ease"), _suggest(d.get("ease"), anim.EASINGS)))
+                errs.append("%s: unknown draw.ease %r%s"
+                            % (where, d.get("ease"), _suggest(d.get("ease"), anim.EASINGS)))
     elif t == "progress":
         _check_num(errs, where, "w", L.get("w"), 0, lo_open=True)
         _check_num(errs, where, "h", L.get("h"), 0, lo_open=True)
@@ -853,6 +860,9 @@ def _check_audio(errs, i, a):
             errs.append("%s: unknown sfx %r%s" % (where, a["sfx"], _suggest(a["sfx"], sfx.NAMES)))
     else:
         _check_file(errs, where, "src", a.get("src"))
+        info = probe(a["src"]) if isinstance(a.get("src"), str) and os.path.isfile(a["src"]) else None
+        if info is not None and not info.get("has_audio"):
+            errs.append("%s: %s has no audio stream" % (where, a["src"]))
     if a.get("role") not in AUDIO_ROLES:
         errs.append("%s: unknown role %r%s" % (where, a.get("role"), _suggest(a.get("role"), AUDIO_ROLES)))
     for k in ("start", "in", "volume", "fade_in", "fade_out"):
@@ -888,7 +898,7 @@ def validate(spec, base_dir=None):
         _check_color(errs, "", "background", bg)
     if errs.need(isinstance(s.get("layers"), list), "", "layers must be a list"):
         for i, L in enumerate(s["layers"]):
-            _check_layer(errs, i, L, s)
+            _check_layer(errs, i, L)
     cam = s.get("camera")
     if errs.need(isinstance(cam, dict), "camera", "camera must be {\"zoom\": [...], \"x\": [...], ...}"):
         for k, keys in cam.items():
@@ -909,11 +919,13 @@ def validate(spec, base_dir=None):
             for i, w in enumerate(words):
                 ok = isinstance(w, dict) and isinstance(w.get("w"), str) and _isnum(w.get("s")) and _isnum(w.get("e"))
                 if not ok:
-                    errs.append("captions: words[%d] must be {\"w\": text, \"s\": seconds, \"e\": seconds}, got %r" % (i, w))
+                    errs.append("captions: words[%d] must be {\"w\": text, \"s\": seconds, \"e\": seconds}, "
+                                "got %r" % (i, w))
                 elif w["e"] < w["s"]:
                     errs.append("captions: words[%d] %r ends (%g) before it starts (%g)" % (i, w["w"], w["e"], w["s"]))
         st = cap.get("style")
-        if st is not None and errs.need(isinstance(st, dict), "captions", "style must be an object of captions.py keys"):
+        if st is not None and errs.need(isinstance(st, dict), "captions",
+                                        "style must be an object of captions.py keys"):
             _check_unknown_fields(errs, "captions.style", st, CAPTION_STYLE_KEYS)
         if cap.get("style_dna") is not None:
             _check_file(errs, "captions", "style_dna", cap["style_dna"])
