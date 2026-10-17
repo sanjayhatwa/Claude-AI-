@@ -1,7 +1,7 @@
 {
   "name": "viral-hyper-agent",
-  "description": "A social media team for one creator. Give it a niche: a multi-source trend radar finds what's breaking out, a Style DNA extractor measures the best examples (caption font, size, colours, position, pace, hook, edit) and re-applies that caption style to your footage, and a script forge writes in your own voice, scored as speech and swipe-tested on a simulated viewer panel. Plus every platform's version, approved scheduling and a learning loop.",
-  "version": "2.0.0",
+  "description": "A social media team for one creator, running on your own computer and Claude subscription. Trend radar, Style DNA extraction (caption font, size, colours, pace, edit), human-sounding scripts scored as speech, and Viral Studio: a local video engine and web app that makes motion-graphics reels from a prompt plus reference and competitor videos, auto-edits raw footage like a pro editor, and reverse-engineers whole channels (thumbnails, topics, dialogue, energy). Plus every platform's posts, approved scheduling and a learning loop.",
+  "version": "3.0.0",
   "author": {
     "name": "sanjayhatwa"
   },
@@ -9,22 +9,29 @@
   "repository": "https://github.com/sanjayhatwa/Claude-AI-",
   "license": "MIT",
   "keywords": [
-    "social media",
-    "viral",
-    "trends",
-    "instagram",
-    "tiktok",
-    "youtube",
-    "reels",
+    "auto edit",
+    "channel analysis",
     "content",
-    "creator"
+    "creator",
+    "instagram",
+    "motion graphics",
+    "reels",
+    "social media",
+    "tiktok",
+    "trends",
+    "video editing",
+    "viral",
+    "youtube"
   ],
   "skills": "./.claude/skills/",
   "agents": [
+    "./.claude/agents/channel-analyst.md",
     "./.claude/agents/growth-strategist.md",
+    "./.claude/agents/motion-designer.md",
     "./.claude/agents/publisher.md",
     "./.claude/agents/reel-mimic-director.md",
     "./.claude/agents/trend-scout.md",
+    "./.claude/agents/video-editor.md",
     "./.claude/agents/viewer-panel.md",
     "./.claude/agents/viral-hyper-agent.md"
   ]

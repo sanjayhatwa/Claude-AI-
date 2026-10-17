@@ -9,3 +9,5 @@ rapidocr-onnxruntime    # on-screen text reading (runs locally, models included)
 # optional, recommended: word-level transcripts on your own machine
 # (first run downloads a speech model of about 500 MB)
 faster-whisper
+# optional, recommended: exact variable fonts (Montserrat etc.) in burned-in captions
+fonttools
