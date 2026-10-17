@@ -1,0 +1,7 @@
+# Viral Hyper Agent: Python tools (trend radar, reel analyzer, founder and creator tools)
+yt-dlp
+numpy
+opencv-python-headless
+scenedetect
+librosa
+Pillow

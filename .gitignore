@@ -1,0 +1,10 @@
+# fetched by setup.sh
+tools/
+# the creator's own working files stay local unless you choose to commit them
+workspace/*
+!workspace/brand.example.md
+!workspace/.gitkeep
+__pycache__/
+*.pyc
+.venv/
+.DS_Store

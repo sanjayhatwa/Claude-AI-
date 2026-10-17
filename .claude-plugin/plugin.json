@@ -1,0 +1,30 @@
+{
+  "name": "viral-hyper-agent",
+  "description": "A social media team for one creator: a hyper agent that finds what is trending in your niche across Shorts, Reels and TikTok, mimics winning formats in your own voice, writes every platform's version, schedules with your approval and learns from results. Combines the YouTube, Instagram and Founder skill packs, ReelMimic's reel analyzer and Harvey's sales playbooks.",
+  "version": "1.0.0",
+  "author": {
+    "name": "sanjayhatwa"
+  },
+  "homepage": "https://github.com/sanjayhatwa/Claude-AI-",
+  "repository": "https://github.com/sanjayhatwa/Claude-AI-",
+  "license": "MIT",
+  "keywords": [
+    "social media",
+    "viral",
+    "trends",
+    "instagram",
+    "tiktok",
+    "youtube",
+    "reels",
+    "content",
+    "creator"
+  ],
+  "skills": "./.claude/skills/",
+  "agents": [
+    "./.claude/agents/growth-strategist.md",
+    "./.claude/agents/publisher.md",
+    "./.claude/agents/reel-mimic-director.md",
+    "./.claude/agents/trend-scout.md",
+    "./.claude/agents/viral-hyper-agent.md"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "viral-hyper-agent",
+  "description": "The Viral Hyper Agent for solo creators",
+  "owner": { "name": "sanjayhatwa" },
+  "plugins": [
+    {
+      "name": "viral-hyper-agent",
+      "description": "Trend radar, reel mimicry, every-platform content, approved scheduling and a learning loop for one-person social media.",
+      "source": "./",
+      "category": "productivity",
+      "homepage": "https://github.com/sanjayhatwa/Claude-AI-"
+    }
+  ]
+}
