@@ -1,105 +1,92 @@
 ---
 name: viral
 description: >-
-  The hyper agent's main loop for a one-person social media business: find
-  what is trending in the niche, decide what to make, mimic the best trend in
-  the user's voice, write every platform's version (Reels, TikTok, Shorts,
-  long YouTube, carousel, stories), humanize it, schedule it, then read the
-  results and learn. Use for "make me go viral", "run the content machine",
-  "what should I post and write it", "make this week's content", "do
-  everything", or any request that spans trend research AND content creation.
+  The hyper agent's main loop for a one-person social media business. Give it
+  just a niche and it finds every trend worth riding (multi-source radar),
+  extracts the exact style of the best example of each (captions, font, pace,
+  hook, edit), and writes ready-to-shoot scripts in the creator's own voice,
+  stress-tested on a simulated viewer panel; then every platform's version,
+  scheduling with approval, and a learning loop. Use for "make me go viral",
+  "<niche> - give me scripts", "run the content machine", "what should I post
+  and write it", "make this week's content", "do everything".
 ---
 
 # viral
 
-You are the conductor. Every specialist already exists as a skill; this file
-decides the order and holds the quality bar. Tell the user in one line which
-stage you are on as you go.
+You are the conductor. Specialists exist for every step; this file decides the
+order and holds the bar. One status line per stage as you go.
 
-## 0. Know the creator (once, then reuse)
+## Fast path: "here's my niche, give me scripts"
 
-`workspace/brand.md` holds: niche (one line), audience, platforms and handles,
-current followers and median views per platform, goal (followers, sales,
-leads, brand deals), what they will film (face, voice, hands, gameplay,
-faceless), weekly capacity (how many posts they can actually make), and 3 to 6
-search phrases. If it is missing, ask only for what is missing, in one
-message, then write it. `templates/voice-instagram.md` and
-`templates/voice-youtube.md` hold the voice; offer to fill one from three of
-their old captions.
+When the user gives a niche (with or without anything else), run this end to
+end without asking more than one question up front:
 
-## 1. Radar: `/trend-hunt`
+1. **Pin the niche** (30 s). If `workspace/brand.md` is missing, ask in ONE
+   message: niche, country, what they'll film (face / voice / faceless /
+   gameplay), and target length. Defaults if they just say go: their words
+   as the niche, US, voiceover + B-roll, 30 s.
+2. **Radar** (`/trend-hunt`): `radar.py "<niche>"` -> `RADAR.md`. Pick the top
+   5 trends, at least 3 different formats.
+3. **Extract** (`/viral-extract`): for the top 3 trends, the best example of
+   each -> `STYLE_DNA.md`, plus your visual read of font, motion and framing.
+4. **Voice** (`/script-forge` inputs): the user's voiceprint if
+   `workspace/voice.json` exists; otherwise build one from the extracted
+   transcripts and say it's the niche's voice until they send their own.
+5. **Write** (`/script-forge`): one script per trend, 5 total. Each: 3 angles,
+   scriptcheck >= 80, viewer-panel swipe test on the top two, fix, re-test.
+6. **Pack** into `workspace/packs/<date>-<niche-slug>/`:
 
-Produces `workspace/trends/<date>/TRENDS.md`: rising, peaking and dying trends,
-each with evidence and a "your version" hook. Re-use one from the last 7 days
-instead of re-running. Also run `/ig-audit` or `/yt-audit` if the user pastes
-their own stats: their own outliers beat anyone else's.
+```
+PACK.md                     the one page to read: trends -> scripts -> what to film first
+trends/RADAR.md             evidence for every trend
+dna/<trend>/STYLE_DNA.md    the style to recreate, with fonts_sheet.jpg
+scripts/<n>-<slug>.md       production sheet: timed spoken lines, on-screen text, shots, delivery, caption style
+captions/<n>-<slug>.ass     caption file in the reference style (captions.py --script ... --ass-only)
+posts/<n>-<slug>.md         caption + hashtags per platform (ig-caption / yt-seo)
+```
 
-## 2. Pick: the slate
+`PACK.md` opens with a table: trend, stage, evidence (Nx, creators), script
+title, scriptcheck, panel hold at 3 s / end, effort to film. Then "film this
+one first and why". End with: **ship it, or change it?**
 
-Choose **N ideas = the user's weekly capacity**, never more. Mix:
+If a source was unreachable (YouTube blocked, no transcript), the pack says so
+on the first line. Scripts written without trend evidence are labelled
+"unvalidated" and never dressed up as researched.
 
-- 60% **ride**: rising trends that fit the niche (the reach engine)
-- 30% **proven**: the user's own past outliers, remade with a new angle
-- 10% **bet**: a format nobody in the niche is using yet, borrowed from an
-  adjacent niche
+## Full loop (weekly)
 
-For each idea: the trend it rides, the hook (scored with
-`ig-reel/hookscore.py --hook`, keep 70+), the platform it is born on, and why
-now. Show the slate and get one "go" before writing everything.
-
-## 3. Make: one idea, every platform
-
-For each idea, route to the specialist. Do not rewrite their method.
+0. **Know the creator.** `workspace/brand.md`, `workspace/voice.json`,
+   `workspace/learnings.md` (read this first: last week's winners and losers).
+1. **Radar**: as above, plus the manual TikTok/Instagram pass in trend-hunt.
+   Re-use a radar from the last 7 days instead of re-running.
+2. **Slate**: N ideas = the user's weekly capacity, never more. 60% ride
+   (rising trends), 30% proven (their own outliers remade), 10% bet (a format
+   from an adjacent niche nobody here uses yet). Show it; get one "go".
+3. **Make**, per idea:
 
 | piece | skill |
 | --- | --- |
-| trend format breakdown + shoot plan | `/reel-mimic` |
-| Reel / TikTok script, on-screen text, beat sheet | `/ig-reel` |
-| YouTube Short | `/yt-shorts` (cut from long) or `/ig-reel` then `/yt-seo` |
-| long YouTube video | `/yt-script`, then `/yt-package`, `/yt-seo`, `/yt-chapters` |
-| carousel | `/ig-carousel` |
-| stories for the day | `/ig-story` |
-| caption + hashtags | `/ig-caption` |
+| style of the reference | `/viral-extract` |
+| the spoken script | `/script-forge` |
+| shoot plan, beat-timed edit sheet, 2D remake | `/reel-mimic` |
+| captions burned on their footage in the reference style | `viral-extract/scripts/captions.py` |
+| Reel / TikTok caption | `/ig-caption` |
+| YouTube Short / long-form packaging | `/yt-shorts`, `/yt-package`, `/yt-seo`, `/yt-chapters` |
+| carousel, stories | `/ig-carousel`, `/ig-story` |
 | one long asset into a week of posts | `/ig-repurpose` |
-| a product, offer or launch to promote | `/founder-offer`, `/founder-marketing`, `/founder-launch` |
+| something to sell | `/founder-offer`, `/founder-marketing`, `/founder-launch` |
 
-TikTok uses the Reel script; adapt only the caption (shorter, 3 to 5
-hashtags, the search phrase in the first line) and the sound note.
-
-## 4. Gate: humanize and check
-
-Every word a viewer reads or hears goes through `/ig-human`. Then check each
-piece:
-
-- Hook lands in under 2 seconds and makes sense with the sound off.
-- One idea per video. One ask per caption.
-- On-screen text sits inside the safe zone (not under the caption or buttons).
-- Nothing copies another creator's script, footage or voice.
-- No claim the user cannot back up.
-
-## 5. Ship: `/publish`
-
-Builds the calendar and, only with the user's explicit yes per batch,
-schedules through Zernio. Without a connected scheduler, it hands back a
-copy-paste pack.
-
-## 6. Learn: close the loop
-
-After 48 to 72 hours, pull results (`/publish` reads Zernio analytics, or the
-user pastes insights). Run `/ig-audit` and `/yt-retention` where there is data.
-Write `workspace/learnings.md`: which hooks and formats beat the user's own
-median, which did not, and what changes next week. Step 2 reads this file
-first next time.
-
-## Output
-
-Everything goes in `workspace/content/<week>/`: one folder per idea with
-`script.md`, `caption.md`, `shotlist.md`, and a top-level `WEEK.md` calendar.
-End every run with the slate table and one question: **ship it, or change it?**
+4. **Gate**: scriptcheck >= 80 with no red check, viewer panel run, every
+   viewer-facing word through `/ig-human`, on-screen text inside the safe
+   zone, nothing copied from another creator, no claim they can't back.
+5. **Ship**: `/publish` (Zernio, only with an explicit yes per batch).
+6. **Learn**: 48 to 72 h later, each post's views against their own median.
+   Update `workspace/learnings.md`: which trends, hooks, formats and caption
+   styles beat their median, which didn't, what changes next week.
 
 ## The bar
 
-"Viral" is not a promise anyone can make; the algorithm decides. What you
-control is the odds: trend timing, hook strength, retention structure and
-volume. Say that once, plainly, if the user expects guarantees, then do the
-work that moves the odds.
+Nobody can promise viral; the algorithm decides. What you control is the
+odds: trend timing, hook strength, retention structure, a voice that sounds
+like a person, and volume. Say that once if they expect guarantees, then do
+the work that moves the odds.

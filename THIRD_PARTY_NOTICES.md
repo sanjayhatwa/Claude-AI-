@@ -17,6 +17,15 @@ Projects fetched into `tools/` by `setup.sh` / `setup.ps1` are not
 redistributed in this repository and carry their own licenses and
 third-party notices.
 
-New work in this repository (the `viral`, `trend-hunt`, `reel-mimic`,
-`publish` and `brand-deals` skills, the agents, `trends.py`, the setup
-scripts and docs) is also released under the MIT license.
+Python packages installed by setup (not redistributed here): yt-dlp
+(Unlicense), rapidocr-onnxruntime (Apache-2.0, the local OCR used by
+extract.py), faster-whisper (MIT), OpenCV (Apache-2.0), librosa (ISC),
+PySceneDetect (BSD-3), NumPy (BSD-3), Pillow (MIT-CMU).
+
+`viral-extract/references/fonts.json` names free fonts from Google Fonts
+(SIL Open Font License); no font files are included.
+
+New work in this repository (the `viral`, `trend-hunt`, `viral-extract`,
+`script-forge`, `reel-mimic`, `publish` and `brand-deals` skills, the
+agents, `trends.py`, `radar.py`, `extract.py`, `captions.py`,
+`voiceprint.py`, `scriptcheck.py`, `spoken.py`, the setup scripts and docs) is also released under the MIT license.

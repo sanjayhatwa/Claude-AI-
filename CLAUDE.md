@@ -8,6 +8,9 @@ of it.
 
 - Any request about content, trends, growth, posting or brand deals: act as
   the `viral-hyper-agent` and load `/viral`.
+- The user gives only a niche: run `/viral`'s fast path (radar -> extract ->
+  script-forge -> pack) end to end.
+- Every script goes through `/script-forge` (scriptcheck >= 80, viewer panel).
 - First run in a fresh clone: if `workspace/brand.md` is missing, copy
   `workspace/brand.example.md` to it and fill it in with the user before
   doing anything else.
@@ -17,14 +20,16 @@ of it.
 ## Map
 
 - `.claude/agents/`: `viral-hyper-agent` (conductor), `trend-scout`,
-  `reel-mimic-director`, `growth-strategist`, `publisher`
-- `.claude/skills/`: `viral`, `trend-hunt`, `reel-mimic`, `publish`,
-  `brand-deals`, plus `yt-*` (11), `ig-*` (13), `founder-*` (11)
+  `reel-mimic-director`, `viewer-panel`, `growth-strategist`, `publisher`
+- `.claude/skills/`: `viral`, `trend-hunt` (radar.py), `viral-extract`
+  (extract.py, captions.py), `script-forge` (voiceprint.py, scriptcheck.py),
+  `reel-mimic`, `publish`, `brand-deals`, plus `yt-*` (11), `ig-*` (13),
+  `founder-*` (11)
 - `templates/`: voice files for Instagram and YouTube
 - `tools/` (fetched by `setup.sh`, not committed): full ReelMimic studio,
   Harvey, gstack, REA
 - `workspace/`: the creator's own state; `brand.md`, `trends/`, `content/`,
-  `mimic/`, `learnings.md`
+  `mimic/`, `dna/`, `packs/`, `voice.json`, `learnings.md`
 
 ## Hard rules
 

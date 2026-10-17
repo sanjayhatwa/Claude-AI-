@@ -18,6 +18,12 @@ characters or voice. It is the structure.
 
 ## Step 1: break the reference down
 
+Run `/viral-extract` first: it measures the captions (font look, size,
+position, colours, words per card), the dialogue (pace, rhythm, hook,
+re-hooks) and the edit in one pass, and `captions.py` re-applies the caption
+style to the user's footage at the end. The analyzer below is the edit part of
+that, usable on its own:
+
 ```bash
 python3 .claude/skills/reel-mimic/scripts/analyze.py "<file-or-url>" --out workspace/mimic/<slug>/analysis
 ```
@@ -58,6 +64,8 @@ the route with the user (one question, not five):
 
 Write `workspace/mimic/<slug>/PLAN.md`:
 
+0. Write the spoken lines with `/script-forge` (voiceprint, three angles,
+   scriptcheck, viewer-panel swipe test), sized to the reference's wpm.
 1. **Three hook options** in the reference's hook shape but the user's story.
    Score each with `python3 .claude/skills/ig-reel/hookscore.py --hook "<hook>"` and
    keep the best.

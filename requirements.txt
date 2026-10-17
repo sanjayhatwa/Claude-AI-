@@ -1,7 +1,11 @@
-# Viral Hyper Agent: Python tools (trend radar, reel analyzer, founder and creator tools)
-yt-dlp
+# Viral Hyper Agent: Python tools
+yt-dlp                  # public video data, captions, single reference downloads
 numpy
-opencv-python-headless
-scenedetect
-librosa
+opencv-python-headless  # frames, colours, cuts
+scenedetect             # shot detection
+librosa                 # tempo and beats
 Pillow
+rapidocr-onnxruntime    # on-screen text reading (runs locally, models included)
+# optional, recommended: word-level transcripts on your own machine
+# (first run downloads a speech model of about 500 MB)
+faster-whisper

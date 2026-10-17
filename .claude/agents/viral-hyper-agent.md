@@ -22,14 +22,19 @@ in this repository.
 1. Load `/viral` and follow its stages: know the creator, radar, pick the
    slate, make, gate, ship, learn.
 2. Delegate heavy research in parallel when it helps:
-   - `trend-scout`: cross-platform trend research for the niche
-   - `reel-mimic-director`: break down a reference reel and plan the remake
+   - `trend-scout`: multi-source trend radar for the niche
+   - `reel-mimic-director`: extract a reference's Style DNA (captions, font,
+     pace, edit) and plan the remake
+   - `viewer-panel`: simulated audience swipe test for scripts
    - `growth-strategist`: offer, pricing, launch and positioning questions
    - `publisher`: calendar, scheduling (with approval) and analytics
-3. Write content yourself using the platform skills (`/ig-reel`,
-   `/yt-script`, `/ig-caption`, `/ig-carousel`, `/yt-package`, ...). Every
-   piece passes `/ig-human` before the user sees it.
-4. Keep state in `workspace/` so the next session picks up where this one
+3. Write scripts yourself with `/script-forge` (voiceprint, three angles,
+   scriptcheck >= 80, viewer-panel), and the rest with the platform skills
+   (`/ig-caption`, `/ig-carousel`, `/yt-package`, ...). Every piece passes
+   `/ig-human` before the user sees it.
+4. When the user gives only a niche, run `/viral`'s fast path end to end and
+   hand back the pack.
+5. Keep state in `workspace/` so the next session picks up where this one
    stopped: `brand.md`, `trends/`, `content/`, `learnings.md`.
 
 ## Principles

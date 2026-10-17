@@ -1,0 +1,33 @@
+{
+  "note": "Free (SIL Open Font License) look-alikes for the text styles that dominate short-form video, grouped by what extract.py can measure: weight, width and case. All are on Google Fonts. Rank breaks ties: lower = more common in captions. extract.py proposes candidates; the agent confirms by looking at fonts_sheet.jpg. Add your own fonts freely.",
+  "fonts": [
+    {"name": "Montserrat Black", "family": "Montserrat", "weights": ["black", "bold"], "width": "wide", "cases": ["upper", "title", "sentence"], "rank": 1, "look": "geometric sans, wide round O, the default 'bold caption' look"},
+    {"name": "Montserrat ExtraBold", "family": "Montserrat", "weights": ["bold", "black"], "width": "wide", "cases": ["upper", "title", "sentence", "lower"], "rank": 2, "look": "as above, one step lighter"},
+    {"name": "Poppins Black", "family": "Poppins", "weights": ["black", "bold"], "width": "wide", "cases": ["upper", "title", "sentence", "lower"], "rank": 3, "look": "geometric, perfectly circular bowls, friendly"},
+    {"name": "Inter Black", "family": "Inter", "weights": ["black", "bold"], "width": "normal", "cases": ["upper", "title", "sentence", "lower"], "rank": 4, "look": "neutral grotesk, tall x-height, app-like"},
+    {"name": "Inter Bold", "family": "Inter", "weights": ["bold", "regular"], "width": "normal", "cases": ["sentence", "lower", "title"], "rank": 8, "look": "clean UI caption, platform-native feel"},
+    {"name": "Roboto Bold", "family": "Roboto", "weights": ["bold", "regular"], "width": "normal", "cases": ["sentence", "lower", "title"], "rank": 9, "look": "Android-native, neutral"},
+    {"name": "Archivo Black", "family": "Archivo Black", "weights": ["black"], "width": "normal", "cases": ["upper", "title"], "rank": 6, "look": "chunky grotesk, tight apertures, punchy"},
+    {"name": "Anton", "family": "Anton", "weights": ["black", "bold"], "width": "condensed", "cases": ["upper"], "rank": 5, "look": "tall condensed impact-style caps, MrBeast-era thumbnail feel"},
+    {"name": "Bebas Neue", "family": "Bebas Neue", "weights": ["bold", "regular"], "width": "condensed", "cases": ["upper"], "rank": 7, "look": "condensed caps, lighter than Anton, cinematic titles"},
+    {"name": "Oswald Bold", "family": "Oswald", "weights": ["bold", "regular"], "width": "condensed", "cases": ["upper", "title"], "rank": 10, "look": "condensed gothic with lowercase"},
+    {"name": "League Gothic", "family": "League Gothic", "weights": ["regular", "bold"], "width": "condensed", "cases": ["upper"], "rank": 14, "look": "very narrow gothic caps"},
+    {"name": "Bangers", "family": "Bangers", "weights": ["black", "bold"], "width": "normal", "cases": ["upper"], "rank": 11, "look": "comic-book slanted caps, gaming and meme edits"},
+    {"name": "Luckiest Guy", "family": "Luckiest Guy", "weights": ["black"], "width": "wide", "cases": ["upper"], "rank": 12, "look": "bubbly cartoon caps, kids and gaming"},
+    {"name": "Lilita One", "family": "Lilita One", "weights": ["black", "bold"], "width": "normal", "cases": ["upper", "title", "sentence"], "rank": 13, "look": "rounded heavy display, playful"},
+    {"name": "Fredoka Bold", "family": "Fredoka", "weights": ["bold", "black"], "width": "wide", "cases": ["sentence", "lower", "title"], "rank": 15, "look": "soft rounded terminals"},
+    {"name": "Nunito Black", "family": "Nunito", "weights": ["black", "bold"], "width": "normal", "cases": ["sentence", "lower", "title"], "rank": 16, "look": "rounded sans, gentle"},
+    {"name": "Rubik Bold", "family": "Rubik", "weights": ["bold", "black"], "width": "normal", "cases": ["upper", "title", "sentence"], "rank": 17, "look": "slightly rounded corners, modern"},
+    {"name": "Space Grotesk Bold", "family": "Space Grotesk", "weights": ["bold", "regular"], "width": "normal", "cases": ["sentence", "lower", "title"], "rank": 20, "look": "tech / startup quirky grotesk"},
+    {"name": "Playfair Display Bold", "family": "Playfair Display", "weights": ["bold", "black", "regular"], "width": "normal", "cases": ["title", "sentence", "lower"], "rank": 18, "look": "high-contrast serif, editorial, luxury, storytelling"},
+    {"name": "DM Serif Display", "family": "DM Serif Display", "weights": ["regular", "bold"], "width": "normal", "cases": ["title", "sentence", "lower"], "rank": 19, "look": "soft display serif, aesthetic / lifestyle"},
+    {"name": "Instrument Serif", "family": "Instrument Serif", "weights": ["regular", "light"], "width": "condensed", "cases": ["sentence", "lower", "title"], "rank": 21, "look": "thin condensed serif, minimalist aesthetic edits"},
+    {"name": "Courier Prime", "family": "Courier Prime", "weights": ["regular", "bold"], "width": "wide", "cases": ["sentence", "lower", "upper"], "rank": 22, "look": "typewriter, documentary and horror text"},
+    {"name": "Space Mono Bold", "family": "Space Mono", "weights": ["bold", "regular"], "width": "wide", "cases": ["upper", "sentence", "lower"], "rank": 23, "look": "monospace, hacker / tech / glitch"},
+    {"name": "Special Elite", "family": "Special Elite", "weights": ["regular"], "width": "wide", "cases": ["sentence", "upper", "lower"], "rank": 24, "look": "worn typewriter, true crime and horror"},
+    {"name": "Creepster", "family": "Creepster", "weights": ["black", "bold"], "width": "normal", "cases": ["upper"], "rank": 25, "look": "dripping horror display"},
+    {"name": "Permanent Marker", "family": "Permanent Marker", "weights": ["bold", "regular"], "width": "wide", "cases": ["upper", "sentence"], "rank": 26, "look": "marker handwriting, DIY / vlog"},
+    {"name": "Caveat Bold", "family": "Caveat", "weights": ["bold", "regular"], "width": "condensed", "cases": ["sentence", "lower"], "rank": 27, "look": "casual handwriting annotations"},
+    {"name": "Inter Light", "family": "Inter", "weights": ["light", "regular"], "width": "normal", "cases": ["sentence", "lower"], "rank": 28, "look": "thin minimal aesthetic captions"}
+  ]
+}

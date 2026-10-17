@@ -34,23 +34,30 @@ what the user will and will not do on camera). If not, ask for three things
 and write it: **niche in one line, 3 to 6 search phrases, and 6 to 12
 accounts they watch.** Do not ask more than that before starting.
 
-## Step 1: the public radar (YouTube Shorts)
-
-Shorts is where short-form view counts are public and no login is needed, and
-the same hooks and formats run on Reels and TikTok the same week.
+## Step 1: the radar (one command)
 
 ```bash
-python3 .claude/skills/trend-hunt/scripts/trends.py all \
-  "phrase one" "phrase two" "phrase three" --dir workspace/trends/<date>
+python3 .claude/skills/trend-hunt/scripts/radar.py "<niche>" --geo <country> \
+  --subreddits <sub1,sub2> --queries "<phrase>,<phrase>" --dir workspace/trends/<date>
 ```
 
-It searches newest-first, keeps videos under 3 minutes, fetches each channel's
-median, ranks by multiple, and pulls the spoken first three seconds of the top
-ten from auto-captions. Outputs `ranked.json`, `report.txt`, and
-`swipe-input.tsv` (ready for `ig-viral/swipe.py`).
+From just the niche it expands to ~16 searches across formats and intents
+(mistakes, POV, storytime, tier list, vs, explained, challenge...) plus what
+people are typing right now (YouTube autocomplete), then collects YouTube
+Shorts (newest and top), long-form, Reddit's top posts of the week and Google
+Trends' trending searches. It looks up upload date, likes, comments and each
+channel's baseline, computes outlier multiple, views per day and engagement,
+pulls the spoken hooks, clusters videos into trends with a stage (rising,
+peaking, saturated), and picks a slate capped at two per format so it's
+varied. Writes `RADAR.md` (read this), `radar.json` and `swipe-input.tsv`.
 
-If YouTube is unreachable (some cloud sandboxes block it), say so in one line
-and continue with Steps 2 and 3. Never invent numbers to fill the gap.
+Takes 3 to 8 minutes. It's polite by design: a few dozen requests, spaced out.
+
+For the top 2 to 3 trends, run `/viral-extract` on the best example of each
+so the writing stage has its exact style, pace and hook shape.
+
+If YouTube is unreachable (some cloud sandboxes block it), RADAR.md says so.
+Continue with Steps 2 and 3. Never invent numbers to fill the gap.
 
 ## Step 2: Instagram and TikTok, by hand, at human speed
 
@@ -93,7 +100,7 @@ under 1.5x. Telling the user what to stop is half the value.
 Close with sample size and confidence in plain words. 40 posts across 8
 creators supports a claim. 12 posts does not, and you say so.
 
-Write the result to `workspace/trends/<date>/TRENDS.md`. `/viral`,
+Write the result to `workspace/trends/<date>/TRENDS.md` (RADAR.md plus your manual pass and calls). `/viral`,
 `/reel-mimic`, `/ig-reel`, `/yt-script` and `/ig-plan` all read it.
 
 ## Never
