@@ -51,7 +51,8 @@ def status():
         return {"installed": False, "running": False, "dir": DIR}
     rev = subprocess.run(["git", "-C", DIR, "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
     return {"installed": True, "running": running(), "dir": DIR, "commit": rev,
-            "node": shutil.which("node") is not None, "built": os.path.isdir(os.path.join(DIR, "app", "dist"))}
+            "node": shutil.which("node") is not None, "chrome": find_chrome() or False,
+            "built": os.path.isdir(os.path.join(DIR, "app", "dist"))}
 
 
 def fetch():
@@ -62,6 +63,30 @@ def fetch():
     subprocess.run(["git", "clone", "-q", "--filter=blob:none", url, DIR], check=True)
     subprocess.run(["git", "-C", DIR, "checkout", "-q", rev], check=True)
     return DIR
+
+
+def find_chrome():
+    """ReelMimic renders frames with Chrome; find one so the user doesn't have to set CHROME_PATH."""
+    if os.environ.get("CHROME_PATH") and os.path.exists(os.environ["CHROME_PATH"]):
+        return os.environ["CHROME_PATH"]
+    for name in ("google-chrome", "google-chrome-stable", "chrome", "chromium", "chromium-browser", "msedge"):
+        path = shutil.which(name)
+        if path:
+            return path
+    candidates = [
+        os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ]
+    pw = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or "/opt/pw-browsers"
+    if os.path.isdir(pw):
+        for d in sorted(os.listdir(pw), reverse=True):
+            if d.startswith("chromium"):
+                candidates.append(os.path.join(pw, d, "chrome-linux", "chrome"))
+    return next((c for c in candidates if c and os.path.exists(c)), None)
 
 
 def _script(name):
@@ -95,8 +120,14 @@ def main(argv=None):
     if running():
         print("ReelMimic is already running at", URL)
         return 0
+    env = dict(os.environ)
+    chrome = find_chrome()
+    if chrome:
+        env["CHROME_PATH"] = chrome
+    else:
+        print("Chrome was not found; ReelMimic needs it to render frames: https://www.google.com/chrome", file=sys.stderr)
     print("Starting ReelMimic at %s (Ctrl+C to stop)" % URL)
-    return subprocess.run(_script("start"), cwd=DIR).returncode
+    return subprocess.run(_script("start"), cwd=DIR, env=env).returncode
 
 
 if __name__ == "__main__":
