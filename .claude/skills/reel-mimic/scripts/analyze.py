@@ -252,7 +252,7 @@ def audio(path, info, out):
     peaks = peak_candidates(y, sr, beats)
     return {"present": True, "silent": False, "levels_db": {"L": round(L, 1), "R": round(R, 1), "mono": round(M, 1)},
             "phase_inverted": bool(phase_inverted), "noise_floor_db": round(float(np.percentile(w, 10)), 1) if w else None,
-            "bpm": round(bpm, 2), "beat_seconds": round(60 / bpm, 4), "first_beat": round(float(beats[0]), 3) if len(beats) else None,
+            "bpm": round(bpm, 2), "beat_seconds": round(60 / bpm, 4) if bpm else None, "first_beat": round(float(beats[0]), 3) if len(beats) else None,
             "beats": [round(float(b), 3) for b in beats],
             "best_30s_starts": [{"start": round(s, 2), "density": round(m, 3)} for m, s in cands[:5]],
             "peak_candidates": peaks,

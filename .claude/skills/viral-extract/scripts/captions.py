@@ -61,6 +61,12 @@ def ass_time(t):
     return "%d:%02d:%05.2f" % (h, m, s)
 
 
+def display_token(word):
+    """What a caption shows: trailing . , ; : are dropped (they end cards, nobody reads them);
+    decimals like 3.5 and ? ! stay."""
+    return re.sub(r"[.,;:]+$", "", word) or word
+
+
 def apply_case(text, case):
     if case == "upper":
         return text.upper()
@@ -105,7 +111,8 @@ def chunk(words, per_card=3, max_chars=22, pause=0.35):
 def caption_style(dna_path):
     if not dna_path:
         return dict(DEFAULT_CAPTION)
-    dna = json.load(open(dna_path, encoding="utf-8"))
+    with open(dna_path, encoding="utf-8") as f:
+        dna = json.load(f)
     cap = ((dna.get("text") or {}).get("caption_track")) or {}
     merged = dict(DEFAULT_CAPTION)
     merged.update({k: v for k, v in cap.items() if v is not None or k in ("highlight", "outline", "box")})
@@ -150,9 +157,15 @@ def build_ass(words, cap, W, H, font, pop=False):
     cards = chunk(words, per_card, max_chars)
     for ci, card in enumerate(cards):
         start = card[0]["s"]
-        end = cards[ci + 1][0]["s"] if ci + 1 < len(cards) else card[-1]["e"] + 0.4
+        hold = card[-1]["e"] + 0.4
+        if ci + 1 < len(cards):
+            nxt = cards[ci + 1][0]["s"]
+            # stay up until the next card, unless a real pause follows: then clear
+            end = hold if nxt - card[-1]["e"] > 0.6 else nxt
+        else:
+            end = hold
         end = max(end, start + 0.25)
-        tokens = [apply_case(w["w"], cap.get("case")) for w in card]
+        tokens = [apply_case(display_token(w["w"]), cap.get("case")) for w in card]
         prefix = "{\\an%d\\pos(%d,%d)%s}" % (
             an, x, y, "\\fscx80\\fscy80\\t(0,90,\\fscx100\\fscy100)" if pop else "")
         if cap.get("highlight") and len(card) > 1:

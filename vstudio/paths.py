@@ -24,6 +24,7 @@ _SKILL_FILES = {
     "voiceprint": ("script-forge", "scripts", "voiceprint.py"),
     "deadair": ("yt-edit", "deadair.py"),
     "hookscore": ("ig-reel", "hookscore.py"),
+    "ythook": ("yt-script", "hookscore.py"),
 }
 
 

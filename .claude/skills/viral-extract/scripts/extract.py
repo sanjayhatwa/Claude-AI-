@@ -95,7 +95,8 @@ def parse_srt_vtt(text):
 
 
 def load_captions(path):
-    raw = open(path, encoding="utf-8", errors="replace").read()
+    with open(path, encoding="utf-8", errors="replace") as f:
+        raw = f.read()
     if path.endswith(".json3") or raw.lstrip().startswith("{"):
         return parse_json3(json.loads(raw))
     if path.endswith(".json"):
@@ -226,6 +227,11 @@ def _ocr_engine():
         from rapidocr_onnxruntime import RapidOCR
     except ImportError:
         return None
+    try:  # keep the OCR stack from phoning home; everything here runs offline
+        import onnxruntime
+        onnxruntime.disable_telemetry_events()
+    except Exception:
+        pass
     return RapidOCR()
 
 
@@ -694,7 +700,11 @@ def font_candidates(look, path=FONTS_REF, n=4):
 # --------------------------------------------------------------------------- edit DNA
 
 def edit_dna(report, words=None):
-    shots = report.get("shots") or {}
+    # analyze.py keeps the shot list in "shots" and the counts in "pacing";
+    # older reports had the counts in "shots"
+    shots = report.get("pacing") or report.get("shots") or {}
+    if not isinstance(shots, dict):
+        shots = {}
     details = report.get("shot_details") or []
     dur = (report.get("video") or {}).get("duration") or report.get("duration")
     cuts = [d["start"] for d in details[1:]] if details else []
