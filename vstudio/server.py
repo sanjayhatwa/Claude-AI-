@@ -595,9 +595,25 @@ class Studio:
             if name not in templates.CATALOG:
                 problems.append("add_templates: unknown template %r" % name)
                 continue
+            params = dict(call.get("params") or {}) if isinstance(call.get("params"), dict) else {}
+            try:
+                from . import planner
+                # the planner's rule: a catalog default that is sample content never ships, and a template
+                # that shows a number as fact needs the real number
+                missing = [k for k in planner.REQUIRED_NUMBERS.get(name, []) if params.get(k) in (None, "", [])]
+                if missing:
+                    problems.append("add_templates: %s needs %s (sample numbers are never used)"
+                                    % (name, ", ".join(missing)))
+                    continue
+                kinds = templates.CATALOG[name]["params"]
+                for k in planner.SAMPLE_PARAMS.get(name, []):
+                    if params.get(k) is None and k in kinds:
+                        params[k] = [] if str(kinds[k].get("type", "")).startswith("list") else ""
+            except ImportError:
+                pass
             try:
                 start, end = float(call.get("start")), float(call.get("end"))
-                layers = templates.build(name, call.get("params") or {}, start, end, canvas, style)
+                layers = templates.build(name, params, start, end, canvas, style)
             except Exception as e:
                 problems.append("add_templates: %s failed: %s" % (name, e))
                 continue
@@ -642,7 +658,7 @@ class Studio:
             base += ["", catalog]
         prompt = "\n".join(base)
         new_spec, summary, errors, validated = None, "", [], False
-        for attempt in range(2):
+        for _ in range(2):                            # one retry with the problems listed
             try:
                 answer = llm.complete_json(prompt, schema=ASK_SCHEMA, system=ASK_SYSTEM, timeout=self.ask_timeout)
             except unavailable as e:

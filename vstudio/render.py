@@ -48,6 +48,7 @@ import fractions
 import math
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -131,22 +132,38 @@ def _cv_affine(M):
 
 # --------------------------------------------------------------------------- blending
 
-def split_alpha(spr, opacity=1.0):
-    """Premultiplied RGBA -> (rgb, 1 - alpha as 3 channels), contiguous, ready for in-place OpenCV blending."""
+def _needs_inverse(mode):
+    """add and screen only use the premultiplied colour; normal and multiply also need 1 - alpha."""
+    return mode not in ("add", "screen")
+
+
+def split_alpha(spr, opacity=1.0, inverse=True):
+    """Premultiplied RGBA -> (rgb, 1 - alpha as 3 channels), contiguous, ready for in-place OpenCV blending.
+
+    inverse=False skips the second array (returned as None) for blend modes that do not use it;
+    on full-frame sprites that saves two 25 MB temporaries per frame.
+    """
     rgb = cv2.cvtColor(spr, cv2.COLOR_RGBA2RGB)
-    a = cv2.extractChannel(spr, 3)
     if opacity < 0.999:
         rgb *= opacity
+    if not inverse:
+        return rgb, None
+    a = cv2.extractChannel(spr, 3)
+    if opacity < 0.999:
         a *= opacity
     return rgb, cv2.cvtColor(1.0 - a, cv2.COLOR_GRAY2RGB)
 
 
 def _blend(region, rgb, inv3, mode):
-    """Blend premultiplied rgb with its (1 - alpha) onto an opaque float region, in place (OpenCV, no temporaries)."""
+    """Blend premultiplied rgb with its (1 - alpha) onto an opaque float region, in place (OpenCV).
+
+    inv3 may be None for add and screen, which do not use it.
+    """
     if mode == "add":
         cv2.add(region, rgb, dst=region)
-    elif mode == "screen":  # s + d - s*d
-        cv2.multiply(region, cv2.subtract(np.ones_like(rgb), rgb), dst=region)
+    elif mode == "screen":  # s + d - s*d, with a single temporary
+        sd = cv2.multiply(region, rgb)
+        cv2.subtract(region, sd, dst=region)
         cv2.add(region, rgb, dst=region)
     elif mode == "multiply":  # d * (s + 1 - a)
         cv2.multiply(region, cv2.add(rgb, inv3), dst=region)
@@ -157,18 +174,22 @@ def _blend(region, rgb, inv3, mode):
 
 def _blend_opaque(region, src, opacity, mode):
     """Blend an opaque RGB source at a uniform opacity."""
-    if opacity >= 0.999 and mode == "normal":
-        region[...] = src
+    if mode == "normal":
+        if opacity >= 0.999:
+            region[...] = src
+        else:
+            cv2.addWeighted(region, 1.0 - opacity, src, opacity, 0.0, dst=region)
         return
     rgb = src * opacity if opacity < 0.999 else src
-    _blend(region, rgb, np.full_like(rgb, 1.0 - opacity), mode)
+    _blend(region, rgb, np.full_like(rgb, 1.0 - opacity) if mode == "multiply" else None, mode)
 
 
 def composite(canvas, spr, M, blend="normal", opacity=1.0, crisp=False, split=None):
     """Place a sprite (premultiplied RGBA float32, or opaque RGB) onto an opaque RGB canvas with matrix M.
 
     crisp: when M is a pure translation, snap to whole pixels (no resampling).
-    split: (rgb, inv3) of spr from split_alpha, when the caller caches it.
+    split: (rgb, inv3) of spr from split_alpha when the caller caches it, or a callable returning it
+           (only called when the sprite is placed without resampling, the one case that uses it).
     """
     H, W = canvas.shape[:2]
     h, w = spr.shape[:2]
@@ -189,10 +210,11 @@ def composite(canvas, spr, M, blend="normal", opacity=1.0, crisp=False, split=No
             _blend_opaque(region, spr[sy, sx], opacity, blend)
             return
         if split is None or opacity < 0.999:
-            split = split_alpha(spr[sy, sx], opacity)
-            _blend(region, split[0], split[1], blend)
+            rgb, inv3 = split_alpha(spr[sy, sx], opacity, inverse=_needs_inverse(blend))
+            _blend(region, rgb, inv3, blend)
         else:
-            _blend(region, split[0][sy, sx], split[1][sy, sx], blend)
+            rgb, inv3 = split() if callable(split) else split
+            _blend(region, rgb[sy, sx], inv3[sy, sx], blend)
         return
 
     # downscaling a lot: shrink with area averaging first, so the warp does not alias
@@ -229,7 +251,7 @@ def composite(canvas, spr, M, blend="normal", opacity=1.0, crisp=False, split=No
         spr = _to_rgba(spr)
     warped = cv2.warpAffine(spr, cvM, size, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
                             borderValue=(0, 0, 0, 0))
-    rgb, inv3 = split_alpha(warped, opacity)
+    rgb, inv3 = split_alpha(warped, opacity, inverse=_needs_inverse(blend))
     _blend(region, rgb, inv3, blend)
 
 
@@ -379,15 +401,18 @@ def _shape_sprite(L, R, draw_p):
             inner = inner * reveal
 
     arr = np.zeros((H, W, 4), np.float32)
-    if inner is not None and sw > 0:
-        textrender.over(arr, textrender.rgba01(stroke.get("color", "#000000")), fill)
-        body = inner
-    else:
-        body = fill
+    stroked = inner is not None and sw > 0
+    body = inner if stroked else fill
     if L.get("gradient"):
         textrender.over_gradient(arr, L["gradient"], body, m, h)
     else:
         textrender.over(arr, textrender.rgba01(L.get("color", "#FFFFFF")), body)
+    if stroked:
+        # the stroke band (fill - inner) and the body (inner) are disjoint areas, so their premultiplied
+        # colours add: seamless where the body is opaque, a clean outline where it is transparent
+        band = np.zeros_like(arr)
+        textrender.over(band, textrender.rgba01(stroke.get("color", "#000000")), np.clip(fill - inner, 0, 1))
+        arr += band
     return arr, (m, m, m + w, m + h)
 
 
@@ -751,7 +776,7 @@ class Compositor:
         crisp = not st["moving"] and not (cam is not None and _camera_moving(self.spec, t))
         split = None
         if spr is cached and spr.shape[2] == 4 and L["type"] in ("text", "counter", "shape", "image"):
-            split = self._split(spr)
+            split = lambda: self._split(spr)  # noqa: E731 - computed only if composite places it unresampled
         composite(canvas, spr, M, L["blend"], st["opacity"], crisp=crisp, split=split)
 
     def _split(self, spr):
@@ -938,6 +963,44 @@ def _caption_style(cap):
     return mod, style
 
 
+CAPTION_GAP = 0.6  # a silence longer than this ends the card (0.4 s after its last word) instead of holding it
+
+
+def _caption_runs(words, gap=CAPTION_GAP):
+    """Split timeline words into runs at silences longer than gap.
+
+    captions.build_ass keeps a card up until the next card starts; across a long gap (a beat whose line is
+    already on screen as a graphic, b-roll, a cut pause) that would leave a stale card on screen for seconds.
+    Each run is built separately, so its last card ends 0.4 s after its last word.
+    """
+    runs, cur = [], []
+    for w in sorted(words, key=lambda w: float(w["s"])):
+        if cur and float(w["s"]) - float(cur[-1]["e"]) > gap:
+            runs.append(cur)
+            cur = []
+        cur.append(w)
+    if cur:
+        runs.append(cur)
+    return runs
+
+
+_OVERRIDE = re.compile(r"(\{[^}]*\})")
+_TRAILING_PUNCT = re.compile(r"(?<=[^\s.,;:])[.,;:]+(?=\s|$)")
+
+
+def _clean_event(line):
+    """Drop trailing . , ; : from the words of one ASS Dialogue line (outside override tags).
+
+    The words keep their punctuation because captions.chunk ends cards on it; on screen, short-form
+    captions read cleaner without it. ? and ! stay: they carry the tone.
+    """
+    head, sep, text = line.partition(",,0,0,0,,")
+    if not sep:
+        return line
+    parts = _OVERRIDE.split(text)
+    return head + sep + "".join(p if p.startswith("{") else _TRAILING_PUNCT.sub("", p) for p in parts)
+
+
 def build_captions(spec, W, H, workdir):
     """Write captions.ass (and copy its font) into workdir; returns the ffmpeg filter, or None without words."""
     cap = spec.get("captions")
@@ -949,7 +1012,14 @@ def build_captions(spec, W, H, workdir):
     fontname, weight = fonts.ass_font(font, fonts_dir)
     # the file's real weight decides libass's bold flag, so no faux-bold smear on heavy fonts
     style["font_look"] = dict(style.get("font_look") or {}, weight="bold" if weight >= 600 else "regular")
-    ass, _ = mod.build_ass(cap["words"], style, W, H, fontname, bool(cap.get("pop")))
+    ass = None
+    for run in _caption_runs(cap["words"]):
+        text, _ = mod.build_ass(run, style, W, H, fontname, bool(cap.get("pop")))
+        lines = text.splitlines()
+        if ass is None:  # header from the first run, Dialogue events from every run
+            ass = [l for l in lines if not l.startswith("Dialogue:")]
+        ass += [_clean_event(l) for l in lines if l.startswith("Dialogue:")]
+    ass = "\n".join(ass) + "\n"
     path = os.path.join(workdir, "captions.ass")
     with open(path, "w", encoding="utf-8") as f:
         f.write(ass)

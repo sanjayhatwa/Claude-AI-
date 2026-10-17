@@ -1242,7 +1242,8 @@ def _title_card(c, p):
     sub = c.body(p["sub"], f.d(46), f.SW * 0.9, lines=2) if p["sub"] else None
     gap, line_h = f.d(30), f.d(10)
     total = title.h + gap * 1.3 + line_h
-    total += (num.h + gap * 0.4) if num else 0
+    num_gap = gap * 0.9  # breathing room under a big numeral before the small kicker
+    total += (num.h + num_gap) if num else 0
     total += (kick.h + gap) if kick else 0
     total += (gap + sub.h) if sub else 0
     y = f.place("center", total)
@@ -1254,7 +1255,7 @@ def _title_card(c, p):
     if num:
         c.text("number", num, x, y, anchor=top_anchor, align=align, color=acc, enter=c.prof["rise"], at=g,
                until=content_until)
-        y += num.h + gap * 0.4
+        y += num.h + num_gap
     if kick:
         c.text("kicker", kick, x, y, anchor=top_anchor, align=align, color=acc, enter=("wipe-right", c.clk.din * 1.4),
                at=g, until=content_until)

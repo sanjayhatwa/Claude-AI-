@@ -84,12 +84,17 @@ def check_ffmpeg():
     have = {"libx264": bool(re.search(r"\blibx264\b", enc or "")),
             "aac": bool(re.search(r"\baac\b", enc or "")),
             "libass": bool(re.search(r"^\s*\S+\s+ass\s", flt or "", re.M))}
-    missing = [k for k, v in have.items() if not v]
+    # the audio mix (audio.py): music ducking, loudness, and amix's normalize option (ffmpeg 5.0+)
+    mix = {f: bool(re.search(r"^\s*\S+\s+%s\s" % f, flt or "", re.M)) for f in ("sidechaincompress", "loudnorm", "amix")}
+    if mix["amix"]:
+        _, amix_help = _run([exe, "-hide_banner", "-h", "filter=amix"])
+        mix["amix"] = "normalize" in (amix_help or "")
+    missing = [k for k, v in have.items() if not v] + ["%s filter" % k for k, v in mix.items() if not v]
     detail = "%s with %s" % (version, ", ".join(k for k, v in have.items() if v) or "no usable encoders")
     if missing:
         detail += "; missing " + ", ".join(missing)
-    fix = ("this ffmpeg build lacks %s (needed for H.264 video, AAC audio and burned-in captions); install a full "
-           "build: %s" % (", ".join(missing), _ffmpeg_install_hint()))
+    fix = ("this ffmpeg build lacks %s (needed for H.264 video, AAC audio, burned-in captions and the audio mix); "
+           "install a full build, version 5.0 or newer: %s" % (", ".join(missing), _ffmpeg_install_hint()))
     return _item("ffmpeg", code == 0 and not missing, detail, fix, required=True)
 
 
@@ -196,6 +201,12 @@ def check_fonts():
     detail = "%d font faces; caption fonts: %s" % (len(faces), ", ".join(have) if have else "none of the recommended")
     if missing:
         detail += "; missing " + ", ".join(missing)
+    try:
+        import fontTools  # noqa: F401 - only its presence matters
+    except ImportError:
+        # libass ignores variable fonts (Google ships Montserrat as one): without fontTools captions use the
+        # closest static font instead of the exact one
+        detail += "; for exact variable-font captions: python -m pip install fonttools"
     fix = ('%s   (free Google Fonts, OFL; or download from https://fonts.google.com and put the .ttf files in '
            'workspace/fonts)' % FONT_INSTALL)
     return _item("Fonts", len(have) >= 2, detail, fix)
@@ -224,8 +235,17 @@ def claude_logged_in(exe):
     return None, "unknown"
 
 
+def _claude_exe():
+    """The same executable the planner will run (llm.claude_path also looks outside PATH)."""
+    try:
+        from . import llm
+        return llm.claude_path()
+    except Exception:  # llm.py missing or broken: PATH only
+        return shutil.which("claude")
+
+
 def check_claude():
-    exe = shutil.which("claude")
+    exe = _claude_exe()
     fix_install = ("install Claude Code (npm install -g @anthropic-ai/claude-code, or the installer from "
                    "claude.com/claude-code), then run `claude` once and log in with your subscription")
     if not exe:

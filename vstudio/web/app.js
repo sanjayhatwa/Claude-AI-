@@ -559,6 +559,9 @@
       S.project = await api("GET", "/api/projects/" + encodeURIComponent(S.pid));
       S.jobs = S.project.jobs || [];
       S.jobs.forEach(j => { S.prevStatus[j.id] = j.status; });
+      const i = S.projects.findIndex(p => p.id === S.pid);
+      if (i >= 0) Object.assign(S.projects[i], { uploads: S.project.upload_count, jobs: S.jobs.length,
+                                                 updated: S.project.updated, last_job: S.jobs[0] || null });
     } catch (e) {
       if (e.status === 404) { S.pid = null; S.project = null; S.jobs = []; store.set("project", null); }
       else throw e;
@@ -1273,17 +1276,18 @@
       const specs = P.specs.filter(s => s.kind === "spec");
       const specList = specs.length ? h("table", { class: "table" }, h("tbody", null, specs.slice(0, 12).map(s => h("tr", { class: "click", tabindex: "0",
           onclick: () => go("timeline", { path: s.path }), onkeydown: e => { if (e.key === "Enter") go("timeline", { path: s.path }); } },
-        h("td", null, h("span", { class: "row", style: { gap: "8px" } }, icon("layers", 15), h("span", { text: s.name }))),
-        h("td", { class: "muted small ellipsis", text: s.path }),
-        h("td", { class: "num muted small", text: fmtAgo(s.mtime) })))))
+        h("td", { class: "cell-fill" }, h("div", { class: "row", style: { gap: "8px", flexWrap: "nowrap" } }, icon("layers", 15),
+          h("div", { style: { minWidth: 0 } }, h("div", { class: "ellipsis", style: { fontWeight: 600 }, text: s.name }),
+            h("div", { class: "muted small ellipsis", title: s.path, text: s.path })))),
+        h("td", { class: "num muted small nowrap", text: fmtAgo(s.mtime) })))))
         : h("p", { class: "muted small", text: "Timelines appear here after a reel, an auto-edit or a plan compile." });
 
       const jobsTable = P.jobs.length ? h("table", { class: "table" }, h("tbody", null, P.jobs.slice(0, 10).map(j => h("tr", { class: "click", tabindex: "0",
           onclick: () => go("jobs", { job: j.id }), onkeydown: e => { if (e.key === "Enter") go("jobs", { job: j.id }); } },
         h("td", null, statusPill(j)),
         h("td", null, h("span", { class: "pill kind plain", text: KIND_LABEL[j.kind] || j.kind })),
-        h("td", { class: "ellipsis", style: { maxWidth: "340px" }, text: j.title }),
-        h("td", { class: "num muted small", text: fmtAgo(j.created) })))))
+        h("td", { class: "cell-fill", title: j.title, text: j.title }),
+        h("td", { class: "num muted small nowrap", text: fmtAgo(j.created) })))))
         : h("p", { class: "muted small", text: "Nothing has run in this project yet." });
 
       el.appendChild(h("div", { class: "split", style: { marginTop: "24px" } },
@@ -1346,6 +1350,10 @@
             try { await submitJob("render", { spec }); toast("Rendering full quality", { kind: "info", message: "Follow it in Jobs or on the Timeline page." }); }
             catch (e) { fail(e, "Could not start the render"); }
           } }, icon("bolt", 14), "Render final") : null));
+        // one still per beat, taken by the QA pass: the quickest visual review of the whole reel
+        const sheet = findOutput(job, "qa/contact_sheet.jpg");
+        if (sheet) out.push(h("a", { href: fileUrl(job.project, sheet.path), target: "_blank", style: { display: "block", marginTop: "14px" } },
+          h("img", { src: fileUrl(job.project, sheet.path), alt: "Stills of every beat", style: { maxWidth: "100%", borderRadius: "12px", border: "1px solid var(--line)" } })));
         const qa = await mdSection(job, "QA.md", "QA: output vs the reference", false);
         const brief = await mdSection(job, "BRIEF.md", "Brief", false);
         return out.concat([qa, brief].filter(Boolean));
@@ -1413,7 +1421,7 @@
       hint: "A reel whose captions and pacing you want (file or link), or a Style Extract result.",
       extraChoices: styleChoices, extraLabel: "Style Extract results", projectHint: hint });
     const aspect = Seg("Aspect", [{ value: "source", label: "Source", icon: "aspect-src" }].concat(ASPECT_OPTS), "9:16");
-    const energy = Seg("Energy", [{ value: "calm", label: "Calm" }, { value: "medium", label: "Medium" }, { value: "high", label: "High" }], "high");
+    const energy = Seg("Energy", [{ value: "auto", label: "Auto" }, { value: "calm", label: "Calm" }, { value: "medium", label: "Medium" }, { value: "high", label: "High" }], "auto");
     const zoom = Toggle("Punch-in zooms", true, "On emphasis words");
     const graphics = Toggle("Motion graphics", true, "Hook title, numbers, lists, callouts");
     const sfx = Toggle("Sound design", true, "Whooshes and hits on cuts");
@@ -1463,7 +1471,7 @@
         h("section", { class: "card" }, h("div", { class: "card-head" }, h("h2", { class: "card-title" }, h("span", { class: "num", text: "1" }), "Footage")), video.el),
         h("section", { class: "card" }, h("div", { class: "card-head" }, h("h2", { class: "card-title" }, h("span", { class: "num", text: "2" }), "Look")),
           h("div", { class: "stack" }, style.el, Field("Aspect ratio", aspect.el, { hint: "16:9 footage is reframed to 9:16 by following the face." }),
-            Field("Energy", energy.el, { hint: "How hard the cuts, zooms and graphics hit." }))),
+            Field("Energy", energy.el, { hint: "How hard the cuts, zooms and graphics hit. Auto reads it from how fast you talk." }))),
         h("section", { class: "card" }, h("div", { class: "card-head" }, h("h2", { class: "card-title" }, h("span", { class: "num", text: "3" }), "Edit")),
           h("div", { class: "stack" }, h("div", { class: "toggles" }, zoom.el, graphics.el, sfx.el, captions.el),
             h("div", { class: "grid-2" }, Field("Hook title", hook, { optional: true, hint: "On screen in the first seconds." }),

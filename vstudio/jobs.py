@@ -415,6 +415,8 @@ def _reel(r, ctx):
         argv.append("--no-render")
     if r.flag("preview", False):
         argv.append("--preview")
+    if not r.flag("qa", True):
+        argv.append("--no-qa")  # skips the re-measure pass (about 40 s on a short preview)
     return [argv]
 
 
@@ -437,7 +439,8 @@ def _autoedit(r, ctx):
     if captions_file:
         argv += ["--captions", captions_file]
     argv += ["--aspect", r.choice("aspect", ASPECTS + ("source",), "9:16")]
-    argv += ["--energy", r.choice("energy", ("high", "medium", "calm"), "high")]
+    # auto (autoedit's own default) picks high/medium/calm from how fast the speaker talks
+    argv += ["--energy", r.choice("energy", ("auto", "high", "medium", "calm"), "auto")]
     broll = r.files("broll", exts=VIDEO_EXT + IMAGE_EXT, max_n=100)
     if broll:
         argv += ["--broll", _link_files(broll, os.path.join(ctx.job_dir, "broll"))]
@@ -565,7 +568,7 @@ def _script(r, ctx):
 
 ALLOWED = {
     "reel": {"prompt", "refs", "competitors", "assets", "script", "script_text", "voice", "music", "aspect",
-             "duration", "llm", "plan", "render", "preview"},
+             "duration", "llm", "plan", "render", "preview", "qa"},
     "autoedit": {"video", "style", "words", "captions_file", "aspect", "energy", "broll", "music", "max_duration",
                  "hook", "zoom", "graphics", "sfx", "captions", "render", "preview"},
     "channel": {"urls", "max_videos", "deep", "download"},

@@ -8,6 +8,7 @@ browser (Python Playwright, or Node Playwright with a preinstalled Chromium) and
 is skipped when neither is available."""
 
 import http.client
+import importlib.util
 import json
 import os
 import shutil
@@ -756,6 +757,24 @@ class ScriptJobTest(unittest.TestCase):
         self.assertIn("PROGRESS 100%", out)
 
 
+class AddTemplatesTest(unittest.TestCase):
+    """Ask Claude's add_templates never ships the catalog's sample content."""
+
+    def test_samples_blanked_and_numbers_required(self):
+        studio = server.Studio.__new__(server.Studio)     # _expand_templates needs no server state
+        spec = {"width": 1080, "height": 1920, "fps": 30, "layers": []}
+        problems = studio._expand_templates(spec, [
+            {"template": "stat", "params": {}, "start": 0, "end": 2},
+            {"template": "counter_reveal", "params": {"label": "subs"}, "start": 0, "end": 2},
+            {"template": "source_card", "params": {"title": "My notes"}, "start": 0, "end": 2}])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("counter_reveal needs value", problems[0])
+        texts = " ".join(str(l.get("text")) for l in spec["layers"] if l["type"] in ("text", "counter"))
+        self.assertIn("My notes", texts)
+        for sample in ("73%", "2,000", "Survey"):
+            self.assertNotIn(sample, texts)
+
+
 class DoctorTest(unittest.TestCase):
 
     def test_check_shape(self):
@@ -844,11 +863,8 @@ def _ui_runner():
     env = dict(os.environ)
     if os.path.isdir("/opt/pw-browsers") and "PLAYWRIGHT_BROWSERS_PATH" not in env:
         env["PLAYWRIGHT_BROWSERS_PATH"] = "/opt/pw-browsers"
-    try:
-        import playwright  # noqa: F401
+    if importlib.util.find_spec("playwright") is not None:
         return "python", env
-    except ImportError:
-        pass
     node = shutil.which("node")
     if not node:
         return None

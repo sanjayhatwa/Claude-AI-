@@ -734,3 +734,5 @@ input[type="range"]::-moz-range-thumb { width: 16px; height: 16px; border: 0; bo
 .md td:first-child { white-space: nowrap; }
 .md img { max-height: 560px; width: auto; }
 .toggle, .seg, .btn, .tab, .nav-item, .chip-filter { -webkit-user-select: none; user-select: none; }
+.table td.cell-fill { width: 100%; max-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.table td.nowrap { white-space: nowrap; }

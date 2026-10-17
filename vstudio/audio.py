@@ -11,7 +11,9 @@ What goes in:
         track under the whole video;
     spec["audio"] entries with `sfx`: the procedural effects from sfx.py;
     every `video` layer with volume > 0 whose file has sound: its audio from
-        `in`, at `speed` (atempo, any speed), for the layer's life.
+        `in`, at `speed` (atempo, any speed), for the layer's life, with a
+        5 ms fade at each cut so jump cuts never click (none where the next
+        clip continues the same take).
 
 Music with `duck: true` is pushed down under the voice: a sidechain
 compressor keyed by every `voice` source and every audible video clip (about
@@ -36,6 +38,7 @@ TARGET_LUFS = -14.0
 TRUE_PEAK = -1.5
 LRA = 11.0
 SR = 48000
+CLIP_EDGE_FADE = 0.005  # s: a jump cut lands mid-waveform; a few ms of fade at each cut removes the click
 
 
 class AudioError(RuntimeError):
@@ -105,7 +108,25 @@ def sources(spec, video_duration):
         out.append({"path": L["src"], "start": start, "in": src_in, "dur": dur, "speed": speed,
                     "volume": float(L["volume"]), "fade_in": 0.0, "fade_out": 0.0, "role": "clip",
                     "duck": False, "loop": bool(L.get("loop"))})
+    _clip_edges([s for s in out if s["role"] == "clip"])
     return out
+
+
+def _continues(a, b):
+    """True when clip b picks up exactly where clip a stops: one take split in two, nothing removed."""
+    return (a["path"] == b["path"] and not a["loop"] and abs(a["speed"] - b["speed"]) < 1e-6
+            and abs(a["start"] + a["dur"] - b["start"]) < 2e-3
+            and abs(a["in"] + a["dur"] * a["speed"] - b["in"]) < 2e-3)
+
+
+def _clip_edges(clips):
+    """Short fades at the edges of clip audio, except where the next clip continues the same take seamlessly."""
+    for c in clips:
+        d = min(CLIP_EDGE_FADE, c["dur"] / 4.0)
+        if not any(_continues(o, c) for o in clips if o is not c):
+            c["fade_in"] = d
+        if not any(_continues(c, o) for o in clips if o is not c):
+            c["fade_out"] = d
 
 
 def _chain(i, src):

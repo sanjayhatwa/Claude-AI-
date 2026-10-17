@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -11,6 +12,7 @@ import wave
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
@@ -120,6 +122,57 @@ class Frames(unittest.TestCase):
         self.assertEqual(px("add"), 255)
         self.assertAlmostEqual(px("multiply"), 64, delta=1)
         self.assertAlmostEqual(px("screen"), 192, delta=1)
+
+    def test_composite_matches_reference_math(self):
+        # every blend mode, RGBA and opaque sprites, snapped and resampled placement, with and without opacity,
+        # against the textbook formulas on premultiplied colour (the fast paths skip unused temporaries)
+        rng = np.random.default_rng(3)
+        base = rng.random((40, 50, 3)).astype(np.float32)
+        a = rng.random((20, 30, 1)).astype(np.float32)
+        rgba = np.concatenate([rng.random((20, 30, 3)).astype(np.float32) * a, a], axis=2)
+        opaque = rng.random((20, 30, 3)).astype(np.float32)
+
+        def ref(d, s, al, mode):
+            return {"normal": s + d * (1 - al), "add": d + s, "screen": s + d - s * d,
+                    "multiply": d * (s + 1 - al)}[mode]
+
+        for spr in (rgba, opaque):
+            for mode in ("normal", "add", "screen", "multiply"):
+                for op in (1.0, 0.4):
+                    for split in (None, "cached"):
+                        canvas = base.copy()
+                        M = np.array([[1.0, 0, 7], [0, 1.0, 5], [0, 0, 1]])  # whole pixels: no resampling
+                        sp = render.split_alpha(spr) if split and spr.shape[2] == 4 else None
+                        render.composite(canvas, spr, M, mode, op, split=(lambda: sp) if sp else None)
+                        s = spr[..., :3] * op
+                        al = (spr[..., 3:] if spr.shape[2] == 4 else np.ones_like(spr[..., :1])) * op
+                        want = base.copy()
+                        want[5:25, 7:37] = ref(base[5:25, 7:37], s, al, mode)
+                        np.testing.assert_allclose(canvas, want, atol=2e-5, err_msg="%s %s %s" % (
+                            spr.shape[2], mode, op))
+                # a resampled placement (scale 1.5, half-pixel offset) agrees with an explicit warp
+                M = np.array([[1.5, 0, 3.5], [0, 1.5, 2.5], [0, 0, 1]])
+                for mode in ("normal", "add", "screen", "multiply"):
+                    canvas = base.copy()
+                    render.composite(canvas, spr, M, mode, 0.7)
+                    src = spr if spr.shape[2] == 4 else np.concatenate([spr, np.ones_like(spr[..., :1])], 2)
+                    w = cv2.warpAffine(src, render._cv_affine(M), (50, 40), flags=cv2.INTER_LINEAR,
+                                       borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
+                    want = ref(base, w[..., :3] * 0.7, w[..., 3:] * 0.7, mode)
+                    inside = (slice(4, 30), slice(5, 47))  # away from the opaque path's replicated border
+                    np.testing.assert_allclose(canvas[inside], want[inside], atol=2e-4,
+                                               err_msg="warp %s %s" % (spr.shape[2], mode))
+
+    def test_stroke_with_transparent_fill_is_an_outline(self):
+        for shape in ("rect", "circle", "polygon"):
+            L = {"type": "shape", "shape": shape, "w": 120, "h": 120, "x": 90, "y": 160, "color": "#00000000",
+                 "stroke": {"color": "#FF0000", "width": 8}, "points": [[0, 0], [1, 0], [1, 1], [0, 1]]}
+            f = render.render_frame(S(layers=[L]), 0)
+            self.assertEqual(tuple(f[160, 90]), (0, 0, 0), shape)        # the inside stays see-through
+            self.assertEqual(tuple(f[160, 33]), (255, 0, 0), shape)      # the band is drawn
+            f = render.render_frame(S(layers=[dict(L, color="#00FF00")]), 0)
+            self.assertEqual(tuple(f[160, 90]), (0, 255, 0), shape)      # an opaque body still fills it
+            self.assertEqual(tuple(f[160, 33]), (255, 0, 0), shape)
 
     def test_opacity_and_gradient_background(self):
         f = render.render_frame(S(layers=[rect(opacity=0.5)]), 0)
@@ -318,6 +371,30 @@ class FullRender(unittest.TestCase):
             self.assertGreater(np.asarray(im.convert("L")).max(), 200)
         self.assertEqual(render.ffmpeg_filter_path("/a:b/c'd,[e];f.ass"), r"/a\\:b/c\\\'d\,\[e\]\;f.ass")
 
+    def test_caption_cards_end_at_silences_and_drop_trailing_punctuation(self):
+        # a line, 10 s with no words (the line is on screen as a graphic), then more words
+        words = [{"w": "Here", "s": 2.0, "e": 2.3}, {"w": "is", "s": 2.3, "e": 2.6}, {"w": "why.", "s": 2.6, "e": 3.0},
+                 {"w": "Wait,", "s": 13.0, "e": 13.3}, {"w": "3.5", "s": 13.3, "e": 13.6},
+                 {"w": "really?", "s": 13.6, "e": 14.0}]
+        d = tempfile.mkdtemp(dir=T["tmp"])
+        render.build_captions(timeline.normalize(S(captions={"words": words})), 180, 320, d)
+        with open(os.path.join(d, "captions.ass"), encoding="utf-8") as f:
+            events = [l for l in f.read().splitlines() if l.startswith("Dialogue:")]
+
+        def secs(ts):
+            h, m, s = ts.split(":")
+            return int(h) * 3600 + int(m) * 60 + float(s)
+
+        spans = [(secs(e.split(",")[1]), secs(e.split(",")[2])) for e in events]
+        self.assertTrue(all(end <= 3.0 + 0.41 for start, end in spans if start < 5))   # no stale card in the gap
+        self.assertTrue(any(start >= 13.0 for start, _ in spans))
+        text = " ".join(re.sub(r"\{[^}]*\}", "", e.split(",,0,0,0,,", 1)[1]) for e in events)
+        self.assertIn("WHY", text)
+        self.assertNotIn("WHY.", text)
+        self.assertNotIn("WAIT,", text)
+        self.assertIn("3.5", text)          # decimals survive
+        self.assertIn("REALLY?", text)      # tone marks stay
+
 
 @unittest.skipUnless(HAVE_FFMPEG, "ffmpeg not installed")
 class AudioMix(unittest.TestCase):
@@ -376,6 +453,24 @@ class AudioMix(unittest.TestCase):
         res, out = self.mix({"layers": [{"type": "video", "src": "clip.mp4", "speed": 4.0}],
                              "audio": [{"sfx": "ding", "start": 0.5}]}, dur=2.0, name="clip.wav")
         self.assertEqual(self.read(out)[2].shape, (2 * 48000, 2))
+
+    def test_jump_cut_has_no_click_and_a_split_take_no_dip(self):
+        # a jump cut lands mid-waveform (440 Hz sine, phase jump at 1.0 s): the edge fades keep the step small
+        jump = [{"type": "video", "src": "clip.mp4", "start": 0, "end": 1.0, "in": 0.0, "volume": 1},
+                {"type": "video", "src": "clip.mp4", "start": 1.0, "end": 2.0, "in": 1.2731, "volume": 1}]
+        _, out = self.mix({"layers": jump}, dur=2.0, name="jump.wav")
+        sr, _, x = self.read(out)
+        d = np.abs(np.diff(x[:, 0]))
+        steady = d[int(0.4 * sr):int(0.9 * sr)].max()   # the sine's own largest sample-to-sample change
+        self.assertLess(d[int(0.99 * sr):int(1.01 * sr)].max(), steady * 1.5)
+        # the same take split in two (nothing removed): no fades at the seam, so no dip in level
+        split = [{"type": "video", "src": "clip.mp4", "start": 0, "end": 1.0, "in": 0.0, "volume": 1},
+                 {"type": "video", "src": "clip.mp4", "start": 1.0, "end": 2.0, "in": 1.0, "volume": 1}]
+        srcs = audio.sources(timeline.normalize(S(duration=2.0, layers=split), T["tmp"]), 2.0)
+        first, second = sorted(srcs, key=lambda s: s["start"])
+        self.assertEqual((first["fade_out"], second["fade_in"]), (0.0, 0.0))
+        self.assertGreater(first["fade_in"], 0)
+        self.assertGreater(second["fade_out"], 0)
 
 
 if __name__ == "__main__":
