@@ -14,8 +14,15 @@ Write-Host "==> Python packages"
 & $py.Source -m pip install -q -r requirements.txt
 
 if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
-  Write-Host "!!  ffmpeg not found. reel-mimic needs it: winget install Gyan.FFmpeg"
+  Write-Host "!!  ffmpeg not found. The studio and reel-mimic need it: winget install Gyan.FFmpeg"
 }
+
+Write-Host "==> Studio assets: free caption fonts (Google Fonts, OFL) and the face-tracking model"
+& $py.Source -m vstudio fonts install "Montserrat" "Anton" "Bebas Neue" "Poppins" "Archivo Black" "Bangers" `
+  "Playfair Display" "Space Grotesk" "Permanent Marker" "Courier Prime"
+if ($LASTEXITCODE -ne 0) { Write-Host "!!  font download failed (offline?); system fonts will be used" }
+& $py.Source -c "from vstudio import reframe; print('    face model:', reframe.ensure_model())"
+if ($LASTEXITCODE -ne 0) { Write-Host "!!  face model download failed; reframing falls back to centre crops" }
 
 New-Item -ItemType Directory -Force workspace | Out-Null
 New-Item -ItemType File -Force workspace\.gitkeep | Out-Null
@@ -43,4 +50,6 @@ if ($Global) {
 }
 
 Write-Host ""
-Write-Host "Done. Open Claude Code in this folder and say:  make me go viral"
+Write-Host "Done."
+Write-Host "  Local studio (web app):   double-click studio.bat   -> http://127.0.0.1:4320"
+Write-Host "  Claude Code agent:        open Claude Code here and say:  make me go viral"

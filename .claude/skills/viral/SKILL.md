@@ -42,6 +42,7 @@ trends/RADAR.md             evidence for every trend
 dna/<trend>/STYLE_DNA.md    the style to recreate, with fonts_sheet.jpg
 scripts/<n>-<slug>.md       production sheet: timed spoken lines, on-screen text, shots, delivery, caption style
 captions/<n>-<slug>.ass     caption file in the reference style (captions.py --script ... --ass-only)
+reels/<n>-<slug>.mp4        optional: a rendered motion-graphics version (/reel-factory) when they want finished videos
 posts/<n>-<slug>.md         caption + hashtags per platform (ig-caption / yt-seo)
 ```
 
@@ -66,10 +67,13 @@ on the first line. Scripts written without trend evidence are labelled
 
 | piece | skill |
 | --- | --- |
+| reverse-engineer a whole channel (thumbnails, topics, dialogue, energy) | `/channel-dna` |
 | style of the reference | `/viral-extract` |
 | the spoken script | `/script-forge` |
-| shoot plan, beat-timed edit sheet, 2D remake | `/reel-mimic` |
-| captions burned on their footage in the reference style | `viral-extract/scripts/captions.py` |
+| finished motion-graphics reel from prompt + references + assets | `/reel-factory` |
+| edit their raw footage (cuts, reframe, zooms, captions, graphics, sfx) | `/auto-edit` |
+| shoot plan, beat-timed edit sheet, 2D animated remake | `/reel-mimic` (`python -m vstudio mimic2d start`) |
+| captions only, burned on their footage in the reference style | `viral-extract/scripts/captions.py` |
 | Reel / TikTok caption | `/ig-caption` |
 | YouTube Short / long-form packaging | `/yt-shorts`, `/yt-package`, `/yt-seo`, `/yt-chapters` |
 | carousel, stories | `/ig-carousel`, `/ig-story` |

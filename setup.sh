@@ -21,7 +21,12 @@ PY=$(command -v python3 || command -v python || true)
 echo "==> Python packages"
 "$PY" -m pip install --user -q -r requirements.txt || "$PY" -m pip install -q -r requirements.txt
 
-command -v ffmpeg >/dev/null || echo "!!  ffmpeg not found. reel-mimic needs it: https://ffmpeg.org/download.html"
+command -v ffmpeg >/dev/null || echo "!!  ffmpeg not found. The studio and reel-mimic need it: https://ffmpeg.org/download.html"
+
+echo "==> Studio assets: free caption fonts (Google Fonts, OFL) and the face-tracking model"
+"$PY" -m vstudio fonts install "Montserrat" "Anton" "Bebas Neue" "Poppins" "Archivo Black" "Bangers" \
+  "Playfair Display" "Space Grotesk" "Permanent Marker" "Courier Prime" || echo "!!  font download failed (offline?); system fonts will be used"
+"$PY" -c "from vstudio import reframe; print('    face model:', reframe.ensure_model())" || echo "!!  face model download failed; reframing falls back to centre crops"
 
 mkdir -p workspace
 touch workspace/.gitkeep
@@ -46,4 +51,6 @@ if [ "$GLOBAL" = 1 ]; then
 fi
 
 echo
-echo "Done. Open Claude Code in this folder and say:  make me go viral"
+echo "Done."
+echo "  Local studio (web app):   ./studio.sh        -> http://127.0.0.1:4320"
+echo "  Claude Code agent:        open Claude Code here and say:  make me go viral"

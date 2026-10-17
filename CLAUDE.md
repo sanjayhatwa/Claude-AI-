@@ -11,6 +11,9 @@ of it.
 - The user gives only a niche: run `/viral`'s fast path (radar -> extract ->
   script-forge -> pack) end to end.
 - Every script goes through `/script-forge` (scriptcheck >= 80, viewer panel).
+- Videos are made and edited locally with `vstudio` (`/reel-factory`,
+  `/auto-edit`, `/channel-dna`, `/studio`). Look at rendered stills before
+  calling anything finished.
 - First run in a fresh clone: if `workspace/brand.md` is missing, copy
   `workspace/brand.example.md` to it and fill it in with the user before
   doing anything else.
@@ -20,11 +23,14 @@ of it.
 ## Map
 
 - `.claude/agents/`: `viral-hyper-agent` (conductor), `trend-scout`,
-  `reel-mimic-director`, `viewer-panel`, `growth-strategist`, `publisher`
+  `reel-mimic-director`, `viewer-panel`, `channel-analyst`, `motion-designer`,
+  `video-editor`, `growth-strategist`, `publisher`
 - `.claude/skills/`: `viral`, `trend-hunt` (radar.py), `viral-extract`
   (extract.py, captions.py), `script-forge` (voiceprint.py, scriptcheck.py),
-  `reel-mimic`, `publish`, `brand-deals`, plus `yt-*` (11), `ig-*` (13),
-  `founder-*` (11)
+  `reel-mimic`, `reel-factory`, `auto-edit`, `channel-dna`, `studio`,
+  `publish`, `brand-deals`, plus `yt-*` (11), `ig-*` (13), `founder-*` (11)
+- `vstudio/`: the local video engine and web app (`python -m vstudio`);
+  contract in `vstudio/ARCHITECTURE.md`
 - `templates/`: voice files for Instagram and YouTube
 - `tools/` (fetched by `setup.sh`, not committed): full ReelMimic studio,
   Harvey, gstack, REA
@@ -45,3 +51,4 @@ of it.
 ## Checks
 
 `python3 -m unittest discover -s tests` runs the tool tests (no network).
+`python -m vstudio doctor` checks the local video toolchain.

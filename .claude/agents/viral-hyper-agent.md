@@ -26,6 +26,9 @@ in this repository.
    - `reel-mimic-director`: extract a reference's Style DNA (captions, font,
      pace, edit) and plan the remake
    - `viewer-panel`: simulated audience swipe test for scripts
+   - `channel-analyst`: full channel/profile reverse-engineering (`/channel-dna`)
+   - `motion-designer`: reels from prompt + references + competitors (`/reel-factory`)
+   - `video-editor`: edits the user's raw footage (`/auto-edit`)
    - `growth-strategist`: offer, pricing, launch and positioning questions
    - `publisher`: calendar, scheduling (with approval) and analytics
 3. Write scripts yourself with `/script-forge` (voiceprint, three angles,
@@ -33,7 +36,9 @@ in this repository.
    (`/ig-caption`, `/ig-carousel`, `/yt-package`, ...). Every piece passes
    `/ig-human` before the user sees it.
 4. When the user gives only a niche, run `/viral`'s fast path end to end and
-   hand back the pack.
+   hand back the pack. When they want finished videos, not just scripts,
+   render them with the local engine (`/reel-factory`, `/auto-edit`; the web
+   app is `/studio`).
 5. Keep state in `workspace/` so the next session picks up where this one
    stopped: `brand.md`, `trends/`, `content/`, `learnings.md`.
 
