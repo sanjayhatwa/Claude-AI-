@@ -103,41 +103,64 @@ The engine also has:
 
 Preview any template with `python -m vstudio templates preview stat --out stat.mp4`.
 
-## Install
+## Install (about 10 minutes, once per computer)
 
-You need Python 3.10+, Git, **FFmpeg 5 or newer** and
-[Claude Code](https://code.claude.com) (logged in).
+### Windows, step by step
 
-**Windows (PowerShell):**
-```powershell
-git clone https://github.com/sanjayhatwa/Claude-AI-.git D:\viral-hyper-agent
-cd D:\viral-hyper-agent
-.\setup.ps1
-```
-FFmpeg: `winget install Gyan.FFmpeg`. Then double-click `studio.bat`.
+1. **Install Python 3.10 or newer** from https://www.python.org/downloads/.
+   On the first installer screen, tick **"Add python.exe to PATH"**.
+2. **Install Claude Code** (https://code.claude.com). Open a terminal, run
+   `claude` once and log in with your Claude account. That login is the only
+   "key" this needs: no API keys.
+3. **Get this repo.** Either:
+   - Download the ZIP (green **Code** button on GitHub, then **Download ZIP**)
+     and unzip it, e.g. to `D:iral-hyper-agent`, or
+   - `git clone https://github.com/sanjayhatwa/Claude-AI-.git D:iral-hyper-agent`
+4. **Double-click `setup.bat`** in that folder. It checks Python, FFmpeg and
+   Git, offers to install anything missing with `winget`, installs the Python
+   packages, downloads the free caption fonts and the face-tracking model,
+   fetches ReelMimic and the other tool repos, and ends with a health check.
+   Every line says `ok`, `warn` or `fail`, and each `fail` or `warn` shows
+   its fix.
+5. **Double-click `studio.bat`.** Your browser opens Viral Studio at
+   http://127.0.0.1:4320.
 
-**macOS / Linux:**
+To use the agent instead, open Claude Code in the same folder and say
+`make me go viral`.
+
+### macOS / Linux
+
 ```bash
 git clone https://github.com/sanjayhatwa/Claude-AI-.git viral-hyper-agent && cd viral-hyper-agent
-./setup.sh          # FFmpeg: brew install ffmpeg  /  sudo apt install ffmpeg
-./studio.sh
+./setup.sh          # checks everything and ends with a health check
+./studio.sh         # http://127.0.0.1:4320
 ```
 
-Setup installs the Python packages and downloads free caption fonts
-(Montserrat, Anton, Bebas Neue, Poppins... all OFL) and the face-tracking
-model. It also fetches the full ReelMimic, Harvey, gstack and REA repos into
-`tools/`. Check everything with:
+FFmpeg is `brew install ffmpeg` on macOS and `sudo apt install ffmpeg` on
+Ubuntu/Debian. Setup tells you if it's missing.
+
+### What setup installs, and what's optional
+
+| | needed? | what for |
+| --- | --- | --- |
+| Python 3.10+ and the packages in `requirements.txt` | yes | everything |
+| FFmpeg 5+ | yes | reading and rendering video |
+| Claude Code, logged in | for planning, scripts and "Ask Claude" | rendering works without it (offline planner) |
+| Free caption fonts (Montserrat, Anton, Bebas Neue, Poppins, ... OFL) | downloaded by setup | caption and title looks |
+| Face-tracking model (YuNet) | downloaded by setup | 16:9 to 9:16 reframing |
+| Git | optional | fetching ReelMimic, Harvey, gstack and REA into `tools/` |
+| Node.js 22.18+ and Chrome | optional | the ReelMimic 2D animation studio (`python -m vstudio mimic2d start`) |
+| faster-whisper speech model (~500 MB) | downloads on first use | transcribing your own videos |
+| Zernio connected in Claude | optional | scheduling posts with `/publish` |
+
+Run the health check any time:
 
 ```bash
 python -m vstudio doctor
 ```
 
-Optional:
-- **`faster-whisper`** (in requirements) transcribes your own videos locally.
-  Its first run downloads a speech model of about 500 MB.
-- **`fonttools`** makes captions use variable fonts like Montserrat exactly.
-- **ReelMimic** needs Node.js 22.18+ for 2D animated remakes:
-  `python -m vstudio mimic2d start`.
+Setup is safe to run again. It skips anything already there, so re-run it
+after installing a missing piece or pulling an update.
 
 ## Commands
 
