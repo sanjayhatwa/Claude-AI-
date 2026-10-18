@@ -26,9 +26,15 @@ overhang live outside it, so nothing is ever clipped.
 Sprites are cached (LRU, about 384 MB) keyed by every input that changes
 pixels.
 
-Limits: no colour emoji and no fallback for glyphs missing from the font
-(they draw as the font's empty box); right-to-left scripts render only as
-well as Pillow's layout engine on the machine.
+Characters the layer's font has no glyph for (Hindi or other scripts in a
+Latin font, symbols) are drawn with the closest weight of an installed font
+that has them (fonts.glyph_fallbacks: Nirmala UI on Windows, Kohinoor
+Devanagari on macOS, Noto Sans Devanagari...), run by run, so the Latin
+words keep the layer's font; a one-line notice names the substitution.
+Limits: colour emoji fonts are bitmap-only and cannot be scaled here, so an
+emoji draws only from a monochrome emoji or symbol font (Segoe UI Emoji on
+Windows) and otherwise as a box, with a notice naming it; right-to-left
+scripts render only as well as Pillow's layout engine on the machine.
 """
 
 import collections
@@ -130,6 +136,59 @@ def _apply_case(text, case):
     return text
 
 
+class _FontRuns:
+    """The layer's font plus fallback faces for the characters it has no glyph for (Hindi in a Latin
+    font, symbols): text is split into runs, each measured, inked and drawn with its own face, so a
+    Devanagari word is shaped as a whole and the Latin words keep the layer's font. Offers the parts of
+    the Pillow font API the layout uses (getlength, getbbox)."""
+
+    def __init__(self, primary, fallbacks=None):
+        self.primary = primary
+        self.fb = fallbacks or {}   # char -> Pillow font
+
+    def runs(self, s):
+        """[(start, text, font)] covering s; spaces, marks and joiners stay with the run before them."""
+        if not self.fb:
+            return [(0, s, self.primary)] if s else []
+        out = []
+        for i, ch in enumerate(s):
+            f = self.fb.get(ch)
+            if f is None:
+                f = out[-1][2] if out and not fonts.needs_glyph(ch) else self.primary
+            if out and out[-1][2] is f:
+                out[-1][1] += ch
+            else:
+                out.append([i, ch, f])
+        return [tuple(r) for r in out]
+
+    def font_at(self, s, i):
+        for start, text, f in self.runs(s):
+            if start <= i < start + len(text):
+                return f
+        return self.primary
+
+    def getlength(self, s):
+        if not self.fb:
+            return self.primary.getlength(s)
+        return sum(f.getlength(t) for _, t, f in self.runs(s))
+
+    def getbbox(self, s, anchor="ls"):
+        if not self.fb:
+            return self.primary.getbbox(s, anchor=anchor)
+        box, x = None, 0.0
+        for _, t, f in self.runs(s):
+            b = f.getbbox(t, anchor=anchor)
+            b = (b[0] + x, b[1], b[2] + x, b[3])
+            box = b if box is None else (min(box[0], b[0]), min(box[1], b[1]), max(box[2], b[2]), max(box[3], b[3]))
+            x += f.getlength(t)
+        return box or self.primary.getbbox(s, anchor=anchor)
+
+    def draw(self, draw, xy, s, offsets, start, **kw):
+        """Draw s, which begins at char `start` of a line whose char x positions are offsets (from xy[0])."""
+        for j, t, f in self.runs(s):
+            draw.text((xy[0] + offsets[start + j], xy[1]), t, font=f, anchor="ls", **kw)
+
+
 class _Measure:
     """Character positions for a font with letter spacing and optional tabular (fixed-width) digits."""
 
@@ -142,12 +201,12 @@ class _Measure:
         """x of every character start, plus the end: len(s) + 1 values."""
         if self.tab is None:
             # start of char i = width through it minus its own advance: keeps the kern pair before it
-            gl = self.font.getlength
-            out = [gl(s[:i + 1]) - gl(s[i]) + self.ls * i for i in range(len(s))]
+            gl, at = self.font.getlength, self.font.font_at
+            out = [gl(s[:i + 1]) - at(s, i).getlength(s[i]) + self.ls * i for i in range(len(s))]
             return out + [gl(s) + self.ls * len(s)]
         out, x = [0.0], 0.0
-        for ch in s:
-            x += (self.tab if ch.isdigit() else self.font.getlength(ch)) + self.ls
+        for i, ch in enumerate(s):
+            x += (self.tab if ch.isdigit() else self.font.font_at(s, i).getlength(ch)) + self.ls
             out.append(x)
         return out
 
@@ -199,10 +258,16 @@ def _wrap(words, extra, measure, max_w):
 def _layout(layer, scale):
     """Positions of every word at this scale (independent of reveal state)."""
     size = max(1.0, float(layer.get("size", 96)) * scale)
-    font = fonts.load(layer.get("font"), size)
+    text = _apply_case(str(layer.get("text") or ""), layer.get("case"))
+    found, _ = fonts.glyph_fallbacks(layer.get("font"), text + str(layer.get("_reserve") or ""))
+    faces = {}
+    for ch, e in found.items():  # one Pillow font per fallback face, shared by its characters
+        key = (e["path"], e.get("index", 0))
+        faces[key] = faces.get(key) or fonts.load_face(e, size)
+        found[ch] = faces[key]
+    font = _FontRuns(fonts.load(layer.get("font"), size), found)
     ls = float(layer.get("letter_spacing") or 0) * scale
     measure = _Measure(font, ls, bool(layer.get("_tabular")))
-    text = _apply_case(str(layer.get("text") or ""), layer.get("case"))
     max_w = float(layer.get("max_width") or 1e9) * scale
     paras = [p.split() for p in text.split("\n")]
     n_words = sum(len(p) for p in paras)
@@ -222,7 +287,7 @@ def _layout(layer, scale):
             lines.append({"words": ws, "text": " ".join(w for _, w in ws)})
         gi += len(pw)
 
-    cap_h = -font.getbbox("H", anchor="ls")[1]
+    cap_h = -font.primary.getbbox("H", anchor="ls")[1]
     adv = size * float(layer.get("line_spacing") or 1.1)
     reserve = measure.width(_apply_case(str(layer["_reserve"]), layer.get("case"))) if layer.get("_reserve") else 0.0
     for ln in lines:
@@ -289,14 +354,15 @@ def _pad(box, scale):
 def _draw_run(draw, measure, x, y, ln, start, s, per_char, **kw):
     """Draw s (which begins at char `start` of the line; x includes the word's shift) at baseline y."""
     if not per_char:
-        draw.text((x + ln["offsets"][start], y), s, font=measure.font, anchor="ls", **kw)
+        measure.font.draw(draw, (x, y), s, ln["offsets"], start, **kw)
         return
     for k, ch in enumerate(s):
         if not ch.isspace():
             cx = x + ln["offsets"][start + k]
+            f = measure.font.font_at(ln["text"], start + k)
             if measure.tab is not None and ch.isdigit():
-                cx += (measure.tab - measure.font.getlength(ch)) / 2  # centre digits in their cell
-            draw.text((cx, y), ch, font=measure.font, anchor="ls", **kw)
+                cx += (measure.tab - f.getlength(ch)) / 2  # centre digits in their cell
+            draw.text((cx, y), ch, font=f, anchor="ls", **kw)
 
 
 def _render(layer, scale, n_chars, n_words):

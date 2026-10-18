@@ -130,9 +130,14 @@ def _clip_edges(clips):
 
 
 def _chain(i, src):
-    """Filter chain for input i: trim, tempo, format, volume, fades, delay."""
+    """Filter chain for input i: trim, tempo, format, volume, fades, delay.
+
+    The sound is timed on the file's own clock from `in` (the clock the video frames are read on):
+    aresample first_pts=0 pads with silence when the sound starts later than the picture, instead of
+    pulling it early by re-basing on its first sample.
+    """
     dur = src["dur"]
-    f = ["atrim=duration=%.6f" % (dur * src["speed"]), "asetpts=PTS-STARTPTS"]
+    f = ["aresample=async=1:first_pts=0", "atrim=end=%.6f" % (dur * src["speed"]), "asetpts=N/SR/TB"]
     f += _atempo(src["speed"])
     f += ["aresample=%d" % SR, "aformat=sample_fmts=fltp:sample_rates=%d:channel_layouts=stereo" % SR,
           "volume=%.6f" % src["volume"]]
@@ -181,15 +186,32 @@ def build_graph(srcs, D):
     else:
         final += key + ducked
     chains.append(_mix(final, "sum"))
-    chains.append("[sum]apad=whole_dur=%.6f,atrim=end=%.6f[mix]" % (D, D))
+    chains.append("[sum]asetpts=N/SR/TB,apad=whole_dur=%.6f,atrim=end=%.6f[mix]" % (D, D))
     return args, ";".join(chains)
+
+
+def _run(cmd):
+    """subprocess.run with ffmpeg's UTF-8 output decoded as UTF-8 (not the Windows ANSI code page)."""
+    return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+
+def _run_graph(ffmpeg, args, graph, tail, work):
+    """Run ffmpeg with the filter graph in a file, so long timelines never hit Windows' 32 767-character
+    command-line limit (one input and ~230 graph characters per audible clip)."""
+    path = os.path.join(work, "mix_graph.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(graph)
+    head = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-nostdin"] + args
+    r = _run(head + ["-filter_complex_script", path] + tail)
+    if r.returncode != 0 and "Unrecognized option" in r.stderr:  # an ffmpeg (8+) without the old option
+        r = _run(head + ["-/filter_complex", path] + tail)
+    return r
 
 
 def _loudness(ffmpeg, path):
     """loudnorm's first-pass measurement of a file, or None when it is silent / unreadable."""
-    r = subprocess.run([ffmpeg, "-hide_banner", "-nostats", "-i", path, "-af",
-                        "loudnorm=I=%g:TP=%g:LRA=%g:print_format=json" % (TARGET_LUFS, TRUE_PEAK, LRA),
-                        "-f", "null", "-"], capture_output=True, text=True)
+    r = _run([ffmpeg, "-hide_banner", "-nostats", "-i", path, "-af",
+              "loudnorm=I=%g:TP=%g:LRA=%g:print_format=json" % (TARGET_LUFS, TRUE_PEAK, LRA), "-f", "null", "-"])
     m = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", r.stderr)
     if not m:
         return None
@@ -222,23 +244,24 @@ def mixdown(spec, video_duration, out_wav, base_dir=None, workdir=None):
     try:
         pre = os.path.join(work, "mix_pre.wav")
         args, graph = build_graph(srcs, D)
-        r = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-nostdin"] + args +
-                           ["-filter_complex", graph, "-map", "[mix]", "-c:a", "pcm_f32le", "-ar", str(SR), pre],
-                           capture_output=True, text=True)
+        r = _run_graph(ffmpeg, args, graph, ["-map", "[mix]", "-c:a", "pcm_f32le", "-ar", str(SR), pre], work)
         if r.returncode != 0:
             raise AudioError("ffmpeg could not mix the audio: %s" % r.stderr.strip()[-1500:])
         out_wav = os.path.abspath(out_wav)
         os.makedirs(os.path.dirname(out_wav), exist_ok=True)
         m = _loudness(ffmpeg, pre)
         if m:
+            # loudnorm hands back 100 ms frames with a gap in their timestamps at the end: rebuild them from
+            # the sample count before padding, or atrim (which cuts by timestamp) ends the mix 33-100 ms short
             af = ("loudnorm=I=%g:TP=%g:LRA=%g:measured_I=%s:measured_TP=%s:measured_LRA=%s:measured_thresh=%s:"
-                  "offset=%s:linear=true:print_format=none,aresample=%d,apad=whole_dur=%.6f,atrim=end=%.6f"
+                  "offset=%s:linear=true:print_format=none,aresample=%d,asetpts=N/SR/TB,apad=whole_dur=%.6f,"
+                  "atrim=end=%.6f"
                   % (TARGET_LUFS, TRUE_PEAK, LRA, m["input_i"], m["input_tp"], m["input_lra"], m["input_thresh"],
                      m["target_offset"], SR, D, D))
         else:
             af = "anull"
-        r = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-nostdin", "-i", pre, "-af", af,
-                            "-c:a", "pcm_s16le", "-ar", str(SR), "-ac", "2", out_wav], capture_output=True, text=True)
+        r = _run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-nostdin", "-i", pre, "-af", af,
+                  "-c:a", "pcm_s16le", "-ar", str(SR), "-ac", "2", out_wav])
         if r.returncode != 0:
             raise AudioError("ffmpeg could not normalize the audio: %s" % r.stderr.strip()[-1500:])
         return out_wav

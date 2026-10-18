@@ -34,8 +34,12 @@ at the edges rather than smeared pixels.
 
 Video layers are decoded by one ffmpeg process each, streaming raw frames
 already scaled and cropped, at the timeline fps, from `in` with `speed`
-(the frame at timeline t is source time in + (t - start) * speed); a
-source that runs out holds its last frame, or wraps with `loop`.
+(the frame at timeline t is the source frame nearest to source time
+in + (t - start) * speed, on the file's own clock, the one the clip audio
+is cut on); a source that runs out holds its last frame, or wraps with
+`loop`. HDR footage (HLG, as iPhones record by default, or PQ) is
+tone-mapped to BT.709 SDR with zscale + tonemap, and BT.2020 SDR gets its
+gamut converted; an ffmpeg without zscale prints a warning instead.
 
 Encoding: raw RGB frames are piped to ffmpeg (libx264, yuv420p BT.709,
 crf 18, preset veryfast, +faststart); the audio mix (audio.mixdown) is
@@ -444,8 +448,77 @@ def _crop_origin(scaled, box, focus):
     return max(0.0, min(scaled - box, focus * scaled - box / 2.0))
 
 
+HDR_TRANSFERS = ("arib-std-b67", "smpte2084")   # HLG (iPhone, most phones and drones), PQ (HDR10)
+SEEK_PREROLL = 0.5   # s decoded before a seek target, so the frame on screen at that time is never trimmed away
+# what zscale is told about the source (ffprobe's names), with the BT.2020 defaults for untagged fields
+_ZSCALE_IN = (("tin", "color_transfer", ("arib-std-b67", "smpte2084", "bt709", "bt2020-10", "bt2020-12"), "bt2020-10"),
+              ("pin", "color_primaries", ("bt2020", "bt709"), "bt2020"),
+              ("min", "color_space", ("bt2020nc", "bt2020c", "bt709", "gbr"), "bt2020nc"))
+_filters = None
+_hdr_warned = []
+
+
+def ffmpeg_filters():
+    """Names of the filters the installed ffmpeg has (asked once)."""
+    global _filters
+    if _filters is None:
+        names = set()
+        try:
+            r = subprocess.run([_ffmpeg(), "-hide_banner", "-filters"], capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=30)
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and re.match(r"^[A-Z.|]{2,3}$", parts[0]):
+                    names.add(parts[1])
+        except (OSError, subprocess.SubprocessError, RenderError):
+            pass
+        _filters = names
+    return _filters
+
+
+def color_filters(info, size=None):
+    """Filters that turn HDR (HLG / PQ) or BT.2020 video into the BT.709 SDR the renderer composites.
+
+    HDR is tone-mapped (zscale + tonemap, mobius: mid-tones and skin keep their level and colour,
+    highlights roll off); BT.2020 SDR gets its gamut converted. size (w, h) folds the resize into the
+    first zscale, so the float stages run at output size. [] for ordinary BT.709 / untagged video.
+    Without zscale (an ffmpeg built without libzimg) a one-time warning says so, and HLG / BT.2020 get
+    the native colorspace filter's approximation; PQ cannot be converted without it.
+    """
+    trc, prim = info.get("color_transfer"), info.get("color_primaries")
+    hdr = trc in HDR_TRANSFERS
+    if not hdr and prim != "bt2020":
+        return []
+    have = ffmpeg_filters()
+    if "zscale" in have and (not hdr or "tonemap" in have):
+        # say what the source is (zscale cannot guess untagged fields), resize in the same step
+        src = ["%s=%s" % (opt, info.get(key) if info.get(key) in known else default)
+               for opt, key, known, default in _ZSCALE_IN]
+        if size:
+            src += ["w=%d" % size[0], "h=%d" % size[1], "f=bicubic"]
+        if hdr:
+            return ["zscale=%s" % ":".join(src + ["t=linear", "npl=100"]), "format=gbrpf32le", "zscale=p=bt709",
+                    "tonemap=tonemap=mobius:desat=0", "zscale=t=bt709", "format=gbrp"]
+        return ["zscale=%s" % ":".join(src + ["p=bt709", "t=bt709"]), "format=gbrp"]
+    if not _hdr_warned:
+        _hdr_warned.append(True)
+        print("this video is %s, and this ffmpeg has no zscale filter (it was built without libzimg), so its "
+              "colours cannot be converted properly and will look %s. Install a full ffmpeg build (Windows: the "
+              "gyan.dev or BtbN builds; macOS: brew install ffmpeg) and render again."
+              % ("HDR (%s)" % ("HLG" if trc == "arib-std-b67" else "PQ") if hdr else "wide-gamut BT.2020",
+                 "washed out" if hdr else "desaturated"), file=sys.stderr)
+    if trc == "smpte2084":
+        return []
+    return ["colorspace=all=bt709:iall=bt2020:format=yuv420p"]
+
+
 class VideoReader:
-    """Frames of one video layer, at the timeline fps, already fitted to its box (uint8 RGB)."""
+    """Frames of one video layer, at the timeline fps, already fitted to its box (uint8 RGB).
+
+    Frame k of the reader is the source frame nearest to source time in + k / fps * speed, measured
+    on the file's own clock (the one the clip audio is cut on): the decoder seeks a little before
+    the target and the frames are timed against the target, not against the first frame decoded.
+    """
 
     def __init__(self, L, R, fps):
         self.L, self.fps = L, fps
@@ -465,16 +538,42 @@ class VideoReader:
         self.last_k = None
         self.eof = False
 
-    def _filter(self):
+    def _filter(self, offset=0.0):
+        """The -vf chain; offset = seconds from the seek point to the first wanted source time."""
         L = self.L
         sw, sh = self.scaled
-        vf = ["setpts=(PTS-STARTPTS)/%r" % float(L["speed"]), "fps=%s" % _fps_str(self.fps),
-              "scale=%d:%d:flags=bicubic" % (sw, sh), "setsar=1"]
+        speed = float(L["speed"])
+        vf = []
+        src_fps = self.info.get("fps")
+        if src_fps and 1.0 <= src_fps <= 300.0:  # (not a container's 1000/1 "frame rate")
+            # snap timestamps to the source's frame grid first: MKV/WebM store whole milliseconds
+            # (33, 67, 100 ...), and that rounding would otherwise decide which frame fills a slot
+            vf.append("fps=%s" % _fps_str(src_fps))
+        # time every frame against the target, then pick the frame nearest each output slot; the tiny
+        # bias (1/1000 of a slot) breaks exact ties the same way every time (towards the frame on screen)
+        vf += ["settb=AVTB", "setpts=(PTS-%.1f)/%r+%.1f" % (offset * 1e6, speed, 1000.0 / self.fps),
+               "fps=%s:start_time=0" % _fps_str(self.fps)]
+        crop = None
         if L["fit"] == "cover" and (sw, sh) != self.size:
             fx, fy = L["focus"]
-            x = int(round(_crop_origin(sw, self.size[0], fx)))
-            y = int(round(_crop_origin(sh, self.size[1], fy)))
-            vf.append("crop=%d:%d:%d:%d" % (self.size[0], self.size[1], x, y))
+            crop = (int(round(_crop_origin(sw, self.size[0], fx))), int(round(_crop_origin(sh, self.size[1], fy))))
+        src_w, src_h = self.info.get("width"), self.info.get("height")
+        if crop and src_w and src_h and color_filters(self.info):
+            # HDR: crop in source pixels first (even, for 4:2:0), so the float tone-mapping stages only
+            # process what is shown (twice as fast for a 16:9 clip in a 9:16 frame)
+            k = sw / float(src_w)
+            cw = min(src_w, max(2, int(round(self.size[0] / k / 2.0)) * 2))
+            ch = min(src_h, max(2, int(round(self.size[1] / k / 2.0)) * 2))
+            cx = min(src_w - cw, max(0, int(round(crop[0] / k / 2.0)) * 2))
+            cy = min(src_h - ch, max(0, int(round(crop[1] / k / 2.0)) * 2))
+            vf.append("crop=%d:%d:%d:%d" % (cw, ch, cx, cy))
+            vf += color_filters(self.info, self.size)
+            vf += ["scale=%d:%d:flags=bicubic" % self.size, "setsar=1"]
+            return ",".join(vf)
+        vf += color_filters(self.info, (sw, sh))
+        vf += ["scale=%d:%d:flags=bicubic" % (sw, sh), "setsar=1"]
+        if crop:
+            vf.append("crop=%d:%d:%d:%d" % (self.size[0], self.size[1], crop[0], crop[1]))
         return ",".join(vf)
 
     def _start(self, k, src_t=None):
@@ -489,7 +588,9 @@ class VideoReader:
             if dur:
                 src_t %= dur
             cmd += ["-stream_loop", "-1"]
-        cmd += ["-ss", "%.6f" % max(0.0, src_t), "-i", L["src"], "-an", "-sn", "-dn", "-vf", self._filter(),
+        src_t = max(0.0, src_t)
+        seek = max(0.0, src_t - SEEK_PREROLL)
+        cmd += ["-ss", "%.6f" % seek, "-i", L["src"], "-an", "-sn", "-dn", "-vf", self._filter(src_t - seek),
                 "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
         self.err = tempfile.TemporaryFile()
         self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=self.err,
@@ -590,6 +691,55 @@ def _load_image(path):
 
 # --------------------------------------------------------------------------- the compositor
 
+SPRITE_CACHE_BYTES = 512 * 1024 * 1024   # settled shape and image sprites kept between frames
+SPLIT_CACHE_BYTES = 384 * 1024 * 1024    # their colour / (1 - alpha) planes for unresampled placement
+
+
+class SpriteCache:
+    """Least-recently-used cache with a byte budget, grouped by owner (a layer) so that everything a
+    finished layer left behind can be dropped at once. A full-frame sprite at 1080x1920 is 33 MB:
+    a long plan with a background per beat must not keep every one of them for the whole render."""
+
+    def __init__(self, budget):
+        self.budget, self.used = budget, 0
+        self.data = collections.OrderedDict()   # key -> (value, nbytes, owner)
+        self.owners = {}                        # owner -> set of keys
+
+    def __len__(self):
+        return len(self.data)
+
+    def get(self, key):
+        hit = self.data.get(key)
+        if hit is None:
+            return None
+        self.data.move_to_end(key)
+        return hit[0]
+
+    def put(self, key, value, nbytes, owner=None):
+        self.pop(key)
+        self.data[key] = (value, int(nbytes), owner)
+        self.owners.setdefault(owner, set()).add(key)
+        self.used += int(nbytes)
+        while self.used > self.budget and len(self.data) > 1:
+            self.pop(next(iter(self.data)))
+
+    def pop(self, key):
+        hit = self.data.pop(key, None)
+        if hit is not None:
+            self.used -= hit[1]
+            keys = self.owners.get(hit[2])
+            if keys is not None:
+                keys.discard(key)
+                if not keys:
+                    del self.owners[hit[2]]
+        return hit
+
+    def drop(self, owner):
+        """Forget everything an owner put in."""
+        for key in list(self.owners.get(owner, ())):
+            self.pop(key)
+
+
 class Compositor:
     """Renders frames of a normalized, valid spec at output scale S (1 = full size)."""
 
@@ -599,8 +749,9 @@ class Compositor:
         self.W, self.H = _even(spec["width"] * self.S), _even(spec["height"] * self.S)
         self.fps = float(fps or spec["fps"])
         self.readers = {}
-        self.cache = {}
-        self.splits = collections.OrderedDict()  # id(sprite) -> (sprite, rgb, inv3) for sprites reused across frames
+        self.cache = {}  # full-frame effect masks (vignette, grain): one each, kept for the render
+        self.sprites = SpriteCache(SPRITE_CACHE_BYTES)   # settled shape / image sprites, per layer
+        self.splits = SpriteCache(SPLIT_CACHE_BYTES)     # id(sprite) -> (sprite, rgb, inv3), per layer
         self.bg = self._background()
         self.normal = [L for L in spec["layers"] if not L["fixed"]]
         self.fixed = [L for L in spec["layers"] if L["fixed"]]
@@ -682,11 +833,11 @@ class Compositor:
                 q = anim.ease(d["ease"], (lt - float(en.get("delay") or 0)) / max(dur, 1e-6))
                 draw_p = float(d["from"]) + (float(d["to"]) - float(d["from"])) * q
             key = ("shape", id(L), R, round(draw_p, 4))
-            hit = self.cache.get(key)
+            hit = self.sprites.get(key)
             if hit is None:
                 hit = self._with_shadow(L, *_shape_sprite(L, R, draw_p), R=R)
                 if draw_p >= 1:
-                    self.cache[key] = hit
+                    self.sprites.put(key, hit, hit[0].nbytes, id(L))
             return hit[0], hit[1], R
         if t == "progress":
             life = max(float(L["end"]) - float(L["start"]), 1e-6)
@@ -695,10 +846,10 @@ class Compositor:
             return arr, box, R
         if t == "image":
             key = ("image", id(L), R)
-            hit = self.cache.get(key)
+            hit = self.sprites.get(key)
             if hit is None:
                 hit = self._with_shadow(L, *self._image_sprite(L, R), R=R)
-                self.cache[key] = hit
+                self.sprites.put(key, hit, hit[0].nbytes, id(L))
             return hit[0], hit[1], R
         # video
         reader = self.readers.get(id(L))
@@ -758,7 +909,9 @@ class Compositor:
         st = anim.state_at(L, lt, canvas=(self.spec["width"], self.spec["height"]), fps=self.fps, frame=frame_idx)
         if st["opacity"] <= 0.002 or st["scale"] <= 1e-4:
             return
-        k_frame = int(round(lt * self.fps))
+        # the reader frame nearest lt; a layer starting on a half frame puts every lt*fps on x.5, so ties
+        # must always go the same way (round() rounds halves to even: frames 0, 2, 2, 4, 4 ... judder)
+        k_frame = int(math.floor(lt * self.fps + 0.5 + 1e-6))
         spr, box, R = self._sprite(L, lt, st, k_frame)
         cached = spr
         spr, box = _apply_looks(spr, box, st, R, L, frame_idx)
@@ -776,20 +929,25 @@ class Compositor:
         crisp = not st["moving"] and not (cam is not None and _camera_moving(self.spec, t))
         split = None
         if spr is cached and spr.shape[2] == 4 and L["type"] in ("text", "counter", "shape", "image"):
-            split = lambda: self._split(spr)  # noqa: E731 - computed only if composite places it unresampled
+            split = lambda: self._split(spr, id(L))  # noqa: E731 - computed only if composite places it unresampled
         composite(canvas, spr, M, L["blend"], st["opacity"], crisp=crisp, split=split)
 
-    def _split(self, spr):
+    def _split(self, spr, owner=None):
         """split_alpha of a sprite that comes back every frame (text at rest, shapes, images), cached."""
         hit = self.splits.get(id(spr))
         if hit is not None and hit[0] is spr:
-            self.splits.move_to_end(id(spr))
             return hit[1], hit[2]
         rgb, inv3 = split_alpha(spr)
-        self.splits[id(spr)] = (spr, rgb, inv3)  # holding spr keeps its id from being reused
-        while len(self.splits) > 48:
-            self.splits.popitem(last=False)
+        # holding spr keeps its id from being reused; it counts towards the budget while held here
+        self.splits.put(id(spr), (spr, rgb, inv3), spr.nbytes + rgb.nbytes + inv3.nbytes, owner)
         return rgb, inv3
+
+    def _done(self, L):
+        """A layer is over (sequential rendering is past its end): free its decoder and sprites."""
+        if L["type"] == "video" and id(L) in self.readers:
+            self.readers.pop(id(L)).close()
+        self.sprites.drop(id(L))
+        self.splits.drop(id(L))
 
     # ----- effects
     def _effects(self, img, t):
@@ -930,8 +1088,8 @@ class Compositor:
             for L in group:
                 if L["start"] <= t < L["end"]:
                     self._draw_layer(canvas, L, t, frame_idx, c)
-                elif L["type"] == "video" and id(L) in self.readers and t >= L["end"]:
-                    self.readers.pop(id(L)).close()  # done with this clip: free its decoder
+                elif t >= L["end"]:
+                    self._done(L)
         return self._effects(canvas, t)
 
     def frame_u8(self, t, frame_idx=None):
@@ -984,8 +1142,19 @@ def _caption_runs(words, gap=CAPTION_GAP):
     return runs
 
 
-_OVERRIDE = re.compile(r"(\{[^}]*\})")
+_OVERRIDE = re.compile(r"((?<!\\)\{[^}]*\})")   # an override block; an escaped \{ is literal text
 _TRAILING_PUNCT = re.compile(r"(?<=[^\s.,;:])[.,;:]+(?=\s|$)")
+
+
+_WORD_JOINER = "\u2060"
+
+
+def ass_text(word):
+    """A caption word as literal ASS text: "{" would open an override block (the word vanishes, or
+    "{\\fs300}" restyles the card) and a backslash would start an escape ("\\n" becomes a line break
+    once uppercased to "\\N"). Braces become libass's \\{ \\}; a backslash gets an invisible word
+    joiner after it, so it prints and never pairs with the next character."""
+    return str(word).replace("\\", "\\" + _WORD_JOINER).replace("{", "\\{").replace("}", "\\}")
 
 
 def _clean_event(line):
@@ -1013,7 +1182,8 @@ def build_captions(spec, W, H, workdir):
     # the file's real weight decides libass's bold flag, so no faux-bold smear on heavy fonts
     style["font_look"] = dict(style.get("font_look") or {}, weight="bold" if weight >= 600 else "regular")
     ass = None
-    for run in _caption_runs(cap["words"]):
+    words = [dict(w, w=ass_text(w["w"])) for w in cap["words"]]
+    for run in _caption_runs(words):
         text, _ = mod.build_ass(run, style, W, H, fontname, bool(cap.get("pop")))
         lines = text.splitlines()
         if ass is None:  # header from the first run, Dialogue events from every run
@@ -1104,10 +1274,12 @@ def render(spec, out_path, preview=False, progress=None, workdir=None, base_dir=
             raise RenderError("ffmpeg could not encode the video: %s" % (msg[-1500:] or "exit code %d" % code))
         mix = audio.mixdown(s, total / fps, os.path.join(workdir, "mix.wav"), workdir=workdir)
         if mix:
+            # the mix is exactly as long as the video; no -shortest: it cuts the last frames (the CTA, the loop
+            # point) whenever the audio packets end a hair early, which at 29.97 / 59.94 fps is every time
             r = subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", silent, "-i", mix,
                                 "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                                "-ar", "48000", "-shortest", "-movflags", "+faststart", out_path],
-                               capture_output=True, text=True)
+                                "-ar", "48000", "-movflags", "+faststart", out_path],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace")
             if r.returncode != 0:
                 raise RenderError("ffmpeg could not add the audio: %s" % r.stderr.strip()[-1500:])
         else:
@@ -1146,12 +1318,15 @@ def still(spec, t, out_png, preview=False, base_dir=None):
             # shift the frame's timestamp to t so libass shows the captions of that moment
             r = subprocess.run([_ffmpeg(), "-hide_banner", "-loglevel", "error", "-y", "-i", raw, "-vf",
                                 "setpts=PTS+%.6f/TB,%s" % (float(t), flt), "-frames:v", "1", "-update", "1",
-                                out_png], capture_output=True, text=True)
+                                out_png], capture_output=True, text=True, encoding="utf-8", errors="replace")
             if r.returncode == 0:
                 return out_png
             print("captions could not be burned into the still: %s" % r.stderr.strip()[-400:], file=sys.stderr)
         Image.fromarray(frame).save(out_png)
     return out_png
+
+
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 
 
 def main(argv=None):
@@ -1163,6 +1338,14 @@ def main(argv=None):
     ap.add_argument("--workdir", help="keep intermediate files (captions .ass, silent video, audio mix) here")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args(argv)
+    ext = os.path.splitext(a.out)[1].lower()
+    if a.still is None and ext in IMAGE_EXT:
+        print("render: %s is an image; add --still SECONDS to render one frame (or use --out video.mp4)" % a.out,
+              file=sys.stderr)
+        return 2
+    if a.still is not None and ext not in IMAGE_EXT:
+        print("render: --still writes an image; give --out a .png or .jpg name, not %s" % a.out, file=sys.stderr)
+        return 2
     t0 = time.time()
     try:
         if a.still is not None:

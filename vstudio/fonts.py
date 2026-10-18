@@ -2,7 +2,7 @@
 fonts.py - find, load and install fonts for the renderer and the captions.
 
     python -m vstudio fonts list                     families found, where they live
-    python -m vstudio fonts resolve "Montserrat Black"
+    python -m vstudio fonts resolve "Montserrat Black" Anton "Inter Bold"   (quote multi-word names)
     python -m vstudio fonts install Montserrat Anton "Bebas Neue" Poppins
 
 Names are "Family" or "Family Weight [Italic]": weights Thin, ExtraLight,
@@ -22,6 +22,10 @@ caption burner) cannot use variable fonts from a folder, so ass_font()
 makes a static instance with fontTools when it is installed, and otherwise
 picks the closest static font.
 
+glyph_fallbacks(name, text) finds, for the characters a font has no glyph
+for (Hindi in a Latin display font, symbols), the closest weight of an
+installed family that has them; textrender draws those runs with it.
+
 `install` downloads open-licensed families from the google/fonts GitHub
 repository (raw.githubusercontent.com), reading each family's METADATA.pb
 for its file names, into workspace/fonts/<Family>/ with the licence file.
@@ -35,11 +39,12 @@ import shutil
 import ssl
 import subprocess
 import sys
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 
-from PIL import ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 from . import paths
 
@@ -60,9 +65,30 @@ ITALIC_WORDS = {"italic", "oblique"}
 FALLBACK_SANS = ["Montserrat", "Inter", "Poppins", "Roboto", "Open Sans", "Arial", "Helvetica Neue", "Helvetica",
                  "Segoe UI", "DejaVu Sans", "Liberation Sans", "Noto Sans", "Verdana"]
 
+# tried first, in this order, for characters the requested font has no glyph for (then every other
+# installed family): Indic, CJK, Arabic, Thai on Windows / macOS / Linux, then broad sans and symbol fonts
+GLYPH_FALLBACKS = [
+    "Noto Sans", "Noto Sans Devanagari", "Noto Sans Bengali", "Noto Sans Tamil", "Noto Sans Telugu",
+    "Noto Sans Gujarati", "Noto Sans Gurmukhi", "Noto Sans Kannada", "Noto Sans Malayalam", "Noto Sans Oriya",
+    "Noto Sans Arabic", "Noto Sans Hebrew", "Noto Sans Thai", "Noto Sans SC", "Noto Sans JP", "Noto Sans KR",
+    "Noto Sans CJK SC", "Noto Sans CJK JP", "Noto Sans CJK KR", "Source Han Sans SC",
+    "Nirmala UI", "Mangal", "Vrinda", "Latha", "Gautami", "Shruti", "Raavi", "Tunga", "Kartika",
+    "Kohinoor Devanagari", "Devanagari Sangam MN", "ITF Devanagari", "Kohinoor Bangla", "Bangla Sangam MN",
+    "Tamil Sangam MN", "Kohinoor Telugu", "Telugu Sangam MN", "Gujarati Sangam MN", "Gurmukhi Sangam MN",
+    "Kannada Sangam MN", "Malayalam Sangam MN",
+    "Segoe UI", "Arial", "Microsoft YaHei", "Yu Gothic", "Meiryo", "Malgun Gothic", "Leelawadee UI",
+    "PingFang SC", "Hiragino Sans", "Apple SD Gothic Neo", "Geeza Pro", "Thonburi", "Helvetica Neue",
+    "DejaVu Sans", "FreeSans", "Liberation Sans", "Arial Unicode MS",
+    "Segoe UI Emoji", "Segoe UI Symbol", "Noto Emoji", "Noto Sans Symbols", "Noto Sans Symbols 2",
+    "Apple Symbols", "Symbola",
+]
+NOTDEF_PROBE = "\U0010FFFF"  # a noncharacter: no font maps it, so it draws the font's .notdef box
+
 _index = None
 _resolved = {}
 _warned = set()
+_probes = {}         # (path, index) -> (Pillow font at 32 px, signature of its .notdef, {char: has it}) or None
+_glyph_choice = {}   # (char, weight, italic) -> index entry of the font that draws it, or None
 
 
 def _key(s):
@@ -218,6 +244,7 @@ def _load_index(refresh=False):
 def refresh():
     """Forget cached lookups and rescan the font folders."""
     _resolved.clear()
+    _glyph_choice.clear()
     _load_index(refresh=True)
 
 
@@ -268,7 +295,7 @@ def _fc_match(family, weight, italic):
     pattern = "%s:weight=%d%s" % (family, w, ":slant=100" if italic else "")
     try:
         r = subprocess.run(["fc-match", "-f", "%{file}\n%{family}", pattern], capture_output=True, text=True,
-                           timeout=10)
+                           encoding="utf-8", errors="replace", timeout=10)
     except (OSError, subprocess.SubprocessError):
         return None
     lines = r.stdout.splitlines()
@@ -343,10 +370,18 @@ _font_cache = {}
 
 def load(name_or_path, size):
     """A Pillow font at a pixel size; variable fonts get their weight axis set to the requested weight."""
-    size = max(1, int(round(size)))
     e = _entry(name_or_path)
     if not e:
-        return ImageFont.load_default(size)
+        try:
+            return ImageFont.load_default(max(1, int(round(size))))
+        except TypeError:  # Pillow < 10.1: the built-in font has one size
+            return ImageFont.load_default()
+    return load_face(e, size)
+
+
+def load_face(e, size):
+    """A Pillow font for an index entry (as installed() / glyph_fallbacks() return them) at a pixel size."""
+    size = max(1, int(round(size)))
     weight = e.get("want_weight") or (400 if e["variable"] else e["weight"])
     key = (e["path"], e["index"], size, weight)
     f = _font_cache.get(key)
@@ -390,6 +425,103 @@ def weight_of(name_or_path):
     if not e:
         return 400
     return (e.get("want_weight") or 400) if e["variable"] else e["weight"]
+
+
+# --------------------------------------------------------------------------- glyph coverage
+
+def needs_glyph(ch):
+    """True for characters that need a glyph of their own (not spaces, combining marks, joiners,
+    variation selectors or control characters: those draw with the font of the character before them)."""
+    return not ch.isspace() and unicodedata.category(ch)[0] not in ("M", "C", "Z")
+
+
+def _glyph_sig(font, ch):
+    bb = font.getbbox(ch)
+    im = Image.new("L", (max(1, bb[2] - bb[0]), max(1, bb[3] - bb[1])))
+    ImageDraw.Draw(im).text((-bb[0], -bb[1]), ch, font=font, fill=255)
+    return bb, round(font.getlength(ch), 3), im.tobytes()
+
+
+def _probe(e):
+    """(font at 32 px, its .notdef signature) for an entry, or None when it cannot be loaded at any size."""
+    key = (e["path"], e.get("index", 0))
+    if key not in _probes:
+        try:
+            f = ImageFont.truetype(e["path"], 32, index=e.get("index", 0))
+            _probes[key] = (f, _glyph_sig(f, NOTDEF_PROBE), {})
+        except (OSError, ValueError):  # colour bitmap emoji fonts only load at their own strike size
+            _probes[key] = None
+    return _probes[key]
+
+
+def has_glyph(probe, ch):
+    """True when the probed font draws ch with a real glyph rather than its .notdef box."""
+    known = probe[2]
+    if ch not in known:
+        try:
+            known[ch] = _glyph_sig(probe[0], ch) != probe[1]
+        except (OSError, ValueError):
+            known[ch] = False
+    return known[ch]
+
+
+def glyph_fallbacks(name_or_path, text):
+    """Fonts for the characters of text that the named font has no glyph for.
+
+    Returns ({char: index entry}, [chars no installed font can draw]). Each fallback is the closest
+    weight and style of a family that has the glyph: GLYPH_FALLBACKS first (Nirmala UI, Kohinoor,
+    Noto Sans Devanagari... for Hindi), then every installed family. Load them with load_face().
+    Colour emoji fonts are bitmap-only, so emoji draw only where a monochrome emoji or symbol font
+    is installed (Segoe UI Emoji / Symbol on Windows); the others are named in a one-time notice.
+    """
+    chars = sorted({c for c in str(text or "") if needs_glyph(c)})
+    e = _entry(name_or_path) if chars else None
+    probe = _probe(e) if e else None
+    if probe is None:
+        return {}, []
+    lacking = [c for c in chars if not has_glyph(probe, c)]
+    if not lacking:
+        return {}, []
+    weight = e.get("want_weight") or (400 if e["variable"] else e["weight"])
+    italic = bool(e.get("want_italic", e.get("italic")))
+    todo = [c for c in lacking if (c, weight, italic) not in _glyph_choice]
+    if todo:
+        entries = _load_index()
+        order = {_key(f): i for i, f in enumerate(GLYPH_FALLBACKS)}
+        families = sorted({x["family"] for x in entries if _key(x["family"]) != _key(e["family"])},
+                          key=lambda f: (order.get(_key(f), len(order)), min(x["rank"] for x in entries
+                                                                             if x["family"] == f), f.lower()))
+        for fam in families:
+            if not todo:
+                break
+            fe = _family_matches(fam, weight, italic, entries)
+            fp = _probe(fe) if fe else None
+            if fp is None:
+                continue
+            got = [c for c in todo if has_glyph(fp, c)]
+            for c in got:
+                _glyph_choice[(c, weight, italic)] = dict(fe, want_weight=weight, want_italic=italic)
+            todo = [c for c in todo if c not in got]
+        for c in todo:
+            _glyph_choice[(c, weight, italic)] = None
+    found = {c: _glyph_choice[(c, weight, italic)] for c in lacking if _glyph_choice[(c, weight, italic)]}
+    nobody = [c for c in lacking if not _glyph_choice[(c, weight, italic)]]
+    used = sorted({f["family"] for f in found.values()})
+    key = ("glyphs", e["path"], tuple(lacking))
+    if key not in _warned:
+        _warned.add(key)
+        if used:
+            print("text: %s has no glyph for %s; drawn with %s" % (
+                e["family"], _show(c for c in lacking if c in found), ", ".join(used)), file=sys.stderr)
+        if nobody:
+            print("text: no installed font can draw %s; it shows as a box (colour emoji are not supported in "
+                  "text layers: use an icon template or remove it, or install a font that has it)"
+                  % _show(nobody), file=sys.stderr)
+    return found, nobody
+
+
+def _show(chars):
+    return ", ".join("%r (U+%04X)" % (c, ord(c)) for c in chars)
 
 
 # --------------------------------------------------------------------------- captions (libass)
@@ -567,13 +699,36 @@ def _list(show_all):
         print("\n(system fonts hidden; --all to show them)")
 
 
+def installed_name(name):
+    """True when a name (or a font file) is installed as asked, without falling back to another family."""
+    if os.path.isfile(str(name)):
+        return True
+    family, weight, italic = parse_name(name)
+    return bool(family) and (_family_matches(family, weight, italic, _load_index()) is not None
+                             or _fc_match(family, weight, italic) is not None)
+
+
+def _resolve_args(args):
+    """The font names on a `fonts resolve` command line.
+
+    Quoted names ("Montserrat Black" "Inter Bold") are one font each. Unquoted words are one name
+    (DejaVu Sans Bold) unless only the separate words are installed fonts (Anton Inter).
+    """
+    if len(args) == 1 or any(" " in a.strip() for a in args):
+        return list(args)
+    joined = " ".join(args)
+    if not installed_name(joined) and all(installed_name(a) for a in args):
+        return list(args)
+    return [joined]
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="vstudio fonts", description="List, resolve or install free fonts.")
     sub = ap.add_subparsers(dest="cmd")
     ls = sub.add_parser("list", help="font families found, by folder")
     ls.add_argument("--all", action="store_true", help="include system fonts even when there are many")
-    rs = sub.add_parser("resolve", help="which file a font name uses")
-    rs.add_argument("name", nargs="+")
+    rs = sub.add_parser("resolve", help="which file a font name uses (quote each multi-word name)")
+    rs.add_argument("name", nargs="+", help='font names, e.g. "Montserrat Black" Anton "Inter Bold"')
     ins = sub.add_parser("install", help="download Google Fonts families (open licences) into workspace/fonts")
     ins.add_argument("family", nargs="+")
     ins.add_argument("--force", action="store_true", help="download again even if present")
@@ -582,18 +737,22 @@ def main(argv=None):
         _list(getattr(a, "all", False))
         return 0
     if a.cmd == "resolve":
-        name = " ".join(a.name)
-        e = info(name)
-        if not e:
-            print("no font file found; Pillow's built-in font will be used")
-            return 1
-        if e["variable"]:
-            rng = "%d-%d" % tuple(e["wght"]) if e.get("wght") else "?"
-            print("%s\n  family %s, variable font (weights %s), renders at weight %d"
-                  % (e["path"], e["family"], rng, weight_of(name)))
-        else:
-            print("%s\n  family %s, style %s, weight %d" % (e["path"], e["family"], e["style"], e["weight"]))
-        return 0
+        names = _resolve_args(a.name)
+        code = 0
+        for name in names:
+            e = info(name)
+            head = "%s: " % name if len(names) > 1 else ""
+            if not e:
+                print("%sno font file found; Pillow's built-in font will be used" % head)
+                code = 1
+            elif e["variable"]:
+                rng = "%d-%d" % tuple(e["wght"]) if e.get("wght") else "?"
+                print("%s%s\n  family %s, variable font (weights %s), renders at weight %d"
+                      % (head, e["path"], e["family"], rng, weight_of(name)))
+            else:
+                print("%s%s\n  family %s, style %s, weight %d" % (head, e["path"], e["family"], e["style"],
+                                                                   e["weight"]))
+        return code
     try:
         files = install(a.family, force=a.force)
     except RuntimeError as err:

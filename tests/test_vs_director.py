@@ -4,19 +4,23 @@ Offline and fast: the Claude CLI is replaced by an injected runner or a fake cli
 ffmpeg at small sizes (those tests skip when ffmpeg is missing).
 """
 
+import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+import wave
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from vstudio import director, llm, paths, planner, templates, timeline  # noqa: E402
 
 HAVE_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+HAVE_OCR = importlib.util.find_spec("rapidocr_onnxruntime") is not None     # optional: reads on-screen text
 T = {}
 
 SCRIPT = """I lost $300 on one setting.
@@ -385,6 +389,144 @@ class PlannerTest(unittest.TestCase):
         self.assertEqual(planner.main(["heuristic", "--prompt", "Coffee: beans, water, time", "--out",
                                        os.path.join(d, "p2.json"), "--spec", os.path.join(d, "s2.json")]), 0)
 
+    def _shown_numbers(self, plan):
+        out = []
+        for b in plan["beats"]:
+            for c in planner.visual_calls(b["visual"]):
+                for k, v in (c.get("params") or {}).items():
+                    if k in ("text", "value", "label", "word", "highlight"):
+                        for x in (v if isinstance(v, list) else [v]):
+                            out += re.findall(r"\d[\d,.]*", str(x))
+        return [n.rstrip(".,") for n in out]
+
+    def test_decimals_and_abbreviations_do_not_split_sentences(self):
+        self.assertEqual(planner._sentences("How I grew 3.5x faster in 30 days. Then it stopped."),
+                         ["How I grew 3.5x faster in 30 days.", "Then it stopped."])
+        self.assertEqual(planner._sentences("I made $1,250.50 from one reel! Wild."),
+                         ["I made $1,250.50 from one reel!", "Wild."])
+        self.assertEqual(planner._sentences("iPhone vs. Android, e.g. for video. Dr. Lee agrees. Visit vstudio.app now."),
+                         ["iPhone vs. Android, e.g. for video.", "Dr. Lee agrees.", "Visit vstudio.app now."])
+        self.assertEqual(planner._sentences("stop scrolling. this changes everything"),
+                         ["stop scrolling.", "this changes everything"])            # lowercase scripts still split
+        for text, nums in (("How I grew 3.5x faster in 30 days", {"3.5", "30"}),
+                           ("I made $1,250.50 from one reel", {"1,250.50"}),
+                           ("We hit 2.5M views", {"2.5"})):
+            plan = planner.heuristic_plan(text, None, None, 10)
+            self.assertEqual(plan["beats"][0]["say"].rstrip("."), text)              # one line, not two halves
+            self.assertTrue(set(self._shown_numbers(plan)) <= nums, (text, self._shown_numbers(plan)))
+        plan = planner.heuristic_plan("", "Which phone shoots better video? iPhone vs. Android. Here is the answer.",
+                                      None, 12)
+        self.assertIn("versus", [(b["visual"] or {}).get("template") for b in plan["beats"]])
+        words = [{"w": w, "s": i * 0.4, "e": i * 0.4 + 0.3} for i, w in enumerate("We hit 2.5M views. Dr. Lee said so.".split())]
+        self.assertEqual([len(s) for s in planner.sentences_from_words(words)], [4, 4])
+
+    def test_headline_never_ends_on_a_dangling_word(self):
+        for line, want in (("Follow for part 2 where I break down the hooks.", "Follow for part 2"),
+                           ("Comment GUIDE and I will send you the checklist.", "Comment GUIDE"),
+                           ("Follow me if you want more tips like this one.", "Follow me"),
+                           ("So if this helped, share this with a friend who needs it.", "Share this with a friend")):
+            plan = planner.heuristic_plan("", "Stop guessing your hooks. Most creators never test them. " + line, None, 12)
+            cta = plan["beats"][-1]["visual"]
+            self.assertEqual(cta["template"], "cta")
+            self.assertEqual(cta["params"]["text"], want)
+        dangling = {"and", "or", "but", "where", "when", "if", "to", "for", "before", "that", "which", "with", "of",
+                    "the", "a", "my", "your"}
+        for line in ("Most creators quit right before it starts working for them every single time.",
+                     "The one setting that nobody checks and that costs you half of your views.",
+                     "Follow for part 2 where I break down the hooks."):
+            for n in (4, 5, 7):
+                h = planner.headline(line, n)
+                self.assertNotIn(h.split()[-1].lower(), dangling, (line, n, h))
+                self.assertLessEqual(len(h.split()), n + 2)
+
+    def test_symbol_only_prompt_still_opens_on_a_hook(self):
+        for prompt in ("🔥🔥🔥", "!!! ???", "***"):
+            plan = planner.heuristic_plan(prompt, None, None, 8)
+            self.assertEqual(planner.validate_plan(plan), [], prompt)
+            self.assertTrue(plan["beats"][0]["visual"]["params"]["text"].strip())
+            spec = planner.compile_plan(plan)
+            self.assertTrue([l for l in spec["layers"] if l["id"].startswith("b01.") and l["type"] == "text"])
+        # a script without words falls back to the prompt
+        plan = planner.heuristic_plan("Three habits that fixed my sleep", "🔥🔥", None, 8)
+        self.assertIn("habits", plan["beats"][0]["say"].lower())
+
+    def test_non_latin_lines_are_timed_like_speech(self):
+        en = planner.speak_seconds("This is exactly how I grew my channel in one single month.")
+        for line in ("Вот как именно я вырастил свой канал всего за один месяц.",
+                     "ठीक इसी तरह मैंने सिर्फ एक महीने में अपना चैनल बढ़ाया।",
+                     "这就是我在短短一个月内发展频道的方法。",
+                     "これがたった一か月でチャンネルを伸ばした方法です。",
+                     "이것이 내가 한 달 만에 채널을 키운 방법입니다."):
+            t = planner.speak_seconds(line)
+            self.assertTrue(0.5 * en <= t <= 2.0 * en, (line, t, en))
+        zh = planner.time_words("这就是我在短短一个月内发展频道的方法。", 0, 6)
+        self.assertGreater(len(zh), 3)                                       # not one 18-character caption "word"
+        self.assertEqual("".join(w["w"] for w in zh), "这就是我在短短一个月内发展频道的方法。")
+        self.assertTrue(all(len(w["w"]) <= 5 for w in zh))
+        self.assertEqual(planner._syllables("café"), 2)
+        self.assertEqual(planner._syllables("2026"), 4)
+
+    def test_malformed_plans_never_crash_the_checks(self):
+        good = _beat(0, 3, say="hello there friend")
+        bad_plans = [
+            {"aspect": ["9:16"], "beats": [good]},
+            {"beats": [_beat(0, 3, visual={"template": "hook_title", "params": ["I LOST $300"]})]},
+            {"beats": [_beat(0, 3, visual={"template": "hook_title", "params": "HELLO"})]},
+            {"beats": [_beat(0, 3, visual={"template": ["hook_title"], "params": {"text": "x"}})]},
+            {"beats": [_beat(0, 3, visual={"template": {"n": 1}, "params": {"text": "x"}})]},
+            {"beats": [good], "cta": {"template": "cta", "params": ["Follow"]}},
+            {"beats": [good], "cta": {"template": ["cta"], "params": {"text": "Follow"}}},
+            {"beats": [good], "music": {"src": ["a.mp3"]}},
+            {"beats": [good], "voiceover": {"src": {"x": 1}, "words": None}},
+            {"beats": [_beat(0, 3, visual={"template": "list_item", "params": {"text": "x", "number": "1e400"}})]},
+            {"beats": [_beat(0, 3, visual={"template": "counter_reveal", "params": {"value": float("inf")}})]},
+            {"beats": [_beat(0, 3, visual={"template": "bar_chart", "params": {"labels": ["a"], "values": [1e400]}})]},
+            {"beats": [_beat(0, 3, background={"asset": ["x.mp4"]})]},
+            {"beats": [_beat(0, 3, background={"color": 7})]},
+            {"beats": [_beat(0, 3, background={"gradient": "#000000"})]},
+            {"beats": [_beat(0, 3, background={"color": "#101010", "zoom": 2, "focus": "x"})]},
+            {"beats": [_beat(0, 3, say=["a", "b"])]},
+        ]
+        for plan in bad_plans:
+            errs = planner.validate_plan(plan)
+            self.assertTrue(errs, plan)
+            try:
+                spec = planner.compile_plan(plan)
+            except ValueError:
+                continue
+            self.assertEqual(timeline.validate(spec), [], plan)
+            self.assertNotIn("12,500", json.dumps(spec))                     # a broken number never becomes a sample
+            self.assertNotIn("12500", json.dumps([l for l in spec["layers"] if l["type"] == "counter"]))
+
+    def test_music_may_be_a_video_file(self):
+        song = os.path.join(T["tmp"], "song.mp4")
+        with open(song, "wb") as f:
+            f.write(b"\0" * 64)
+        plan = {"aspect": "9:16", "duration": 3, "beats": [_beat(0, 3, say="hello")], "music": {"src": song}}
+        self.assertEqual(planner.validate_plan(plan), [])
+        plan["music"]["src"] = os.path.join(T["tmp"], "photo.png")
+        self.assertTrue(any("music.src" in e for e in planner.validate_plan(plan)))
+
+    def test_unreadable_assets_are_skipped(self):
+        broken_png = os.path.join(T["tmp"], "broken.png")
+        broken_mp4 = os.path.join(T["tmp"], "broken.mp4")
+        for p in (broken_png, broken_mp4):
+            with open(p, "wb") as f:
+                f.write(b"not media at all " * 20)
+        skipped = []
+        rows = planner.asset_rows([broken_png, os.path.join(T["tmp"], "photo.png")], skipped)
+        self.assertEqual([r["path"] for r in rows], [os.path.join(T["tmp"], "photo.png")])
+        self.assertEqual([s[0] for s in skipped], [broken_png])
+        if HAVE_FFMPEG:
+            good = os.path.join(T["tmp"], "broll.mp4")
+            skipped = []
+            rows = planner.asset_rows([broken_mp4, good], skipped)
+            self.assertEqual([r["path"] for r in rows], [good])
+            self.assertEqual([s[0] for s in skipped], [broken_mp4])
+            plan = planner.heuristic_plan("", SCRIPT, None, 12, assets=[broken_mp4, good])
+            self.assertTrue(all(b["background"]["asset"] == good for b in plan["beats"]))
+            self.assertIn("could not be read", plan["notes"])
+
 
 class DirectorChecksTest(unittest.TestCase):
     def test_invented_numbers(self):
@@ -394,6 +536,27 @@ class DirectorChecksTest(unittest.TestCase):
         self.assertEqual(len(errs), 1)
         self.assertIn("1,200", errs[0])
         self.assertEqual(director.invented_numbers(plan, "47% and 1200 views"), [])
+
+    def test_invented_numbers_ignores_layout_params(self):
+        layout = [{"template": "emphasis_word", "params": {"word": "LUNCH", "y": 0.3, "tilt": -3.5}},
+                  {"template": "highlight_box", "params": {"x": 0.42, "y": 0.61, "w": 0.55, "h": 0.18, "thickness": 12,
+                                                           "color": "#1E2A44"}},
+                  {"template": "arrow", "params": {"x": 0.3, "y": 0.7, "length": 420}},
+                  {"template": "icon_badge", "params": {"size": 260, "y": 0.35}},
+                  {"template": "kinetic_text", "params": {"text": "post at lunch", "times": [0.12, 0.55, 0.93]}},
+                  {"template": "counter_reveal", "params": {"value": 47, "label": "retention", "duration": 1.35}},
+                  {"template": "list_item", "params": {"number": 2, "total": 3, "text": "cut the intro", "y": 0.62}}]
+        plan = {"beats": [_beat(0, 2, say="Post at lunch.", visual=layout)],
+                "cta": {"template": "cta", "params": {"text": "Follow", "color": "#FF3366"}}}
+        self.assertEqual(director.invented_numbers(plan, "post at lunch, 47% retention"), [])
+        # numbers a template shows are still checked, in number and in text params
+        plan["beats"][0]["visual"] = [{"template": "counter_reveal", "params": {"value": 340, "from": 120}},
+                                      {"template": "stat", "params": {"value": "340%", "label": "in 90 days"}},
+                                      {"template": "hook_title", "params": {"text": "I made 12k", "size": 120}}]
+        errs = "\n".join(director.invented_numbers(plan, "post at lunch"))
+        for want in ("counter_reveal.value", "counter_reveal.from", "stat.value", "stat.label", "hook_title.text"):
+            self.assertIn(want, errs)
+        self.assertNotIn("size", errs)
 
     def test_copied_lines_and_script_coverage(self):
         plan = {"beats": [_beat(0, 2, say="nobody tells you this about the algorithm and your first hundred videos")]}
@@ -476,10 +639,11 @@ class DirectorFlowTest(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(out, name)), name)
         spec = timeline.load(os.path.join(out, "spec.json"))
         self.assertEqual(timeline.validate(spec), [])
-        # the reference's measured caption look went into the plan style
+        # the reference's measured caption look went into the plan style (reading on-screen text needs the OCR)
         plan = json.loads(_read(os.path.join(out, "plan.json")))
-        self.assertIn("caption_style", plan["style"])
-        self.assertAlmostEqual(plan["style"]["caption_style"]["center_y_pct"], 68, delta=4)
+        if HAVE_OCR:
+            self.assertIn("caption_style", plan["style"])
+            self.assertAlmostEqual(plan["style"]["caption_style"]["center_y_pct"], 68, delta=4)
         info = timeline.probe(res["video"])
         self.assertEqual((info["width"], info["height"]), (540, 960))
         self.assertAlmostEqual(info["duration"], 3.6, delta=0.2)
@@ -510,6 +674,152 @@ class DirectorFlowTest(unittest.TestCase):
                                         "--no-render"]), 0)
         brief = _read(os.path.join(out3, "BRIEF.md"))
         self.assertIn("scriptcheck", brief)
+
+    def _simple_plan(self, **kw):
+        plan = {"title": "Stop posting at night", "aspect": "9:16", "duration": 6, "style": {}, "cta": None,
+                "beats": [_beat(0, 3, say="Stop posting at night.", transition=None, camera="punch", sfx="hit",
+                                visual={"template": "hook_title", "params": {"text": "STOP POSTING AT NIGHT"}}),
+                          _beat(3, 6, say="Post at lunch instead.",
+                                visual={"template": "emphasis_word", "params": {"word": "LUNCH", "y": 0.3}})]}
+        plan.update(kw)
+        return plan
+
+    def _runner(self, *answers):
+        calls = []
+
+        def run(argv, stdin, timeout, cwd, env):
+            calls.append(stdin)
+            ans = answers[min(len(calls), len(answers)) - 1]
+            return 0, _envelope(result=ans if isinstance(ans, str) else json.dumps(ans)), ""
+        return run, calls
+
+    def tearDown(self):
+        llm.set_runner(None)
+
+    def test_layout_numbers_and_video_music_pass_the_checks(self):
+        song = os.path.join(T["tmp"], "track.mp4")
+        with open(song, "wb") as f:
+            f.write(b"\0" * 64)
+        for music in (None, song):
+            run, calls = self._runner(self._simple_plan())
+            llm.set_runner(run)
+            res = director.make_reel("Stop posting at night. Post at lunch instead.", music=music, duration=6,
+                                     out_dir=tempfile.mkdtemp(dir=T["tmp"]), llm="claude", render=False, log=None)
+            self.assertEqual((res["planner"], len(calls)), ("claude", 1), res["notes"])
+            plan = json.loads(_read(res["plan"]))
+            self.assertEqual((plan.get("music") or {}).get("src"), music)
+        with self.assertRaises(director.DirectorError):
+            director.make_reel("x", music=os.path.join(T["tmp"], "photo.png"), duration=6, llm="none", render=False,
+                               out_dir=tempfile.mkdtemp(dir=T["tmp"]), log=None)
+
+    def test_malformed_answers_go_back_to_claude(self):
+        base = self._simple_plan()
+        hook = base["beats"][0]
+
+        def with_hook(**visual):
+            p = json.loads(json.dumps(base))
+            p["beats"][0]["visual"] = dict(hook["visual"], **visual)
+            return p
+        cases = {"params_list": with_hook(params=["I LOST $300"]),
+                 "params_str": with_hook(params="HELLO"),
+                 "template_list": with_hook(template=["hook_title"]),
+                 "huge_int": with_hook(template="list_item", params={"text": "post later", "number": "1e400"}),
+                 "cta_params_list": dict(json.loads(json.dumps(base)), cta={"template": "cta", "params": ["Follow"]}),
+                 "music_src_list": dict(json.loads(json.dumps(base)), music={"src": ["a.mp3"]}),
+                 "beats_of_strings": dict(json.loads(json.dumps(base)), beats=["hello", "there"])}
+        for name, bad in cases.items():
+            run, calls = self._runner(bad, base)
+            llm.set_runner(run)
+            res = director.make_reel("Stop posting at night. Post at lunch instead.", duration=6, llm="claude",
+                                     out_dir=tempfile.mkdtemp(dir=T["tmp"]), render=False, log=None)
+            self.assertEqual((res["planner"], len(calls)), ("claude", 2), (name, res["notes"]))
+            self.assertIn("# Your previous answer had these problems", calls[1], name)
+        # a plan file with the same faults is reported, never a traceback
+        for name, bad in cases.items():
+            d = tempfile.mkdtemp(dir=T["tmp"])
+            p = os.path.join(d, "plan.json")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(bad, f)
+            try:
+                res = director.make_reel("", plan=p, out_dir=d, render=False, log=None)
+            except director.DirectorError:
+                continue
+            self.assertTrue(res["plan_errors"], name)
+
+    def _wav(self, path, seconds=2.0, sr=16000):
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sr)
+            w.writeframes(b"\0\0" * int(seconds * sr))
+        return path
+
+    def test_voice_words_sidecar_in_every_documented_shape(self):
+        d = tempfile.mkdtemp(dir=T["tmp"])
+        shapes = {"whisperx": [{"word": "Stop", "start": 0.1, "end": 0.4}, {"word": "posting", "start": 0.45, "end": 0.9},
+                               {"word": "at", "start": 0.95, "end": 1.05}, {"word": "night.", "start": 1.1, "end": 1.6}],
+                  "segments": {"segments": [{"start": 0.1, "end": 1.6, "text": "Stop posting at night."}]},
+                  "unsorted": [{"w": "night.", "s": 1.1, "e": 1.6}, {"w": "Stop", "s": 0.1, "e": 0.4},
+                               {"w": "posting", "s": 0.45, "e": 0.9}, {"w": "at", "s": 0.95, "e": 1.05}]}
+        for name, data in shapes.items():
+            voice = self._wav(os.path.join(d, "%s.wav" % name))
+            with open(os.path.join(d, "%s.words.json" % name), "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            words = director._voice_words(voice)
+            self.assertEqual([w["w"] for w in words], ["Stop", "posting", "at", "night."], name)
+            self.assertTrue(all(set(w) >= {"w", "s", "e"} for w in words))
+            self.assertEqual(words, sorted(words, key=lambda w: w["s"]))
+            res = director.make_reel("Stop posting at night", voice=voice, duration=10, llm="none", render=False,
+                                     out_dir=os.path.join(d, "out_" + name), log=None)
+            self.assertAlmostEqual(json.loads(_read(res["plan"]))["duration"], 1.6 + 0.5 + 2.2, delta=0.6)
+
+    def test_download_follows_the_link(self):
+        d = tempfile.mkdtemp(dir=T["tmp"])
+        stem = os.path.join(d, "inputs", "ref1")
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            url = cmd[-1]
+            if "--skip-download" not in cmd:
+                with open(stem + ".mp4", "w", encoding="utf-8") as f:
+                    f.write(url)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        old_run, old_have = director.subprocess.run, director._have_ytdlp
+        director.subprocess.run, director._have_ytdlp = fake_run, lambda: True
+        try:
+            v1, _ = director.download("https://www.youtube.com/shorts/AAA", stem)
+            self.assertEqual(_read(v1), "https://www.youtube.com/shorts/AAA")
+            n = len(calls)
+            v1b, _ = director.download("https://www.youtube.com/shorts/AAA", stem)
+            self.assertEqual((v1b, len(calls)), (v1, n))                       # same link: the file is reused
+            os.makedirs(os.path.dirname(stem), exist_ok=True)
+            with open(stem + ".en.vtt", "w", encoding="utf-8") as f:
+                f.write("WEBVTT\n")
+            v2, caps = director.download("https://www.youtube.com/shorts/COMPLETELY_DIFFERENT", stem)
+            self.assertEqual(_read(v2), "https://www.youtube.com/shorts/COMPLETELY_DIFFERENT")
+            self.assertIsNone(caps)                                            # the old link's captions are gone
+        finally:
+            director.subprocess.run, director._have_ytdlp = old_run, old_have
+
+    @unittest.skipUnless(HAVE_FFMPEG, "ffmpeg missing")
+    def test_unreadable_asset_is_skipped_not_fatal(self):
+        d = tempfile.mkdtemp(dir=T["tmp"])
+        broken = os.path.join(d, "broken.mp4")
+        with open(broken, "wb") as f:
+            f.write(b"not a video at all" * 10)
+        good = os.path.join(T["tmp"], "broll.mp4")
+        res = director.make_reel("Stop posting at 9pm", assets=[broken, good], duration=5, llm="none", render=False,
+                                 out_dir=os.path.join(d, "out"), log=None)
+        self.assertTrue(any("broken.mp4" in n and "could not be read" in n for n in res["notes"]), res["notes"])
+        plan = json.loads(_read(res["plan"]))
+        self.assertTrue(all((b["background"] or {}).get("asset") == good for b in plan["beats"]))
+
+    def test_offline_plans_are_validated_too(self):
+        res = director.make_reel("🔥🔥🔥", duration=6, llm="none", render=False, out_dir=tempfile.mkdtemp(dir=T["tmp"]),
+                                 log=None)
+        self.assertEqual(res["plan_errors"], [])
+        self.assertTrue(json.loads(_read(res["plan"]))["beats"][0]["visual"]["params"]["text"])
 
     def test_claude_mode_without_cli_says_how_to_fix(self):
         old = llm.claude_path

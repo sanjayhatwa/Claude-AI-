@@ -7,14 +7,16 @@ parameters into timeline layers (pure data, see ARCHITECTURE.md section 1).
                              start=0.0, end=2.4, canvas={"width": 1080, "height": 1920, "fps": 30},
                              style={"accent": "#FFE500", "energy": "high"})
 
-    python -m vstudio templates                      the catalog as a table
+    python -m vstudio templates [list]               the catalog as a table
     python -m vstudio templates --json               the catalog as JSON (for the web UI / planner)
     python -m vstudio templates doc                  the markdown the planner gives Claude
     python -m vstudio templates build stat --params '{"value": "73%"}'      print the layers
     python -m vstudio templates preview cta --out cta.mp4 [--aspect 9:16] [--params JSON]
         [--energy high|medium|calm] [--style JSON] [--size 216x384] [--duration 3]
         [--background clip.mp4|#hex] [--preview] [--spec spec.json]
-        (an --out ending in .png writes one still of the settled design instead)
+        (an --out ending in .png writes one still of the settled design instead; --still SECONDS
+        picks the moment)
+    python -m vstudio templates <command> --help     each command's options
 
 How the designs are made
 
@@ -356,17 +358,42 @@ def _stroke_path(pts, width):
 
 
 def _arrow_path(pts, width, head_len, head_w):
-    """A thick polyline ending in a triangular arrow head (one simple polygon)."""
-    (ax, ay), (bx, by) = pts[-2], pts[-1]
-    ln = math.hypot(bx - ax, by - ay) or 1.0
-    ux, uy = (bx - ax) / ln, (by - ay) / ln
-    base = [bx - ux * head_len, by - uy * head_len]
-    shaft = pts[:-1] + [base]
-    outline = _stroke_path(shaft, width)    # left side forward, then right side backward
-    n = len(shaft)
+    """A thick polyline ending in a triangular arrow head (one simple polygon).
+
+    The shaft is cut where the path comes within `head_len` of the tip, so
+    it ends exactly at the head's base: on a curve (whose last segments are
+    much shorter than the head) the outline never runs past the base and
+    folds back over itself. A path shorter than the head is all head.
+    """
+    bx, by = pts[-1]
+    cut = None
+    for i in range(len(pts) - 2, -1, -1):
+        (px, py), (qx, qy) = pts[i], pts[i + 1]
+        if math.hypot(px - bx, py - by) >= head_len:
+            # the point on segment p->q at distance head_len from the tip (q is closer than head_len)
+            dx, dy, fx, fy = qx - px, qy - py, px - bx, py - by
+            a, b, c = dx * dx + dy * dy, 2 * (fx * dx + fy * dy), fx * fx + fy * fy - head_len * head_len
+            t = 0.0 if a <= 1e-12 else (-b - math.sqrt(max(0.0, b * b - 4 * a * c))) / (2 * a)
+            t = min(1.0, max(0.0, t))
+            cut = (i, [px + dx * t, py + dy * t])
+            break
+    if cut is None:                          # shorter than the head: a plain triangle from the first point
+        base = list(pts[0])
+        shaft = None
+    else:
+        base = cut[1]
+        shaft = pts[:cut[0] + 1] + [base]
+        if math.hypot(shaft[-1][0] - shaft[-2][0], shaft[-1][1] - shaft[-2][1]) < 1e-9:
+            shaft = shaft[:-1]
+    ln = math.hypot(bx - base[0], by - base[1]) or 1.0
+    ux, uy = (bx - base[0]) / ln, (by - base[1]) / ln
     nx, ny = -uy, ux
     head = [[base[0] + nx * head_w / 2, base[1] + ny * head_w / 2], [bx, by],
             [base[0] - nx * head_w / 2, base[1] - ny * head_w / 2]]
+    if not shaft or len(shaft) < 2:
+        return head
+    outline = _stroke_path(shaft, width)    # left side forward, then right side backward
+    n = len(shaft)
     return outline[:n] + head + outline[n:]
 
 
@@ -666,6 +693,85 @@ def _clip_keys(keys, life):
     return inside
 
 
+def _key_value(keys, t, default=1.0):
+    """A keyframe curve's value at t (the engine's interpolation; linear while the engine is missing)."""
+    try:
+        from .anim import value_at
+    except ImportError:
+        value_at = None
+    if value_at is not None:
+        return value_at(keys, t, default)
+    if not keys:
+        return default
+    if t <= keys[0][0]:
+        return float(keys[0][1])
+    for a, b in zip(keys, keys[1:]):
+        if t < b[0]:
+            if len(b) > 2 and b[2] == "step":
+                return float(a[1])
+            return a[1] + (b[1] - a[1]) * (t - a[0]) / max(1e-9, b[0] - a[0])
+    return float(keys[-1][1])
+
+
+def _mul_keys(a, b, dt=1.0 / 30):
+    """Keyframes of the product of two curves (a member's own opacity x its group's opacity).
+
+    Exact wherever at most one curve changes between two neighbouring key
+    times (that segment keeps its easing, scaled); a stretch where both change,
+    or where one steps in the middle of the other's eased segment, is sampled
+    every `dt` seconds.
+    """
+    if not a or not b:
+        return [list(k) for k in (a or b or [])]
+
+    def seg(keys, t0, t1):
+        """(start key, end key) of the segment of `keys` covering [t0, t1], or None outside the keys."""
+        if t1 <= keys[0][0] + 1e-9 or t0 >= keys[-1][0] - 1e-9:
+            return None
+        for k0, k1 in zip(keys, keys[1:]):
+            if k0[0] <= t0 + 1e-9 and t1 <= k1[0] + 1e-9:
+                return k0, k1
+        return None
+
+    def ease_of(k):
+        return k[2] if len(k) > 2 and k[2] else None
+
+    def flat(s, t1):
+        """The curve holds one value on [t0, t1) (it may still step to a new value exactly at t1)."""
+        return s is None or abs(s[0][1] - s[1][1]) < 1e-9 or (ease_of(s[1]) == "step")
+
+    def jumps(s, t1):
+        return s is not None and ease_of(s[1]) == "step" and abs(s[1][0] - t1) < 1e-9 and \
+            abs(s[0][1] - s[1][1]) >= 1e-9
+
+    def prod(t):
+        return _key_value(a, t) * _key_value(b, t)
+
+    times = sorted({round(float(k[0]), 4) for k in list(a) + list(b)})
+    out = [[times[0], prod(times[0])]]
+    for t0, t1 in zip(times, times[1:]):
+        sa, sb = seg(a, t0, t1), seg(b, t0, t1)
+        fa, fb = flat(sa, t1), flat(sb, t1)
+        v1 = prod(t1)
+        held_zero = (fa and abs(_key_value(a, t0)) < 1e-9) or (fb and abs(_key_value(b, t0)) < 1e-9)
+        if (fa and fb) or held_zero:     # nothing changes before t1 (a curve held at 0 zeroes the product)
+            out.append([t1, v1, "step"] if abs(v1 - out[-1][1]) >= 1e-9 else [t1, v1])
+            continue
+        ramp, other = (sa, sb) if not fa else (sb, sa)
+        if (fa or fb) and abs(ramp[0][0] - t0) < 1e-9 and abs(ramp[1][0] - t1) < 1e-9 and not jumps(other, t1):
+            out.append([t1, v1] + ([ease_of(ramp[1])] if ease_of(ramp[1]) else []))
+            continue
+        k = math.floor(t0 / dt + 1e-6) + 1      # samples on the frame grid of the layer
+        while k * dt < t1 - 1e-3:
+            out.append([k * dt, prod(k * dt)])
+            k += 1
+        out.append([t1, v1, "step"] if (jumps(sa, t1) or jumps(sb, t1)) else [t1, v1])
+    # drop keys inside a run of one value (the curve is constant across them whatever their easing)
+    keep = [k for i, k in enumerate(out)
+            if i in (0, len(out) - 1) or not (abs(out[i - 1][1] - k[1]) < 1e-9 and abs(out[i + 1][1] - k[1]) < 1e-9)]
+    return _keys(keep)
+
+
 def _enter(spec, default_d):
     if not spec:
         return None
@@ -760,6 +866,9 @@ class _Ctx:
             lay.setdefault("animate", {})["scale"] = _keys([[0, 1.0], [life, 1 + self.prof["drift"]]])
         if group is not None:
             anim = group.animate_for(lay.get("x", self.f.W / 2), lay.get("y", self.f.H / 2))
+            own = (lay.get("animate") or {}).get("opacity")
+            if own and anim.get("opacity"):     # a member's own fades/blinks ride on the group's fades
+                anim["opacity"] = _mul_keys(own, anim["opacity"], 1.0 / self.f.fps)
             if anim:
                 lay.setdefault("animate", {}).update(anim)
         # templates write x/y keyframes as offsets from the layer's position; the spec wants positions
@@ -1919,14 +2028,19 @@ def _countdown(c, p):
     cy = f.CY
     if p["ring"]:
         c.ring("track", f.CX, cy, D, _alpha(s["text"], 0.14), D * 0.05, enter="fade", exit="fade")
+    out_d = min(0.12, slot * 0.2)
     for i in range(n):
-        at, until = i * slot, c.clk.dur - (i + 1) * slot
+        # a number (and its full arc) stays until the next one has landed: its exit runs over the next
+        # entrance instead of ending on the frame where the next one starts invisible
+        last = i == slots - 1
+        at = i * slot
+        until = max(0.0, c.clk.dur - (i + 1) * slot - (0.0 if last else out_d))
         num = fit_text(str(n - i), s["font"], D * 0.62, D * 0.8, 1)
         if p["ring"]:
             c.ring("arc", f.CX, cy, D, col, D * 0.05, draw={"from": 0.0, "to": 1.0, "ease": "linear"},
-                   enter=("none", slot * 0.95), exit=None, at=at, until=until, min_life=0.1)
+                   enter=("none", slot * 0.95), exit=("fade", out_d), at=at, until=until, min_life=0.1)
         c.text("number", num, f.CX, cy, shadow=c.text_shadow(), enter=(c.prof["title"], min(0.3, slot * 0.45)),
-               exit=(c.prof["exit"], min(0.12, slot * 0.2)), at=at, until=until, min_life=0.1)
+               exit=(c.prof["exit"], out_d), at=at, until=until, min_life=0.1)
     if p["go"]:
         go = c.fit(p["go"], D * 0.42, f.SW * 0.9, lines=1, case="upper")
         gpad, _ = _pill(c, go, (44, 26))
@@ -2083,13 +2197,21 @@ def _ranking(c, p):
     n = len(items)
 
     def rows(k):
-        rh, gap = f.d(132) * k, f.d(22) * k
+        rh0, gap = f.d(132) * k, f.d(22) * k
+        pad, rank_w = f.d(30) * k, f.d(150) * k
         title = c.fit(p["title"], f.d(84) * k, f.SW, lines=2, min_size=f.d(48) * k, case="upper",
                       ls=1.0) if p["title"] else None
+        # one text size for every row (the longest name sets it; it may wrap to two lines rather
+        # than shrink far), and one row height that holds the tallest name
+        room = [f.SW - pad * 2 - rank_w - (rh0 * 0.56 if i == 0 else 0) for i in range(n)]
+        size = min(c.fit(items[i], f.d(58) * k, room[i], lines=2, min_size=f.d(34) * k, case="upper",
+                         ls=1.0, prefer=1).size for i in range(n))
+        names = [c.fit(items[i], size, room[i], lines=2, min_size=size, case="upper", ls=1.0) for i in range(n)]
+        rh = max(rh0, max(b.h for b in names) + f.d(44) * k)
         needed = (title.h + gap * 2 if title else 0) + n * rh + (n - 1) * gap
-        return (rh, gap, title), needed
+        return (rh0, rh, gap, title, names), needed
 
-    (rh, gap, title), needed, k = _fit_stack(rows, f.SH * 0.92)
+    (rh0, rh, gap, title, names), needed, k = _fit_stack(rows, f.SH * 0.92)
     y = f.place("center", needed)
     per = {"high": 0.42, "medium": 0.55, "calm": 0.7}[c.energy]
     step = c.clk.stagger(n + (1 if title else 0), 0.6, per=per)
@@ -2110,12 +2232,10 @@ def _ranking(c, p):
         intro = ("pop" if top else "right") if over else "fade"
         row = c.group((f.CX, cy), intro=intro, outro="fade", at=t0 + order.index(i) * step, dist=f.d(160))
         row.rect("card", f.CX, cy, f.SW, rh, card, radius=f.d(28) * k, shadow=c.card_shadow())
-        rank = fit_text("#%d" % (i + 1), s["font"], rh * 0.46, rank_w, 1)
+        rank = fit_text("#%d" % (i + 1), s["font"], rh0 * 0.46, rank_w, 1)
         row.text("rank", rank, f.L + pad, cy, anchor="left", align="left", color=ink if top else acc)
-        crown = rh * 0.56 if top else 0
-        name = c.fit(items[i], f.d(58) * k, f.SW - pad * 2 - rank_w - crown, lines=1, min_size=f.d(34) * k,
-                     case="upper", ls=1.0)
-        row.text("name", name, f.L + pad + rank_w, cy, anchor="left", align="left", color=ink)
+        crown = rh0 * 0.56 if top else 0
+        row.text("name", names[i], f.L + pad + rank_w, cy, anchor="left", align="left", color=ink)
         if top:
             row.icon("crown", "crown", f.R - pad - crown / 2, cy, crown, ink, acc,
                      enter=(c.prof["pop"], c.clk.din, c.clk.din))
@@ -2324,6 +2444,7 @@ def _versus(c, p):
     over = c.prof["over"] > 0
     g = c.clk.stagger(3, 0.35)
     D = f.d(176)
+    texts = []      # (x0, y0, x1, y1) of every name and sub line, to keep the badge's entrance off them
     for i, (name, sub, colp) in enumerate(((p["left"], p["left_sub"], p["left_color"]),
                                            (p["right"], p["right_sub"], p["right_color"]))):
         col = c.color(colp)
@@ -2340,14 +2461,30 @@ def _versus(c, p):
                  gradient=[_alpha(col, 0.95), _alpha(_mix(col, "#000000", 0.38), 0.95)], shadow=c.card_shadow())
         ink = _on(col)
         grp.text("name", lab, tx, cy - block / 2, anchor="top", color=ink)
+        texts.append((tx - lab.w / 2, cy - block / 2, tx + lab.w / 2, cy - block / 2 + lab.h))
         if sb:
             grp.text("sub", sb, tx, cy - block / 2 + lab.h + f.d(14), anchor="top", color=_alpha(ink, 0.85))
+            texts.append((tx - sb.w / 2, cy - block / 2 + lab.h + f.d(14), tx + sb.w / 2,
+                          cy - block / 2 + lab.h + f.d(14) + sb.h))
     vcx, vcy = f.CX, f.CY
     vs = fit_text(p["vs"], s["font"], D * 0.42, D * 0.8, 1, case="upper")
-    wig = c.wiggle_keys(2 * g + c.clk.din, 10)
-    extra = {"animate": {"rotation": wig}} if wig else {}
-    c.circle("badge", vcx, vcy, D, s["text"], enter=c.prof["title"], at=2 * g, shadow=c.card_shadow(), **extra)
-    c.text("vs", vs, vcx, vcy, color=_on(s["text"]), enter=c.prof["title"], at=2 * g, **dict(extra))
+    anim = {}
+    enter, land = c.prof["title"], c.clk.din
+    if enter == "stamp":
+        # a stamp starts at 2.2x and would cover both names right as they are read: slam the badge in
+        # from no bigger than the room around it allows (at most 1.35x)
+        clear = min([math.hypot(max(x0 - vcx, 0, vcx - x1), max(y0 - vcy, 0, vcy - y1))
+                     for x0, y0, x1, y1 in texts] or [D])
+        peak = max(1.0, min(1.35, (clear - f.d(14)) / (D / 2)))
+        land = c.clk.din * 0.55
+        anim["scale"] = _keys([[0, peak], [land, 0.96, "in-quad"], [c.clk.din * 0.8, 1.0, "out-quad"]])
+        enter = ("fade", c.clk.din * 0.3)
+    wig = c.wiggle_keys(land, 10)       # layer time: the badge's own clock starts at its entrance
+    if wig:
+        anim["rotation"] = wig
+    extra = {"animate": anim} if anim else {}
+    c.circle("badge", vcx, vcy, D, s["text"], enter=enter, at=2 * g, shadow=c.card_shadow(), **extra)
+    c.text("vs", vs, vcx, vcy, color=_on(s["text"]), enter=enter, at=2 * g, **dict(extra))
 
 
 def _split(c, p, labels, colors, notes, handle):
@@ -2356,10 +2493,13 @@ def _split(c, p, labels, colors, notes, handle):
     vertical = p["layout"] == "vertical" or (p["layout"] == "auto" and f.H > f.W)
     g = c.clk.stagger(3, 0.35)
     line = f.d(8)
+    D = f.d(92)
     if vertical:
         c.rect("divider", f.W / 2, f.H / 2, f.W, line, s["text"], enter=("wipe-right", c.clk.din * 1.4),
                shadow=c.card_shadow())
-        spots = [(f.CX, f.T + f.d(16)), (f.CX, f.H / 2 + f.d(40))]
+        # the second label hangs under the divider, its pill clear of the slider handle centred on it
+        # (a label's y is its text top; the pill reaches 16 design px above that)
+        spots = [(f.CX, f.T + f.d(16)), (f.CX, f.H / 2 + (D / 2 + f.d(24 + 16) if handle else f.d(40)))]
         half_w = f.SW
     else:
         c.rect("divider", f.W / 2, f.H / 2, line, f.H, s["text"], enter=("wipe-up", c.clk.din * 1.4),
@@ -2367,7 +2507,6 @@ def _split(c, p, labels, colors, notes, handle):
         spots = [(f.W * 0.25, f.T + f.d(16)), (f.W * 0.75, f.T + f.d(16))]
         half_w = f.W / 2 - f.L * 1.5
     if handle:
-        D = f.d(92)
         c.circle("handle", f.W / 2, f.H / 2, D, s["text"], enter=c.prof["pop"], at=g, shadow=c.card_shadow())
         for tri in ([[0.5, 0.12], [0.8, 0.42], [0.2, 0.42]], [[0.5, 0.88], [0.8, 0.58], [0.2, 0.58]]):
             pts = tri if vertical else [[y, x] for x, y in tri]     # up/down arrows, or left/right
@@ -2727,12 +2866,22 @@ def _search_bar(c, p):
              enter=("typewriter", type_d, type_at))
     cur_w, cur_h = max(2.0, f.d(4)), f.d(58)
     end_x = tx + q.w + f.d(6)
-    blink = _keys([[0, 1], [0.45, 0, "step"], [0.9, 1, "step"], [1.35, 0, "step"], [1.8, 1, "step"],
-                   [2.25, 0, "step"], [2.7, 1, "step"]])
-    c.rect("cursor", tx, cy, cur_w, cur_h, "#1A73E8", enter=("fade", 0.1, type_at * 0.5), exit=None,
-           until=c.clk.dur - type_at, animate={"opacity": blink}, min_life=0.1)
-    c.rect("cursor_end", end_x, cy, cur_w, cur_h, "#1A73E8", enter=None, exit="fade", at=type_at + type_d,
-           animate={"opacity": blink})
+
+    def blink(t_on, t_off):
+        """Caret opacity: off, then blinking (0.45 s on / 0.45 s off) from t_on until t_off."""
+        keys, t, v = [[0, 0], [t_on, 1, "step"]], t_on, 1
+        while t + 0.45 < min(t_off, c.clk.dur):
+            t, v = t + 0.45, 1 - v
+            keys.append([t, v, "step"])
+        if t_off < c.clk.dur and v:
+            keys.append([t_off, 0, "step"])
+        return _keys(keys)
+
+    # the caret is part of the bar (it pops, scales and leaves with it): before the typing at the start
+    # of the box, after it at the end of the query
+    grp.rect("cursor", tx, cy, cur_w, cur_h, "#1A73E8", animate={"opacity": blink(type_at * 0.5, type_at)})
+    grp.rect("cursor_end", end_x, cy, cur_w, cur_h, "#1A73E8",
+             animate={"opacity": blink(type_at + type_d, c.clk.dur)})
     if sugg:
         card_top = top + bar_h + f.d(16)
         card_h = row_h * len(sugg) + f.d(20)
@@ -2780,16 +2929,18 @@ def _poll(c, p):
         cy = y + row_h / 2
         grp.rect("row", f.CX, cy, rw, row_h, "#EFEFF4", radius=f.d(28))
         win = i == best
+        # fills, counters and labels belong to the card (they scale and leave with it); their own
+        # entrances are delayed to the reveal
         if p["show_results"] and reveal + grow < c.clk.dur:
             fill = max(row_h, rw * pct[i] / 100.0)
-            c.rect("fill", x0 + pad, cy, fill, row_h, acc if win else "#D1D1D6", radius=f.d(28), anchor="left",
-                   enter=("wipe-right", grow), at=reveal, exit="fade")
+            grp.rect("fill", x0 + pad, cy, fill, row_h, acc if win else "#D1D1D6", radius=f.d(28), anchor="left",
+                     enter=("wipe-right", grow, reveal))
             num = c.fit("100%", f.d(50), f.d(200), lines=1)
-            c.counter("pct", num, x0 + pad + rw - f.d(28), cy, 0, pct[i], 0, "", "%", "", grow, "out-cubic",
-                      anchor="right", color=_INK, enter="fade", at=reveal, exit="fade")
+            grp.counter("pct", num, x0 + pad + rw - f.d(28), cy, 0, pct[i], 0, "", "%", "", grow, "out-cubic",
+                        anchor="right", color=_INK, enter=("fade", c.clk.din, reveal))
         lab = c.body(opt, f.d(48), rw * 0.66, lines=1, min_size=f.d(30), ls=1.0)
-        c.text("option", lab, x0 + pad + f.d(30), cy, anchor="left", align="left", color=_INK, enter="fade",
-               at=c.clk.din * 0.6, exit="fade")
+        grp.text("option", lab, x0 + pad + f.d(30), cy, anchor="left", align="left", color=_INK,
+                 enter=("fade", c.clk.din, c.clk.din * 0.6))
         y += row_h + gap
 
 
@@ -3280,9 +3431,14 @@ def _source_card(c, p):
     width = min(f.SW, f.d(920))
     pad, th = f.d(28), f.d(118)
     tw = width - pad * 3 - th
-    lab = c.body(p["label"], f.d(28), tw, lines=1, case="upper", lsp=f.d(4), ls=1.0) if p["label"] else None
-    title = c.body(p["title"], f.d(44), tw, lines=1, min_size=f.d(28), ls=1.0)
-    det = c.body(p["detail"], f.d(34), tw, lines=2, min_size=f.d(24), ls=1.15) if p["detail"] else None
+    # the title leads: it wraps to a second line before it shrinks, and the label and the detail are
+    # sized under it, so a long title never ends up the smallest text on the card
+    title = c.body(p["title"], f.d(44), tw, lines=2, min_size=f.d(30), ls=1.05, prefer=1)
+    lab = c.body(p["label"], min(f.d(28), title.size * 0.8), tw, lines=1, case="upper", lsp=f.d(4),
+                 ls=1.0) if p["label"] else None
+    dsize = min(f.d(34), title.size * 0.8)
+    det = c.body(p["detail"], dsize, tw, lines=2, min_size=min(f.d(24), dsize * 0.8), ls=1.15) \
+        if p["detail"] else None
     block = (lab.h + f.d(12) if lab else 0) + title.h + ((f.d(12) + det.h) if det else 0)
     ch = max(th, block) + pad * 2
     top = f.place(p["position"], ch, margin=0.03)
@@ -3358,6 +3514,21 @@ def _image_size(path):
         return None
 
 
+def _image_see_through(path):
+    """True when an image file has pixels that are not fully opaque (a cut-out, a logo); False for
+    opaque or unreadable files (an RGBA screenshot whose alpha is all 255 counts as opaque)."""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            if im.mode in ("RGBA", "LA", "PA"):
+                return im.getchannel("A").getextrema()[0] < 250
+            if "transparency" in im.info:
+                return im.convert("RGBA").getchannel("A").getextrema()[0] < 250
+    except Exception:
+        pass
+    return False
+
+
 @_template(
     "image_card", "utility",
     "A user asset (screenshot, product photo, chart) popped in as a rounded card with a shadow and a slight "
@@ -3384,16 +3555,33 @@ def _image_card(c, p):
     tilt = max(-10.0, min(10.0, p["tilt"]))
     over = c.prof["over"]
     rot = {"rotation": _keys([[0, tilt - 8 * over], [c.clk.din * 1.2, tilt, "out-back" if over else "out-cubic"]])}
-    border = f.d(10)
-    c.rect("frame", f.CX, cy, w + border * 2, h + border * 2, "#FFFFFF", radius=f.d(30), rotation=tilt,
-           shadow=c.card_shadow(), enter=c.prof["pop"], drift=True, animate=dict(rot))
+    border, rad = f.d(10), f.d(22)
+    # Frame and photo fade and pop together. Two layers fading on top of each other show the lower one
+    # through the upper one half-way (a white frame under a photo turns the photo milky), so for an
+    # opaque photo (and the placeholder) the frame is an outline drawn over the photo, overlapping its
+    # edge by a hair so no seam shows, and the photo carries the card shadow: every pixel of the card
+    # belongs to one layer. A see-through image (a cut-out, a logo) needs the white card behind it.
+    backed = bool(p["src"]) and _image_see_through(p["src"])
+    shadow = c.card_shadow()
+    if backed:
+        c.rect("frame", f.CX, cy, w + border * 2, h + border * 2, "#FFFFFF", radius=rad + border, rotation=tilt,
+               shadow=shadow, enter=c.prof["pop"], drift=True, animate=dict(rot))
+    else:
+        shadow = dict(shadow, dy=_r(shadow["dy"] + border))
     if p["src"]:
-        c.add("image", "image", {"src": p["src"], "fit": "cover", "w": w, "h": h, "radius": _r(f.d(22)),
-                                 "x": f.CX, "y": cy, "rotation": tilt, "animate": dict(rot)},
+        c.add("image", "image", {"src": p["src"], "fit": "cover", "w": w, "h": h, "radius": _r(rad),
+                                 "x": f.CX, "y": cy, "rotation": tilt, "animate": dict(rot),
+                                 "shadow": None if backed else shadow},
               enter=c.prof["pop"], drift=True)
     else:
-        c.rect("placeholder", f.CX, cy, w, h, s["bg2"], radius=f.d(22), rotation=tilt, enter=c.prof["pop"],
+        c.rect("placeholder", f.CX, cy, w, h, s["bg2"], radius=rad, rotation=tilt, enter=c.prof["pop"],
+               drift=True, animate=dict(rot), shadow=shadow)
+    if not backed:
+        tuck = max(1.5, f.d(3))
+        c.rect("frame", f.CX, cy, w + border * 2, h + border * 2, "#FFFFFF00", radius=rad + border,
+               stroke={"color": "#FFFFFF", "width": _r(border + tuck)}, rotation=tilt, enter=c.prof["pop"],
                drift=True, animate=dict(rot))
+    if not p["src"]:
         c.icon("placeholder_icon", "play", f.CX, cy, min(w, h) * 0.3, _alpha(s["text"], 0.5), s["bg2"], rotation=tilt,
                enter=c.prof["pop"], drift=True, animate=dict(rot))
     if cap:
@@ -3506,41 +3694,64 @@ def _json_arg(text, what):
         raise SystemExit("%s is not valid JSON: %s" % (what, e))
 
 
+def _parser():
+    """`vstudio templates` with its subcommands (each prints its own usage under --help)."""
+    ap = argparse.ArgumentParser(
+        prog="vstudio templates", formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="The motion-graphics templates: list them, read when to use each, print the layers one "
+                    "makes, or render a preview.",
+        epilog="examples:\n"
+               "  vstudio templates                      the catalog as a table\n"
+               "  vstudio templates --json               the catalog as JSON\n"
+               "  vstudio templates doc                  when to use each template, with every param\n"
+               "  vstudio templates build stat --params '{\"value\": \"73%\"}'\n"
+               "  vstudio templates preview cta --out cta.mp4 [--aspect 16:9] [--energy calm]\n"
+               "  vstudio templates preview cta --out cta.png --still 1.5\n\n"
+               "`vstudio templates <command> --help` shows a command's options.")
+    ap.add_argument("--json", dest="json_top", action="store_true", help="list: print the catalog as JSON")
+    sub = ap.add_subparsers(dest="cmd", metavar="{list,doc,build,preview}",
+                            title="commands (default: list)")
+    ls = sub.add_parser("list", help="the catalog as a table (names, kinds, params)",
+                        description="The template catalog as a table, or as JSON with --json.")
+    ls.add_argument("--json", action="store_true", help="print the catalog as JSON")
+    sub.add_parser("doc", help="when to use each template and what every param does (markdown)",
+                   description="The markdown catalog the planner gives Claude: when to use each template, "
+                               "and every param with its type, choices and default.")
+    one = argparse.ArgumentParser(add_help=False)
+    one.add_argument("name", help="template name (see `vstudio templates`)")
+    one.add_argument("--params", help="JSON object (or a .json file) of template params")
+    one.add_argument("--style", help="JSON object (or a .json file) of style keys")
+    one.add_argument("--energy", choices=sorted(_ENERGY), help="override style.energy")
+    one.add_argument("--aspect", default="9:16", help="9:16 (default), 1:1, 4:5 or 16:9")
+    one.add_argument("--size", help="exact canvas size, e.g. 216x384 for a fast draft")
+    one.add_argument("--fps", type=int, default=30)
+    one.add_argument("--duration", type=float, default=3.0, help="seconds the template is shown (default 3)")
+    b = sub.add_parser("build", parents=[one], help="print the timeline layers a template makes (JSON)",
+                       description="Print the timeline layers one template makes, as JSON.")
+    b.add_argument("--start", type=float, default=0.0, help="timeline second the template starts at")
+    pv = sub.add_parser("preview", parents=[one], help="render a template to an MP4 (or one PNG still)",
+                        description="Render one template over a plain background (or your clip) to an MP4, "
+                                    "or to one PNG still when --out ends in .png.")
+    pv.add_argument("--out", required=True, help="output .mp4 (or .png for one still)")
+    pv.add_argument("--background", help="#hex colour or a video/image file to put behind the template")
+    pv.add_argument("--still", type=float, help="time of the still when --out is .png (default: settled)")
+    pv.add_argument("--preview", action="store_true", help="half resolution and fps (fast draft)")
+    pv.add_argument("--spec", help="also write the timeline spec JSON here")
+    return ap
+
+
 def main(argv=None):
-    """vstudio templates [--json] | doc | build <name> | preview <name> --out f.mp4"""
+    """vstudio templates [list] [--json] | doc | build <name> | preview <name> --out f.mp4"""
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv and argv[0] in ("preview", "build", "doc"):
-        cmd = argv.pop(0)
-    else:
-        cmd = "list"
-    ap = argparse.ArgumentParser(prog="vstudio templates", description="motion-graphics templates")
+    args = _parser().parse_args(argv)
+    cmd = args.cmd or "list"
     if cmd == "list":
-        ap.add_argument("--json", action="store_true", help="print the catalog as JSON")
-        args = ap.parse_args(argv)
-        print(json.dumps(catalog_json(), indent=2, ensure_ascii=False) if args.json else _table())
+        as_json = args.json_top or getattr(args, "json", False)
+        print(json.dumps(catalog_json(), indent=2, ensure_ascii=False) if as_json else _table())
         return 0
     if cmd == "doc":
-        ap.parse_args(argv)
         sys.stdout.write(catalog_doc())
         return 0
-    ap.add_argument("name", help="template name (see `vstudio templates`)")
-    ap.add_argument("--params", help="JSON object (or a .json file) of template params")
-    ap.add_argument("--style", help="JSON object (or a .json file) of style keys")
-    ap.add_argument("--energy", choices=sorted(_ENERGY), help="override style.energy")
-    ap.add_argument("--aspect", default="9:16", help="9:16 (default), 1:1, 4:5 or 16:9")
-    ap.add_argument("--size", help="exact canvas size, e.g. 216x384 for a fast draft")
-    ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--duration", type=float, default=3.0, help="seconds the template is shown (default 3)")
-    if cmd == "build":
-        ap.add_argument("--start", type=float, default=0.0)
-        args = ap.parse_args(argv)
-    else:
-        ap.add_argument("--out", required=True, help="output .mp4 (or .png for one still)")
-        ap.add_argument("--background", help="#hex colour or a video/image file to put behind the template")
-        ap.add_argument("--still", type=float, help="time of the still when --out is .png (default: settled)")
-        ap.add_argument("--preview", action="store_true", help="half resolution and fps (fast draft)")
-        ap.add_argument("--spec", help="also write the timeline spec JSON here")
-        args = ap.parse_args(argv)
     if args.name not in CATALOG:
         print("unknown template %r; known: %s" % (args.name, ", ".join(CATALOG)), file=sys.stderr)
         return 2

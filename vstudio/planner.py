@@ -57,6 +57,7 @@ import math
 import os
 import re
 import sys
+import unicodedata
 
 from . import paths, sfx, templates, timeline
 
@@ -170,24 +171,119 @@ def _energy(st):
     return e if e in ENERGIES else _ENERGY_ALIASES.get(e, "medium")
 
 
+_HAN_RE = re.compile(r"[㐀-䶿一-鿿豈-﫿]")
+_KANA_RE = re.compile(r"[぀-ヿｦ-ﾟ]")
+_HANGUL_RE = re.compile(r"[가-힯]")
+_CJK_RE = re.compile(r"[぀-ヿ㐀-䶿一-鿿豈-﫿가-힯ｦ-ﾟ]")
+_CJK_BREAK = "、。，！？；："          # 、。，！？；：
+_CYRILLIC_VOWELS = set("аеёиоуыэюяіїєў")
+_GREEK_VOWELS = "αεηιουωάέήίόύώϊϋΐΰ"
+_STOP_PUNCT = r"[.!?。！？]"
+_PAUSE_PUNCT = r"[,;:、，；：]"
+
+
+def _bare_north_indic_consonant(c):
+    """A Devanagari, Bengali, Gurmukhi or Gujarati consonant letter (not an independent vowel)."""
+    name = unicodedata.name(c, "")
+    return 0x0915 <= ord(c) <= 0x0AFF and unicodedata.category(c) == "Lo" and " LETTER " in name \
+        and not re.search(r"LETTER (?:[AEIOU]{1,2}|VOCALIC .*|CANDRA .*|SHORT .*)$", name)
+
+
 def _syllables(word):
-    w = re.sub(r"[^a-z]", "", word.lower())
-    if not w:
-        return max(1, len(re.sub(r"\D", "", word)))  # digits: about one syllable each
-    n = len(re.findall(r"[aeiouy]+", w))
-    if w.endswith("e") and not w.endswith(("le", "ee")) and n > 1:
-        n -= 1
-    return max(1, n)
+    """Spoken syllables in one token, for any script.
+
+    Latin (accents folded): vowel groups with a silent final e. Cyrillic:
+    vowels. Greek: vowel groups. Indic scripts: base letters minus viramas
+    (each consonant carries a vowel). Han: one a character; kana and hangul
+    a little less (morae and blocks are spoken faster). Other scripts (Arabic,
+    Hebrew, Thai...): about one per two letters. Digits only: one each.
+    """
+    low = str(word).lower()
+    latin, greek = [], []
+    n, folded_end, other = 0.0, False, 0
+    letters = [c for c in low if unicodedata.category(c)[:1] in ("L", "M")]
+    if len(letters) > 1 and _bare_north_indic_consonant(letters[-1]):
+        n -= 1          # Hindi, Bengali, Punjabi, Gujarati drop the vowel of a word-final bare consonant ("ek")
+    for c in low:
+        o = ord(c)
+        if c.isascii():
+            if "a" <= c <= "z":
+                latin.append(c)
+                folded_end = False
+            continue
+        if _HAN_RE.match(c):
+            n += 1.0
+        elif _KANA_RE.match(c):
+            n += 0.6
+        elif _HANGUL_RE.match(c):
+            n += 0.8
+        elif 0x00C0 <= o <= 0x024F or 0x1E00 <= o <= 0x1EFF:            # accented Latin: fold to the base letter
+            base = unicodedata.normalize("NFKD", c)[:1]
+            if "a" <= base <= "z":
+                latin.append(base)
+                folded_end = True
+        elif 0x0400 <= o <= 0x052F:
+            n += c in _CYRILLIC_VOWELS
+        elif 0x0370 <= o <= 0x03FF or 0x1F00 <= o <= 0x1FFF:
+            greek.append(c if unicodedata.normalize("NFD", c)[:1] in _GREEK_VOWELS else " ")
+        elif 0x0900 <= o <= 0x0DFF:                                      # Devanagari ... Sinhala
+            if unicodedata.category(c) == "Lo":
+                n += 1
+            elif "VIRAMA" in unicodedata.name(c, "") or "AL-LAKUNA" in unicodedata.name(c, ""):
+                n -= 1
+        elif c.isalpha():
+            other += 1
+    w = "".join(latin)
+    if w:
+        k = len(re.findall(r"[aeiouy]+", w))
+        if w.endswith("e") and not w.endswith(("le", "ee")) and k > 1 and not folded_end:
+            k -= 1
+        n += max(1, k)
+    if greek:
+        n += len(re.findall(r"[^ ]+", "".join(greek)))
+    if other:
+        n += math.ceil(other / 2.0)
+    if n <= 0 and not (w or greek or other):
+        return max(1, len(re.sub(r"\D", "", low)))                     # digits: about one syllable each
+    return max(1, int(round(n)))
+
+
+def _speech_tokens(text, size=4):
+    """Spoken tokens of a line: its words, with runs of CJK characters cut into pieces of up to `size`
+    characters (at CJK punctuation first), so a line without spaces is timed and captioned in steps."""
+    out = []
+    for tok in clean_say(text).split():
+        if not _CJK_RE.search(tok) or len(tok) <= size + 1:
+            out.append(tok)
+            continue
+        cur, k = "", 0
+        for ch in tok:
+            if _CJK_RE.match(ch):
+                if k >= size:
+                    out.append(cur)
+                    cur, k = "", 0
+                k += 1
+            cur += ch
+            if ch in _CJK_BREAK:
+                out.append(cur)
+                cur, k = "", 0
+        if cur:
+            if out and not re.search(r"\w", cur):
+                out[-1] += cur                                          # a closing mark stays with its words
+            else:
+                out.append(cur)
+    return out
 
 
 def speak_seconds(text, wpm=DEFAULT_WPM):
     """How long a line takes to say at wpm (syllable weighted, pauses at punctuation)."""
-    toks = str(text or "").split()
+    toks = _speech_tokens(text)
     if not toks:
         return 0.0
     per_syl = 60.0 / max(60.0, float(wpm)) / 1.45   # ~1.45 syllables per spoken English word
     t = sum(_syllables(w) for w in toks) * per_syl
-    t += sum(0.22 for w in toks[:-1] if re.search(r"[.!?]$", w)) + sum(0.1 for w in toks[:-1] if re.search(r"[,;:]$", w))
+    t += sum(0.22 for w in toks[:-1] if re.search(_STOP_PUNCT + "$", w)) + \
+        sum(0.1 for w in toks[:-1] if re.search(_PAUSE_PUNCT + "$", w))
     return t
 
 
@@ -207,12 +303,13 @@ def time_words(text, start, end, wpm=DEFAULT_WPM):
     The same idea as captions.words_from_script, but each word's length
     follows its syllables and the line never spills out of its beat.
     """
-    toks = clean_say(text).split()
+    toks = _speech_tokens(text)
     if not toks or end - start < 0.2:
         return []
     per_syl = 60.0 / max(60.0, float(wpm)) / 1.45
     lens = [_syllables(w) * per_syl for w in toks]
-    gaps = [0.22 if re.search(r"[.!?]$", w) else 0.1 if re.search(r"[,;:]$", w) else 0.0 for w in toks]
+    gaps = [0.22 if re.search(_STOP_PUNCT + "$", w) else 0.1 if re.search(_PAUSE_PUNCT + "$", w) else 0.0
+            for w in toks]
     gaps[-1] = 0.0
     lead = min(0.1, (end - start) * 0.05)
     avail = max(0.15, (end - start) - lead - 0.08)
@@ -1042,16 +1139,46 @@ _UNITS = re.compile(r"\b(views|followers|subscribers|subs|people|users|customers
                     r"hours|days|weeks|months|years|videos|posts|times|dollars|bucks|members|clients|students)\b", re.I)
 
 
+# A full stop after these is not the end of a sentence ("vs.", "Dr. Lee", "e.g."); after the second set only
+# when the next word is capitalised ("etc. Then ...").
+_ABBREV = {"vs", "v", "dr", "mr", "mrs", "ms", "prof", "st", "mt", "e.g", "i.e", "cf", "approx", "ca"}
+_ABBREV_END = {"etc", "inc", "ltd", "co", "corp", "jr", "sr", "u.s", "u.k", "a.m", "p.m", "no"}
+_SENT_END_RE = re.compile(r"[.!?]+[\"'”’)\]]*(?=\s|$)|[。！？]+[\"'”’」)\]]*")
+
+
+def _ends_sentence(text, i, j):
+    """True when the punctuation text[i:j] closes a sentence (not a decimal point, domain or abbreviation)."""
+    mark = text[i:j]
+    if not mark.startswith(".") or mark.rstrip("\"'”’)]") != ".":
+        return True                                     # ! ? ... and CJK stops always end the sentence
+    word = re.search(r"([A-Za-z][A-Za-z.]*)$", text[:i])
+    word = word.group(1).lower() if word else ""
+    nxt = text[j:].lstrip()[:1]
+    if word in _ABBREV:
+        return False
+    if word in _ABBREV_END or re.fullmatch(r"(?:[a-z]\.)+[a-z]", word):
+        if word == "no":
+            return not (nxt.isdigit() or nxt == "#")    # "No. 1 rule" goes on; "No. I didn't." ends
+        return nxt.isupper()
+    return True
+
+
 def _sentences(text):
-    """Sentences with their end punctuation (script-forge's splitter when it loads)."""
-    try:
-        sp = paths.load_skill("spoken")
-        out = sp.sentences(text)
-        if out:
-            return out
-    except Exception:
-        pass
-    return [s.strip() for s in re.findall(r"[^.!?]+[.!?]*", text) if s.strip()]
+    """Sentences with their end punctuation.
+
+    Splits after . ! ? (and the CJK stops) followed by a space or the end, so
+    "3.5x", "$1,250.50", "vstudio.app" and abbreviations ("vs.", "Dr.",
+    "e.g.") stay inside their sentence; lowercase scripts still split.
+    """
+    text = str(text or "")
+    out, start = [], 0
+    for m in _SENT_END_RE.finditer(text):
+        if not _ends_sentence(text, m.start(), m.end()):
+            continue
+        out.append(text[start:m.end()].strip())
+        start = m.end()
+    out.append(text[start:].strip())
+    return [s for s in out if re.search(r"\w", s)]
 
 
 def _split_long(sentence, max_words=13):
@@ -1114,8 +1241,40 @@ def _prompt_units(prompt):
     return _units(p)
 
 
+# Words a short on-screen line never ends on: it would read as cut off ("FOLLOW FOR PART 2 WHERE").
+_DANGLING = set("a an the and or but so nor yet to of in on at for with from by as into onto about over under "
+                "through than like without within before after until while where when whenever if because since "
+                "though although unless whether which who whom whose that my your our their his her its is are was "
+                "were be been being am will would should could can may might must shall do does did have has had "
+                "i we they he she not very really just every each some any i'm i'll we're we'll you're you'll".split())
+# Words that open a new clause: cutting just before one keeps a whole phrase on screen.
+_CLAUSE = set("where when whenever if because before after until while which who whom whose that so but unless "
+              "since though although whereas then".split())
+_SUBJECTS = set("i i'll i'm i've we we'll we're you you'll you're they it it's this he she".split())
+
+
+def _clause_start(words, i):
+    """True when words[i] opens a new clause ("and" only before a subject: "Comment GUIDE and I'll send it")."""
+    w = _norm_word(words[i]).replace("’", "'")
+    if w in _CLAUSE:
+        return True
+    return w in ("and", "or") and i + 1 < len(words) and re.sub(r"[^\w']", "", words[i + 1].lower()) in _SUBJECTS
+
+
+def _trim_dangling(words, keep=2):
+    words = list(words)
+    while len(words) > keep and re.sub(r"[^\w']", "", words[-1].lower().replace("’", "'")) in _DANGLING:
+        words.pop()
+    return words
+
+
 def headline(text, max_words=7, cap=True):
-    """A short on-screen version of a spoken line (fillers off, cut at a natural break, capitalised)."""
+    """A short on-screen version of a spoken line (fillers off, cut at a natural break, capitalised).
+
+    A line too long for the card is cut at a comma, before a new clause or
+    at max_words, and never ends on a word that leaves it hanging ("and",
+    "where", "before", "your").
+    """
     s = clean_say(text)
     for _ in range(3):
         s2 = _FILLER_START.sub("", s)
@@ -1126,15 +1285,34 @@ def headline(text, max_words=7, cap=True):
     words = s.split()
     if len(words) > max_words + 2:       # a whole short sentence reads better than a clipped one
         parts = re.split(r"(?<=[,;:])\s+|\s+(?=but\b|because\b|so\b|which\b)", s)
-        if 2 <= len(parts[0].split()) <= max_words:
-            s = parts[0]
+        head = re.sub(r"[,;:]+$", "", parts[0]).split()
+        if 2 <= len(head) <= max_words and len(_trim_dangling(head)) == len(head):
+            s = " ".join(head)
         else:
-            cut = words[:max_words]
-            while len(cut) > 3 and _norm_word(cut[-1]) in _STOP:
-                cut.pop()
-            s = " ".join(cut)
+            cut = max((i for i in range(2, max_words + 1) if _clause_start(words, i)), default=max_words)
+            s = " ".join(_trim_dangling(words[:cut]))
         s = re.sub(r"[,;:]+$", "", s)
     return s[:1].upper() + s[1:] if cap else s
+
+
+def cta_text(text, max_words=7):
+    """The ask in a closing line as card text: from the call to action to the end of its phrase.
+
+    "So if this helped, share this with a friend who needs it" -> "Share this with a friend";
+    "Follow for part 2 where I break down the hooks" -> "Follow for part 2".
+    """
+    s = clean_say(text)
+    m = _CTA_RE.search(s)
+    if m:
+        s = s[m.start():]                 # the ask itself, without its lead-in
+    words = s.split()
+    for i in range(1, len(words)):
+        if re.search(r"[,;:.!?]$", words[i - 1]) or _clause_start(words, i):
+            words = words[:i]
+            break
+    words = _trim_dangling(words[:max_words], keep=1)
+    out = re.sub(r"[.;,:!?]+$", "", " ".join(words)).strip()
+    return out[:1].upper() + out[1:] if out else headline(text, 5)
 
 
 def _power_words(text):
@@ -1216,7 +1394,7 @@ def _visual_for(u, i, n, ctx):
         return {"template": "hook_title", "params": {"text": head, "highlight": hl,
                                                      "look": "stroke" if ctx["footage"] else "shadow"}}, "hook"
     if i == n - 1 and _CTA_RE.search(text):
-        return {"template": "cta", "params": {"text": headline(text, 5), "icon": "plus" if re.search(
+        return {"template": "cta", "params": {"text": cta_text(text), "icon": "plus" if re.search(
             r"follow|subscribe", text, re.I) else "comment" if re.search(r"comment", text, re.I) else "bookmark"}}, "cta"
     if u.get("list_no"):
         body = headline(_LIST_RE.sub("", text) or text, 7)
@@ -1296,14 +1474,23 @@ def asset_rows(assets):
     return rows
 
 
+def _word_ends_sentence(tok, nxt=""):
+    """True when a transcript token closes a sentence ("views." yes; "vs.", "Dr.", "2.5M" no)."""
+    m = re.search(r"(?:[.!?]+|[。！？]+)[\"'”’)\]]*$", str(tok))
+    if not m:
+        return False
+    return _ends_sentence(str(tok) + " " + str(nxt or ""), m.start(), m.end())
+
+
 def sentences_from_words(words, pause=0.45):
     """Timed words grouped into sentences: by punctuation when the transcript has it, else by pauses."""
     out, cur = [], []
-    punct = sum(1 for w in words if re.search(r"[.!?]$", w["w"])) >= max(2, len(words) // 40)
+    ends = [_word_ends_sentence(w["w"], words[i + 1]["w"] if i + 1 < len(words) else "") for i, w in enumerate(words)]
+    punct = sum(ends) >= max(2, len(words) // 40)
     for i, w in enumerate(words):
         cur.append(w)
         gap = words[i + 1]["s"] - w["e"] if i + 1 < len(words) else 9
-        if (re.search(r"[.!?]$", w["w"]) if punct else gap >= pause) or gap >= 1.2 or len(cur) >= 16:
+        if (ends[i] if punct else gap >= pause) or gap >= 1.2 or len(cur) >= 16:
             out.append(cur)
             cur = []
     if cur:
@@ -1330,9 +1517,14 @@ def heuristic_plan(prompt, script=None, style=None, duration=30, assets=None, as
         sents = sentences_from_words(words)
         units = [{"text": " ".join(w["w"] for w in s), "list_no": None, "s": s[0]["s"]} for s in sents]
     else:
-        units = _units(script) if script and str(script).strip() else _prompt_units(prompt or "")
+        units = _units(script) if script and str(script).strip() else []
+        if not units:
+            units = _prompt_units(prompt or "")
     if not units:
-        units = [{"text": headline(prompt or "Watch this", 7), "list_no": None}]
+        # emoji, symbols or stage directions only: nothing to say or show, so the hook is a plain opener
+        units = [{"text": "Watch this.", "list_no": None}]
+        notes.append("the prompt has no words to put on screen; the hook says \"Watch this\" (give a script with "
+                     "--script for real lines)")
 
     def is_item(u):
         return bool(u.get("list_no") or (_LIST_RE.match(u["text"]) and len(u["text"].split()) > 2))

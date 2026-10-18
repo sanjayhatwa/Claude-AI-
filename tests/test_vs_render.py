@@ -1,5 +1,7 @@
 """Viral Studio engine, part 2: frames, video decoding, full renders, audio mix (needs ffmpeg; offline)."""
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -49,6 +51,18 @@ def setUpModule():
     # lossless clip whose grey level is 8 x frame number: decoding can be checked exactly
     _ff("-f", "lavfi", "-i", "nullsrc=s=32x32:r=10:d=3,format=gray,geq=lum='N*8'", "-c:v", "ffv1",
         os.path.join(d, "counter.mkv"))
+    # lossless 30 fps counters (grey = 4 x frame number): a fine MOV timebase and MKV's whole milliseconds
+    counter30 = "nullsrc=s=32x32:r=30:d=2,format=gray,geq=lum='N*4'"
+    _ff("-f", "lavfi", "-i", counter30, "-c:v", "ffv1", os.path.join(d, "counter30.mov"))
+    _ff("-f", "lavfi", "-i", counter30, "-c:v", "ffv1", os.path.join(d, "counter30.mkv"))
+    # a recording whose picture starts 0.3 s after its sound (screen recorders, some cameras)
+    _ff("-itsoffset", "0.3", "-i", os.path.join(d, "counter30.mov"), "-f", "lavfi", "-i",
+        "sine=frequency=440:sample_rate=48000:duration=2.3", "-map", "0:v", "-map", "1:a", "-c:v", "copy",
+        "-c:a", "pcm_s16le", os.path.join(d, "late_video.mov"))
+    # ... and one whose sound starts 0.3 s after its picture
+    _ff("-i", os.path.join(d, "counter30.mov"), "-itsoffset", "0.3", "-f", "lavfi", "-i",
+        "sine=frequency=440:sample_rate=48000:duration=1.7", "-map", "0:v", "-map", "1:a", "-c:v", "copy",
+        "-c:a", "pcm_s16le", os.path.join(d, "late_audio.mov"))
     sr = 48000
     t = np.arange(4 * sr) / sr
     _wav(os.path.join(d, "music.wav"), 0.3 * np.sin(2 * np.pi * 200 * t))
@@ -256,6 +270,33 @@ class Frames(unittest.TestCase):
         self.assertEqual(comp._counter_text(L, 1.5)["text"], "$1,234.5")
         self.assertEqual(comp._counter_text(L, 0.5)["_reserve"], "$1,234.5")
 
+    def test_sprites_of_finished_layers_are_freed(self):
+        # a background per beat: each full-frame sprite used to stay cached (3 GB for 15 at 1080x1920)
+        layers = [rect(w=180, h=320, x=0, y=0, start=i * 0.2, end=(i + 1) * 0.2, color="#%02X2040" % (i * 16),
+                       gradient=["#000000", "#%02X2040" % (i * 16)]) for i in range(12)]
+        layers.append({"type": "image", "src": "logo.png", "x": 90, "y": 160, "start": 0, "end": 1.0})
+        s = render._prepare(S(duration=2.4, layers=layers), T["tmp"])
+        comp = render.Compositor(s, 1.0, 10)
+        try:
+            for i in range(24):
+                f = comp.frame_u8(i / 10.0, i)
+                self.assertLessEqual(len(comp.sprites), 2, i)      # the beat's background (+ the logo)
+                self.assertLessEqual(len(comp.splits), 2, i)
+            self.assertEqual(tuple(f[300, 10]), tuple(render.render_frame(s, 2.3)[300, 10]))
+        finally:
+            comp.close()
+        # and the cache is bounded by bytes, least recently used out first
+        c = render.SpriteCache(100)
+        for k in range(5):
+            c.put(k, "v%d" % k, 30, owner=k % 2)
+        self.assertEqual(sorted(c.data), [2, 3, 4])
+        c.get(2)
+        c.put(5, "v5", 30, owner=1)
+        self.assertEqual(sorted(c.data), [2, 4, 5])
+        c.drop(0)
+        self.assertEqual(sorted(c.data), [5])
+        self.assertEqual(c.used, 30)
+
     def test_bad_spec_raises(self):
         with self.assertRaises(render.RenderError) as cm:
             render.render_frame(S(layers=[{"type": "txt"}]), 0)
@@ -286,6 +327,92 @@ class Video(unittest.TestCase):
             comp.close()
         for i in (0, 7, 11):
             self.assertTrue(np.array_equal(seq[i], render.render_frame(s, i / 10.0)), i)
+
+    def counter_frames(self, layer, fps, t0, n, src="counter30.mov"):
+        """Source frame numbers shown by n consecutive timeline frames from t0 (grey = 4 x frame number)."""
+        L = dict({"type": "video", "src": src, "volume": 0, "fit": "fill"}, **layer)
+        s = render._prepare(S(fps=fps, duration=t0 + n / float(fps) + 0.5, layers=[L]), T["tmp"])
+        comp = render.Compositor(s, 1.0, fps)
+        try:
+            i0 = int(round(t0 * fps))
+            return [int(round(comp.frame_u8((i0 + i) / float(fps), i0 + i)[160, 90, 0] / 4.0)) for i in range(n)]
+        finally:
+            comp.close()
+
+    def test_layer_starting_on_a_half_frame_plays_every_frame_once(self):
+        # start 1.05 s at 30 fps is frame 31.5: every lt * fps lands on x.5 (round() gave 0, 2, 2, 4, 4 ...)
+        for src in ("counter30.mov", "counter30.mkv"):
+            got = self.counter_frames({"start": 1.05}, 30, 32 / 30.0, 24, src)
+            self.assertEqual(np.diff(got).tolist(), [1] * 23, (src, got))
+
+    def test_ms_rounded_in_points_start_on_their_own_frame(self):
+        # word times are whole milliseconds: in = 0.067 s means frame 2 (at 0.0667 s), not frame 3
+        for n in range(1, 30):
+            got = self.counter_frames({"in": round(n / 30.0, 3)}, 30, 0.0, 2)
+            self.assertEqual(got, [n, n + 1], n)
+
+    def test_speed_on_millisecond_timestamps_steps_evenly(self):
+        # MKV/WebM store 33, 67, 100 ms: at 2x every other frame, at 1.5x steps of 1 and 2 in turn
+        for src in ("counter30.mkv", "counter30.mov"):
+            self.assertEqual(self.counter_frames({"speed": 2.0}, 30, 0.0, 12, src), list(range(0, 24, 2)), src)
+            got = self.counter_frames({"speed": 1.5}, 30, 0.0, 12, src)
+            self.assertEqual(np.diff(got).tolist(), [2, 1] * 5 + [2], (src, got))   # the nearest frame to 1.5 k
+            self.assertTrue(all(abs(f - 1.5 * k) <= 0.5 for k, f in enumerate(got)), (src, got))
+
+    def test_picture_that_starts_after_its_sound_stays_in_sync(self):
+        # the picture starts at 0.3 s on the file's clock, the sound at 0: at layer time 1.0 s the frame in
+        # sync with the clip audio is (1.0 - 0.3) * 30 = 21; before 0.3 s the first picture holds
+        self.assertEqual(self.counter_frames({"src": "late_video.mov"}, 30, 1.0, 3), [21, 22, 23])
+        self.assertEqual(self.counter_frames({"src": "late_video.mov"}, 30, 0.0, 2), [0, 0])
+
+    def test_hdr_footage_is_tone_mapped(self):
+        if "zscale" not in render.ffmpeg_filters():
+            self.skipTest("this ffmpeg has no zscale (libzimg)")
+        # the same picture as SDR BT.709 and as 10-bit HLG / BT.2020 (what iPhones record by default)
+        sdr, hlg = os.path.join(T["tmp"], "sdr.mp4"), os.path.join(T["tmp"], "hlg.mp4")
+        _ff("-f", "lavfi", "-i", "testsrc2=size=320x180:rate=10:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-qp", "0", sdr)
+        try:
+            _ff("-f", "lavfi", "-i", "testsrc2=size=320x180:rate=10:duration=1", "-vf",
+                "format=yuv444p,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv,"
+                "zscale=t=arib-std-b67:p=bt2020:m=bt2020nc:r=tv:npl=203,format=yuv420p10le", "-c:v", "libx264",
+                "-qp", "0", "-color_trc", "arib-std-b67", "-color_primaries", "bt2020", "-colorspace", "bt2020nc", hlg)
+        except subprocess.CalledProcessError:
+            self.skipTest("this ffmpeg cannot write 10-bit H.264")
+        self.assertEqual(timeline.probe(hlg)["color_transfer"], "arib-std-b67")
+
+        def frame(src):
+            L = {"type": "video", "src": src, "volume": 0}
+            return render.render_frame(S(duration=1, layers=[L]), 0.5).astype(int)
+        a, b = frame(hlg), frame(sdr)
+        sat = lambda x: float((x.max(axis=2) - x.min(axis=2)).mean())  # noqa: E731
+        self.assertLess(np.abs(a - b).mean(), 30)        # untouched HLG: about 70 (grey and flat)
+        self.assertGreater(sat(a), 0.8 * sat(b))         # untouched HLG: about 0.4
+
+    def test_color_filters(self):
+        saved, warned = render._filters, list(render._hdr_warned)
+        try:
+            render._filters = {"zscale", "tonemap", "colorspace"}
+            self.assertEqual(render.color_filters({}), [])
+            self.assertEqual(render.color_filters({"color_transfer": "bt709", "color_primaries": "bt709"}), [])
+            hlg = render.color_filters({"color_transfer": "arib-std-b67", "color_primaries": "bt2020"}, (64, 32))
+            self.assertIn("tin=arib-std-b67", hlg[0])
+            self.assertIn("min=bt2020nc", hlg[0])        # untagged matrix: the BT.2020 default
+            self.assertIn("w=64", hlg[0])
+            self.assertTrue(any(f.startswith("tonemap=") for f in hlg))
+            wide = render.color_filters({"color_primaries": "bt2020"})
+            self.assertFalse(any(f.startswith("tonemap=") for f in wide))
+            self.assertIn("p=bt709", wide[0])
+            render._filters = {"tonemap", "colorspace"}    # an ffmpeg without libzimg: say so, once
+            err = io.StringIO()
+            del render._hdr_warned[:]
+            with contextlib.redirect_stderr(err):
+                self.assertTrue(render.color_filters({"color_transfer": "arib-std-b67"})[0].startswith("colorspace="))
+                self.assertEqual(render.color_filters({"color_transfer": "smpte2084"}), [])
+            self.assertEqual(err.getvalue().count("zscale"), 1)
+        finally:
+            render._filters = saved
+            render._hdr_warned[:] = warned
 
 
 @unittest.skipUnless(HAVE_FFMPEG, "ffmpeg not installed")
@@ -334,6 +461,20 @@ class FullRender(unittest.TestCase):
         self.assertEqual(len(calls), 20)
         self.assertEqual(calls[-1], (20, 20))
 
+    def test_every_frame_survives_the_audio_mux(self):
+        # -shortest used to cut the last frames (the CTA, the loop point): 145 of 150 at 29.97 fps
+        for fps, frames in ((30000 / 1001.0, 150), (30, 121)):
+            spec = S(fps=fps, duration=frames / fps, layers=[rect()],
+                     audio=[{"src": "music.wav", "loop": True, "duck": False}])
+            out = os.path.join(T["tmp"], "frames.mp4")
+            render.render(spec, out, base_dir=T["tmp"])
+            r = subprocess.run(["ffprobe", "-v", "error", "-count_frames", "-show_entries",
+                                "stream=codec_type,nb_read_frames,duration", "-of", "json", out],
+                               capture_output=True, text=True, check=True)
+            streams = {s["codec_type"]: s for s in json.loads(r.stdout)["streams"]}
+            self.assertEqual(int(streams["video"]["nb_read_frames"]), frames, fps)
+            self.assertAlmostEqual(float(streams["audio"]["duration"]), frames / fps, delta=0.03)
+
     def test_preview_and_still(self):
         out = os.path.join(T["tmp"], "prev.mp4")
         render.render(self.spec(), out, preview=True, base_dir=T["tmp"])
@@ -354,6 +495,14 @@ class FullRender(unittest.TestCase):
         self.assertEqual(render.main([spec_path, "--still", "1.0", "--out", png, "--preview"]), 0)
         with Image.open(png) as im:
             self.assertEqual(im.size, (108, 192))
+        # an image name without --still used to render every frame, then fail in the muxer leaving a broken .png
+        oops = os.path.join(T["tmp"], "oops.png")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(render.main([spec_path, "--out", oops, "--quiet"]), 2)
+            self.assertEqual(render.main([spec_path, "--still", "1.0", "--out", oops + ".mp4"]), 2)
+        self.assertIn("--still", err.getvalue())
+        self.assertFalse(os.path.exists(oops) or os.path.exists(oops + ".mp4"))
         bad = os.path.join(T["tmp"], "bad.json")
         timeline.save({"width": 100, "height": 100, "layers": [{"type": "shape", "color": "nope"}]}, bad)
         self.assertEqual(render.main([bad, "--out", os.path.join(T["tmp"], "bad.mp4"), "--quiet"]), 1)
@@ -370,6 +519,29 @@ class FullRender(unittest.TestCase):
         with Image.open(os.path.join(T["tmp"], "esc.png")) as im:
             self.assertGreater(np.asarray(im.convert("L")).max(), 200)
         self.assertEqual(render.ffmpeg_filter_path("/a:b/c'd,[e];f.ass"), r"/a\\:b/c\\\'d\,\[e\]\;f.ass")
+
+    def test_caption_words_are_literal_text(self):
+        # "{wow}" was read as an override block (the card showed nothing), "back\nslash" uppercased to a
+        # hard line break, and "{\fs300}" restyled the card
+        words = [{"w": "{wow}", "s": 0.0, "e": 0.4}, {"w": "back\\nslash", "s": 0.5, "e": 0.9},
+                 {"w": "{\\fs300}huge", "s": 1.0, "e": 1.4}]
+        spec = S(width=360, height=640, background="#203040", captions={"words": words, "style": {"words_per_card": 1}})
+        d = tempfile.mkdtemp(dir=T["tmp"])
+        render.build_captions(timeline.normalize(spec), 360, 640, d)
+        with open(os.path.join(d, "captions.ass"), encoding="utf-8") as f:
+            text = " ".join(l.split(",,0,0,0,,", 1)[1] for l in f.read().splitlines() if l.startswith("Dialogue:"))
+        self.assertNotIn("{\\FS300}", text)
+        self.assertNotIn("\\N", text)
+
+        def ink(t):
+            out = render.still(spec, t, os.path.join(d, "c%s.png" % t))
+            with Image.open(out) as im:
+                a = np.asarray(im.convert("RGB")).astype(int)
+            ys = np.nonzero((np.abs(a - [0x20, 0x30, 0x40]).sum(axis=2) > 60).any(axis=1))[0]
+            return len(ys) and ys.max() - ys.min() + 1
+        heights = [ink(t) for t in (0.2, 0.7, 1.2)]
+        self.assertGreater(heights[0], 10)                        # "{WOW}" is drawn
+        self.assertLess(max(heights), 1.5 * min(heights))        # one line each, at the caption size
 
     def test_caption_cards_end_at_silences_and_drop_trailing_punctuation(self):
         # a line, 10 s with no words (the line is on screen as a graphic), then more words
@@ -471,6 +643,84 @@ class AudioMix(unittest.TestCase):
         self.assertEqual((first["fade_out"], second["fade_in"]), (0.0, 0.0))
         self.assertGreater(first["fade_in"], 0)
         self.assertGreater(second["fade_out"], 0)
+
+    def test_mix_is_exactly_as_long_as_the_video(self):
+        # loudnorm's last frames carry a timestamp gap: the mix used to come out 33-100 ms short
+        for fps, frames in ((30, 121), (30000 / 1001.0, 150), (60000 / 1001.0, 179)):
+            D = frames / fps
+            res, out = self.mix({"audio": [{"src": "music.wav", "loop": True, "duck": False}]}, dur=D,
+                                name="len.wav")
+            self.assertEqual(len(self.read(out)[2]), int(round(D * 48000)), fps)
+
+    def test_clip_sound_that_starts_after_the_picture_stays_in_sync(self):
+        # the sound starts at 0.3 s on the file's clock: the mix is silent until then, not pulled early
+        _, out = self.mix({"layers": [{"type": "video", "src": "late_audio.mov", "volume": 1}]}, dur=1.5,
+                          name="late.wav")
+        sr, _, x = self.read(out)
+        rms = lambda a, b: float(np.sqrt((x[int(a * sr):int(b * sr), 0] ** 2).mean()))  # noqa: E731
+        self.assertLess(rms(0.0, 0.25), 0.002)
+        self.assertGreater(rms(0.4, 1.0), 0.05)
+
+    def test_ffmpeg_output_is_read_as_utf8_whatever_the_code_page(self):
+        # Windows decodes text=True pipes with its ANSI code page (cp1252): ffmpeg echoes the input path as UTF-8,
+        # and bytes such as 0x81 (in Devanagari, many emoji) are undefined there
+        folder = os.path.join(T["tmp"], "कुछ वीडियो")
+        os.makedirs(folder, exist_ok=True)
+        clip = os.path.join(folder, "clip.mp4")
+        shutil.copyfile(os.path.join(T["tmp"], "clip.mp4"), clip)
+        real = subprocess.run
+
+        def windows_run(*args, **kw):
+            if kw.get("text") and kw.get("encoding") is None:
+                kw["encoding"] = "cp1252"
+            return real(*args, **kw)
+        saved = subprocess.run
+        subprocess.run = windows_run
+        try:
+            self.assertIsNotNone(audio._loudness(shutil.which("ffmpeg"), clip))
+            self.assertEqual(timeline.probe(clip)["width"], 320)
+            out = render.render(S(duration=1, layers=[{"type": "video", "src": clip}]), os.path.join(folder, "o.mp4"))
+            self.assertTrue(os.path.isfile(out))
+        finally:
+            subprocess.run = saved
+
+    def test_long_timelines_pass_the_graph_in_a_file(self):
+        # ~230 graph characters per clip: 120 jump cuts were 42 k characters, over Windows' 32 767 limit
+        layers = [{"type": "video", "src": "clip.mp4", "start": i * 0.025, "end": (i + 1) * 0.025, "in": i * 0.02,
+                   "volume": 1} for i in range(120)]
+        calls = []
+        real = subprocess.run
+
+        def spy(cmd, *args, **kw):
+            calls.append(cmd)
+            return real(cmd, *args, **kw)
+        saved = subprocess.run
+        subprocess.run = spy
+        try:
+            res, out = self.mix({"layers": layers}, dur=3.0, name="long.wav")
+        finally:
+            subprocess.run = saved
+        self.assertEqual(res, out)
+        self.assertEqual(len(self.read(out)[2]), 3 * 48000)
+        self.assertLess(max(len(subprocess.list2cmdline(c)) for c in calls), 12000)
+        # an ffmpeg that dropped -filter_complex_script (8+) gets -/filter_complex instead
+        tries = []
+
+        def fake(cmd):
+            tries.append(cmd)
+            if "-filter_complex_script" in cmd:
+                return subprocess.CompletedProcess(cmd, 8, "", "Unrecognized option 'filter_complex_script'.")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        saved = audio._run
+        audio._run = fake
+        try:
+            work = tempfile.mkdtemp(dir=T["tmp"])
+            self.assertEqual(audio._run_graph("ffmpeg", ["-i", "a.wav"], "[0:a]anull[mix]", ["o.wav"], work).returncode, 0)
+        finally:
+            audio._run = saved
+        self.assertEqual(tries[1][tries[1].index("-/filter_complex") + 1], os.path.join(work, "mix_graph.txt"))
+        with open(os.path.join(work, "mix_graph.txt"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "[0:a]anull[mix]")
 
 
 if __name__ == "__main__":

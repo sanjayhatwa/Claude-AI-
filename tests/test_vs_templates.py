@@ -691,6 +691,14 @@ class TestDesign(unittest.TestCase):
                             with self.subTest(fps=fps, window=(t0, t1), energy=energy, go=go, t=round(t, 3)):
                                 self.assertGreaterEqual(total, 0.6)
                             k += 1
+                        # the ring never empties either: when the next arc starts drawing from 0, the
+                        # previous one is still there, full
+                        arcs = [L for L in layers if L["id"].startswith("countdown.arc")]
+                        for a, b in zip(arcs, arcs[1:]):
+                            st = layer_state(a, b["start"], 1080, 1920, fps)
+                            with self.subTest(fps=fps, window=(t0, t1), energy=energy, go=go, arc=b["id"]):
+                                self.assertIsNotNone(st)
+                                self.assertGreater(st["opacity"], 0.9)
 
     def test_ranking_rows_share_one_text_size(self):
         items = ["Hooks that open a loop", "Pacing under 2 seconds per shot", "Captions", "Music",
@@ -811,12 +819,60 @@ class TestDesign(unittest.TestCase):
                                 self.assertGreater(math.hypot(dx, dy), r)
 
 
+class TestKeyProduct(unittest.TestCase):
+    """_mul_keys: a group member's own opacity keys (a blinking caret) times the group's fades."""
+
+    def test_matches_the_product_at_every_frame(self):
+        from vstudio import anim
+        import random
+        rnd = random.Random(7)
+        eases = sorted(anim.EASINGS)
+        for _ in range(400):
+            def curve():
+                ts = sorted(rnd.sample(range(0, 300), rnd.randint(1, 6)))
+                return [[t / 100.0, round(rnd.random(), 3)] + ([rnd.choice(eases)] if rnd.random() < 0.7 else [])
+                        for t in ts]
+            a, b = curve(), curve()
+            keys = templates._mul_keys(a, b, 1 / 30.0)
+            errs = []
+            check_keys(errs, "product", keys, 3.0, "x")      # (back / elastic eases may overshoot 0..1)
+            self.assertEqual(errs, [])
+            for k in range(91):
+                t = k / 30.0
+                want = anim.value_at(a, t, 1.0) * anim.value_at(b, t, 1.0)
+                self.assertAlmostEqual(anim.value_at(keys, t, 1.0), want, delta=0.03, msg=(a, b, t))
+
+    def test_exact_where_one_curve_holds(self):
+        group = [[0, 0], [0.3, 1, "out-cubic"], [2.7, 1, "linear"], [3.0, 0, "in-cubic"]]
+        blink = [[0, 0], [1.0, 1, "step"], [1.45, 0, "step"], [1.9, 1, "step"]]
+        keys = templates._mul_keys(blink, group)
+        self.assertIn([3.0, 0.0, "in-cubic"], keys)        # the group's exit keeps its easing
+        self.assertLessEqual(len(keys), 8)                 # no sampling where nothing needs it
+
+
 class TestCLI(unittest.TestCase):
     def run_main(self, argv):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = templates.main(argv)
         return code, out.getvalue(), err.getvalue()
+
+    def help_text(self, argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as cm:
+            templates.main(argv + ["--help"])
+        self.assertEqual(cm.exception.code, 0)
+        return out.getvalue()
+
+    def test_help_shows_every_command_with_its_own_usage(self):
+        top = self.help_text([])
+        for cmd in ("list", "doc", "build", "preview"):
+            self.assertIn(cmd, top)
+        for cmd in ("list", "doc", "build", "preview"):
+            self.assertIn("usage: vstudio templates %s" % cmd, self.help_text([cmd]))
+        self.assertIn("--still", self.help_text(["preview"]))
+        code, out, _ = self.run_main(["list", "--json"])
+        self.assertEqual((code, set(json.loads(out))), (0, set(templates.CATALOG)))
 
     def test_table_json_doc_build(self):
         code, out, _ = self.run_main([])
@@ -874,6 +930,44 @@ class TestRender(unittest.TestCase):
                 bg = img[2, 2]
                 diff = np.abs(img - bg).sum(axis=2) > 60
                 self.assertGreater(diff.mean(), 0.004, "%s drew almost nothing" % name)
+
+    def test_image_card_fades_as_one_card(self):
+        """Mid-fade the photo (or placeholder) never turns milky: the white frame is not under it."""
+        import numpy as np
+        from PIL import Image
+        from vstudio import render
+        with tempfile.TemporaryDirectory() as d:
+            black = os.path.join(d, "black.png")
+            Image.new("RGB", (400, 300), (0, 0, 0)).save(black)
+            cut = os.path.join(d, "cut.png")              # a see-through cut-out keeps its white card
+            Image.new("RGBA", (400, 300), (0, 0, 0, 0)).save(cut)
+            out = os.path.join(d, "f.png")
+            for src in (black, ""):
+                for energy in ("high", "medium", "calm"):
+                    spec = templates.preview_spec("image_card", {"src": src, "tilt": 0}, size="216x384",
+                                                  style={"energy": energy}, background="#000000")
+                    lay = [L for L in spec["layers"] if L["id"] in ("image_card.image", "image_card.placeholder")][0]
+                    en, ex = lay["enter"], lay["exit"]
+                    life = lay["end"] - lay["start"]
+                    times = [lay["start"] + en.get("delay", 0) + en["duration"] * q for q in (0.1, 0.2, 0.35, 0.6)]
+                    times += [lay["start"] + life - ex["duration"] * q for q in (0.6, 0.35, 0.2, 0.1)]
+                    for t in times:
+                        render.still(spec, t, out)
+                        img = np.asarray(Image.open(out).convert("RGB")).astype(int)
+                        # a point inside the card, clear of the placeholder's centred play icon
+                        px = img[img.shape[0] * 45 // 100, 216 // 2 - 216 * 82 // 100 * 30 // 100]
+                        with self.subTest(src=bool(src), energy=energy, t=round(t, 3)):
+                            self.assertLessEqual(px.max(), 40, px)     # black photo / #1B1B24 placeholder
+            layers = templates.build("image_card", {"src": cut}, 0, 3, {"width": 1080, "height": 1920, "fps": 30})
+            frame = [L for L in layers if L["id"] == "image_card.frame"][0]
+            self.assertEqual(frame["color"].upper(), "#FFFFFF")
+            self.assertLess(layers.index(frame), [L["id"] for L in layers].index("image_card.image"))
+            shot = os.path.join(d, "shot.png")             # an RGBA screenshot that is fully opaque
+            Image.new("RGBA", (400, 300), (10, 20, 30, 255)).save(shot)
+            layers = templates.build("image_card", {"src": shot}, 0, 3, {"width": 1080, "height": 1920, "fps": 30})
+            frame = [L for L in layers if L["id"] == "image_card.frame"][0]
+            self.assertEqual(frame["color"].upper(), "#FFFFFF00")
+            self.assertGreater(layers.index(frame), [L["id"] for L in layers].index("image_card.image"))
 
     def test_mp4_preview(self):
         with tempfile.TemporaryDirectory() as d:

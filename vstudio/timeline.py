@@ -183,10 +183,13 @@ _PROBE_CACHE = {}
 
 
 def probe(path):
-    """ffprobe facts about a media file: {duration, width, height, fps, has_audio, has_video}.
+    """ffprobe facts about a media file: {duration, width, height, fps, has_audio, has_video,
+    color_transfer, color_primaries, color_space}.
 
     Returns None when the file or ffprobe is missing or unreadable. Cached by
     path + modification time. Width/height account for phone rotation tags.
+    The colour fields are ffprobe's names ("arib-std-b67" = HLG, "smpte2084"
+    = PQ, "bt2020"...) or None when the file does not say.
     """
     try:
         st = os.stat(path)
@@ -198,9 +201,10 @@ def probe(path):
     info = None
     try:
         r = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
-                            "format=duration:stream=codec_type,width,height,avg_frame_rate,r_frame_rate,duration:"
+                            "format=duration:stream=codec_type,width,height,avg_frame_rate,r_frame_rate,duration,"
+                            "color_transfer,color_primaries,color_space:"
                             "stream_tags=rotate:stream_side_data=rotation", "-of", "json", path],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
         if r.returncode == 0:
             data = json.loads(r.stdout or "{}")
             streams = data.get("streams") or []
@@ -208,8 +212,12 @@ def probe(path):
             dur = (data.get("format") or {}).get("duration")
             info = {"duration": float(dur) if dur not in (None, "N/A") else None,
                     "has_audio": any(s.get("codec_type") == "audio" for s in streams),
-                    "has_video": vs is not None, "width": None, "height": None, "fps": None}
+                    "has_video": vs is not None, "width": None, "height": None, "fps": None,
+                    "color_transfer": None, "color_primaries": None, "color_space": None}
             if vs:
+                for k in ("color_transfer", "color_primaries", "color_space"):
+                    if vs.get(k) not in (None, "", "unknown", "N/A"):
+                        info[k] = vs[k]
                 w, h = vs.get("width"), vs.get("height")
                 rot = 0
                 for sd in vs.get("side_data_list") or []:

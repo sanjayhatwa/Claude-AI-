@@ -1,5 +1,7 @@
 """Viral Studio engine, part 1: timeline, anim, sfx, fonts, textrender (no ffmpeg, no network)."""
 
+import contextlib
+import io
 import os
 import shutil
 import sys
@@ -355,6 +357,24 @@ class Fonts(unittest.TestCase):
     def test_cli(self):
         self.assertEqual(fonts.main(["resolve", "DejaVu", "Sans"]), 0 if fonts.resolve("DejaVu Sans") else 1)
 
+    def test_resolve_cli_takes_several_names(self):
+        # "fonts resolve 'Montserrat Black' Anton 'Inter Bold'" used to look up one font of all the words
+        saved = fonts.installed_name
+        try:
+            fonts.installed_name = lambda n: n in ("DejaVu Sans Bold", "Anton", "Inter")
+            self.assertEqual(fonts._resolve_args(["Montserrat Black", "Anton", "Inter Bold"]),
+                             ["Montserrat Black", "Anton", "Inter Bold"])          # quoted: one font each
+            self.assertEqual(fonts._resolve_args(["DejaVu", "Sans", "Bold"]), ["DejaVu Sans Bold"])
+            self.assertEqual(fonts._resolve_args(["Anton", "Inter"]), ["Anton", "Inter"])
+            self.assertEqual(fonts._resolve_args(["Bebas", "Neue"]), ["Bebas Neue"])  # not installed: one name
+        finally:
+            fonts.installed_name = saved
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            fonts.main(["resolve", "DejaVu Sans Bold", "DejaVu Sans"])
+        self.assertIn("DejaVu Sans Bold: ", out.getvalue())
+        self.assertIn("DejaVu Sans: ", out.getvalue())
+
 
 # --------------------------------------------------------------------------- textrender
 
@@ -437,6 +457,48 @@ class TextRender(unittest.TestCase):
             for extra in ({}, {"stroke": {"color": "#000000", "width": 10}, "letter_spacing": -4}):
                 a = alpha(textrender.render_text(text_layer(text="ÉÀÇ fjord Wf\nQjgy|", font=name, size=90, **extra)))
                 self.assertEqual(max(a[0].max(), a[-1].max(), a[:, 0].max(), a[:, -1].max()), 0, (name, extra))
+
+    def test_missing_glyphs_fall_back_run_by_run(self):
+        # a Hindi hook title in a Latin font used to draw as a row of .notdef boxes
+        text = "HELLO नमस्ते"
+        found, _ = fonts.glyph_fallbacks("DejaVu Sans Bold", text)
+        if "न" not in found:
+            self.skipTest("no installed font draws Devanagari")
+        for ch in "नमसत":
+            self.assertTrue(fonts.has_glyph(fonts._probe(found[ch]), ch), ch)
+        self.assertNotIn("H", found)                       # the Latin word keeps the layer's font
+        lay = textrender._layout(text_layer(text=text), 1.0)
+        runs = lay["font"].runs(text)
+        self.assertEqual([r[1] for r in runs], ["HELLO ", "नमस्ते"])
+        self.assertIs(runs[0][2], lay["font"].primary)
+        # the Devanagari is drawn exactly as its own font draws it (shaped as one word), not as boxes
+        fam = found["न"]["family"] + " " + fonts.WEIGHT_NAMES.get(found["न"]["weight"], "")
+
+        def ink(L):
+            a = alpha(textrender.render_text(L))
+            ys, xs = np.nonzero(a > 0)
+            return a[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+        mixed, direct = ink(text_layer(text="नमस्ते")), ink(text_layer(text="नमस्ते", font=fam))
+        self.assertEqual(mixed.shape, direct.shape)      # boxes: (35, 140) against (38, 94)
+        self.assertLess(np.abs(mixed - direct).mean(), 2.0)
+
+    def test_glyphs_no_font_has_are_named(self):
+        saved = fonts._index
+        dejavu = [e for e in fonts.installed() if e["family"] == "DejaVu Sans"]
+        if not dejavu:
+            self.skipTest("DejaVu Sans not installed")
+        fonts._index, err = dejavu, io.StringIO()
+        fonts._glyph_choice.clear()
+        try:
+            with contextlib.redirect_stderr(err):
+                found, nobody = fonts.glyph_fallbacks("DejaVu Sans Bold", "OK न")
+        finally:
+            fonts._index = saved
+            fonts._glyph_choice.clear()
+        self.assertEqual((found, nobody), ({}, ["न"]))
+        self.assertIn("U+0928", err.getvalue())
+        self.assertFalse(any(fonts.needs_glyph(c) for c in " ्‍️\n"))  # space, virama, ZWJ, VS16
+        self.assertTrue(all(fonts.needs_glyph(c) for c in "Aन🔥★"))
 
     def test_letter_spacing_and_tabular(self):
         tight = text_layer(text="ABCD")
