@@ -606,6 +606,211 @@ class TestParams(unittest.TestCase):
         self.assertEqual(len(two.lines), 2)
 
 
+# ----------------------------------------------------------------------------- design regressions
+
+def _segments_cross(p1, p2, p3, p4):
+    """True when segments p1p2 and p3p4 properly cross (touching ends do not count)."""
+    def orient(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    d1, d2 = orient(p3, p4, p1), orient(p3, p4, p2)
+    d3, d4 = orient(p1, p2, p3), orient(p1, p2, p4)
+    return d1 * d2 < -1e-12 and d3 * d4 < -1e-12
+
+
+def self_intersections(pts):
+    """Pairs of non-adjacent edges of a closed polygon that cross each other."""
+    n, out = len(pts), []
+    for i in range(n):
+        for j in range(i + 2, n):
+            if i == 0 and j == n - 1:
+                continue
+            if _segments_cross(pts[i], pts[(i + 1) % n], pts[j], pts[(j + 1) % n]):
+                out.append((i, j))
+    return out
+
+
+def layer_state(L, t, W, H, fps=30):
+    """anim.state_at for a layer at timeline second t (None while the layer is not on screen)."""
+    from vstudio import anim
+    if not L["start"] <= t < L["end"]:
+        return None
+    return anim.state_at(L, t - L["start"], (W, H), fps)
+
+
+def text_box(L, st=None):
+    """(x0, y0, x1, y1) of a text layer's layout box (the fitted lines), at its state when given."""
+    blk = templates.fit_text(L["text"], L["font"], L["size"], L["max_width"], 20, L["size"], L.get("case", "none"),
+                             L.get("line_spacing", 1.05), L.get("letter_spacing", 0))
+    s = st["scale"] if st else 1.0
+    x, y = (st["x"], st["y"]) if st else (L["x"], L["y"])
+    w, h = blk.w * s, blk.h * s
+    fx = ANCHOR_FX[L.get("anchor", "center")]
+    a = L.get("anchor", "center")
+    fy = 0.0 if a.startswith("top") else 1.0 if a.startswith("bottom") else 0.5
+    return (x - fx * w, y - fy * h, x - fx * w + w, y - fy * h + h)
+
+
+class TestDesign(unittest.TestCase):
+    """Things that built valid layers but looked broken on screen."""
+
+    def test_arrow_is_one_simple_polygon(self):
+        """The shaft stops at the head's base: the outline never folds back over itself."""
+        dirs = templates.CATALOG["arrow"]["params"]["direction"]["choices"]
+        for key in ("9:16", "16:9"):
+            W, H = CANVASES[key]
+            for d in dirs:
+                for curve in (True, False):
+                    for length in (80, 340, 900):
+                        with self.subTest(aspect=key, direction=d, curve=curve, length=length):
+                            layers = templates.build("arrow", {"direction": d, "curve": curve, "length": length},
+                                                     0, 3, {"width": W, "height": H, "fps": 30})
+                            arrow = [L for L in layers if L["id"] == "arrow.arrow"][0]
+                            self.assertEqual(self_intersections(arrow["points"]), [])
+        self.assertEqual(self_intersections(templates.ICONS["trend"][0]["points"]), [])
+        # a path shorter than the head still gives a clean head
+        stub = templates._arrow_path([[0.1, 0.5], [0.2, 0.5]], 0.1, 0.25, 0.34)
+        self.assertEqual(self_intersections(stub), [])
+
+    def test_countdown_never_flashes_an_empty_frame(self):
+        """From the first number landing to the last exit, a number (or GO) is always clearly on screen."""
+        for fps in (24, 25, 30, 60):
+            for t0, t1 in ((0.0, 3.0), (0.0, 4.0), (1.0, 3.4), (0.37, 2.97), (0.0, 1.5), (2.0, 8.0)):
+                for energy in ("high", "medium", "calm"):
+                    for go in ("GO!", ""):
+                        layers = templates.build("countdown", {"go": go}, t0, t1,
+                                                 {"width": 1080, "height": 1920, "fps": fps}, {"energy": energy})
+                        shown = [L for L in layers if L["id"].startswith(("countdown.number", "countdown.go"))]
+                        first, last = shown[0], shown[-1]
+                        settle = first["start"] + first["enter"]["duration"] + first["enter"].get("delay", 0)
+                        leave = last["end"] - (last["exit"]["duration"] if last.get("exit") else 0)
+                        k = int(math.ceil(settle * fps))
+                        while k / fps < leave - 1e-9:
+                            t = k / fps
+                            states = [layer_state(L, t, 1080, 1920, fps) for L in shown]
+                            total = sum(s["opacity"] for s in states if s)
+                            with self.subTest(fps=fps, window=(t0, t1), energy=energy, go=go, t=round(t, 3)):
+                                self.assertGreaterEqual(total, 0.6)
+                            k += 1
+
+    def test_ranking_rows_share_one_text_size(self):
+        items = ["Hooks that open a loop", "Pacing under 2 seconds per shot", "Captions", "Music",
+                 "Thumbnails and covers"]
+        for key in ("9:16", "16:9", "1:1"):
+            W, H = CANVASES[key]
+            for its in (items, ["Hooks", "Pacing", "Captions"], ["a much longer winner than the others", "b"]):
+                with self.subTest(aspect=key, items=its):
+                    layers = templates.build("ranking", {"items": its}, 0, 3, {"width": W, "height": H, "fps": 30})
+                    names = [L for L in layers if L["id"].startswith("ranking.name")]
+                    self.assertEqual(len(names), len(its))
+                    self.assertEqual(len({L["size"] for L in names}), 1, [(L["text"], L["size"]) for L in names])
+                    cards = [L for L in layers if L["id"].startswith("ranking.card")]
+                    for name, card in zip(names, cards):
+                        x0, y0, x1, y1 = text_box(name)
+                        self.assertLessEqual(y1 - y0, card["h"] - 2, name["text"])
+
+    def test_poll_parts_move_with_the_card(self):
+        """Result fills, counters and labels scale with the card on the way in and out."""
+        W, H = CANVASES["9:16"]
+        for energy in ("high", "medium", "calm"):
+            layers = templates.build("poll", {}, 0, 3, {"width": W, "height": H, "fps": 30}, {"energy": energy})
+            card = [L for L in layers if L["id"] == "poll.card"][0]
+            parts = [L for L in layers if L["id"].split(".")[1].rstrip("0123456789") in ("fill", "pct", "option")]
+            self.assertEqual(len(parts), 6)
+            for L in parts:
+                for k in range(90):
+                    t = k / 30.0
+                    sc, sl = layer_state(card, t, W, H), layer_state(L, t, W, H)
+                    if not sc or not sl or sl["opacity"] < 0.05:
+                        continue
+                    with self.subTest(energy=energy, layer=L["id"], t=round(t, 3)):
+                        self.assertAlmostEqual(sl["scale"], sc["scale"], delta=0.01)
+                        self.assertAlmostEqual(sl["x"] - sc["x"], (L["x"] - card["x"]) * sc["scale"], delta=1.5)
+                        self.assertAlmostEqual(sl["y"] - sc["y"], (L["y"] - card["y"]) * sc["scale"], delta=1.5)
+
+    def test_search_bar_cursor_moves_with_the_bar(self):
+        W, H = CANVASES["9:16"]
+        layers = templates.build("search_bar", {}, 0, 3, {"width": W, "height": H, "fps": 30}, {"energy": "high"})
+        bar = [L for L in layers if L["id"] == "search_bar.bar"][0]
+        cursors = [L for L in layers if L["id"].startswith("search_bar.cursor")]
+        self.assertEqual(len(cursors), 2)
+        for L in cursors:
+            for k in range(90):
+                t = k / 30.0
+                sb, sl = layer_state(bar, t, W, H), layer_state(L, t, W, H)
+                if not sb or not sl:
+                    continue
+                with self.subTest(layer=L["id"], t=round(t, 3)):
+                    self.assertAlmostEqual(sl["scale"], sb["scale"], delta=0.01)
+                    self.assertAlmostEqual(sl["x"] - sb["x"], (L["x"] - bar["x"]) * sb["scale"], delta=1.5)
+
+    def test_source_card_title_leads_the_hierarchy(self):
+        long_title = "The 2025 State of the Creator Economy Annual Report"
+        detail = "Published by the Creator Research Institute, surveyed 12,000 creators in 40 countries"
+        for key in ("9:16", "16:9", "1:1"):
+            W, H = CANVASES[key]
+            for params in ({}, {"title": long_title, "detail": detail}, {"title": long_title * 2, "detail": detail}):
+                with self.subTest(aspect=key, params=params):
+                    layers = templates.build("source_card", params, 0, 3, {"width": W, "height": H, "fps": 30})
+                    size = {L["id"].split(".")[1]: L["size"] for L in layers if L["type"] == "text"}
+                    self.assertGreaterEqual(size["title"], size["detail"], size)
+                    self.assertGreaterEqual(size["title"], size["label"], size)
+                    card = [L for L in layers if L["id"] == "source_card.card"][0]
+                    for L in layers:
+                        if L["type"] == "text":
+                            x0, y0, x1, y1 = text_box(L)
+                            self.assertGreaterEqual(y0, card["y"] - card["h"] / 2 - 1, L["id"])
+                            self.assertLessEqual(y1, card["y"] + card["h"] / 2 + 1, L["id"])
+        default = templates.build("source_card", {}, 0, 3, {"width": 1080, "height": 1920, "fps": 30})
+        title = [L for L in default if L["id"] == "source_card.title"][0]
+        self.assertEqual(title["size"], 44)    # short titles keep their full size
+
+    def test_before_after_label_clears_the_handle(self):
+        for key in ("9:16", "4:5", "16:9"):
+            W, H = CANVASES[key]
+            for params in ({}, {"after_note": "52% retention"}, {"layout": "vertical"}, {"layout": "horizontal"}):
+                with self.subTest(aspect=key, params=params):
+                    layers = templates.build("before_after", params, 0, 3, {"width": W, "height": H, "fps": 30})
+                    handle = [L for L in layers if L["id"] == "before_after.handle"][0]
+                    hx0, hy0 = handle["x"] - handle["w"] / 2, handle["y"] - handle["h"] / 2
+                    hx1, hy1 = hx0 + handle["w"], hy0 + handle["h"]
+                    gap = templates._Frame({"width": W, "height": H}).d(12)
+                    for L in layers:
+                        if L["type"] != "text":
+                            continue
+                        x0, y0, x1, y1 = text_box(L)
+                        pad = L["box"]["pad"] if L.get("box") else [0, 0]
+                        x0, y0, x1, y1 = x0 - pad[0], y0 - pad[1], x1 + pad[0], y1 + pad[1]
+                        apart = x0 >= hx1 + gap or x1 <= hx0 - gap or y0 >= hy1 + gap or y1 <= hy0 - gap
+                        self.assertTrue(apart, "%s (%s) touches the handle" % (L["id"], L["text"]))
+
+    def test_versus_badge_never_covers_the_names(self):
+        names = [{}, {"left": "PRODUCTIVITY", "right": "MOTIVATION"},
+                 {"left": "Morning routines", "right": "Night routines"}, {"left": "A", "right": "B"}]
+        for key in ("9:16", "4:5", "1:1", "16:9"):
+            W, H = CANVASES[key]
+            for params in names:
+                for energy in ("high", "medium", "calm"):
+                    layers = templates.build("versus", params, 0, 3, {"width": W, "height": H, "fps": 30},
+                                             {"energy": energy})
+                    badge = [L for L in layers if L["id"] == "versus.badge"][0]
+                    labels = [L for L in layers if L["id"].startswith("versus.name")]
+                    for k in range(90):
+                        t = k / 30.0
+                        sb = layer_state(badge, t, W, H)
+                        if not sb or sb["opacity"] < 0.2:
+                            continue
+                        r = badge["w"] / 2 * sb["scale"]
+                        for L in labels:
+                            sl = layer_state(L, t, W, H)
+                            if not sl or sl["opacity"] < 0.2:
+                                continue
+                            x0, y0, x1, y1 = text_box(L, sl)
+                            dx = max(x0 - sb["x"], 0, sb["x"] - x1)
+                            dy = max(y0 - sb["y"], 0, sb["y"] - y1)
+                            with self.subTest(aspect=key, params=params, energy=energy, t=round(t, 3), label=L["id"]):
+                                self.assertGreater(math.hypot(dx, dy), r)
+
+
 class TestCLI(unittest.TestCase):
     def run_main(self, argv):
         out, err = io.StringIO(), io.StringIO()
