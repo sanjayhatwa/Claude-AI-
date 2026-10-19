@@ -82,11 +82,19 @@ python3 .claude/skills/viral-extract/scripts/captions.py --style workspace/dna/<
 
 - Timing comes from `--words`, `--srt`, or faster-whisper on their video; with
   only `--script` it previews at the reference pace.
+- Nothing filmed yet: `--script script.txt --ass-only --out captions/<n>-<slug>.ass`
+  with no `--video` writes just the caption file, laid out for 1080x1920
+  (`--size WxH` for another frame).
 - The `.ass` file is written next to the output: it imports into CapCut,
-  Premiere and DaVinci if they'd rather finish in an editor.
-- Fonts: install the chosen free font (Google Fonts) or pass `--fonts-dir`.
-  If the font isn't installed, the system substitutes one and the look drifts:
-  say so.
+  Premiere and DaVinci if they'd rather finish in an editor (that computer
+  needs the font installed).
+- Fonts: `python -m vstudio fonts install "<Family>"` puts the free font in
+  `workspace/fonts/`, where captions.py finds it by itself (as it does a
+  folder given with `--fonts-dir`, subfolders included). A variable font
+  (`Family[wght].ttf`) is cut to the asked weight, which needs `fonttools`
+  (in requirements.txt). The `wrote ... font <name> from <file>` line names
+  the font actually burned in; a missing font prints `font '<name>' not
+  found; using <other>` and the look drifts: say so.
 
 ## Accuracy, stated plainly
 

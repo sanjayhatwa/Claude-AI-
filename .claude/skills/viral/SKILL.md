@@ -41,8 +41,10 @@ PACK.md                     the one page to read: trends -> scripts -> what to f
 trends/RADAR.md             evidence for every trend
 dna/<trend>/STYLE_DNA.md    the style to recreate, with fonts_sheet.jpg
 scripts/<n>-<slug>.md       production sheet: timed spoken lines, on-screen text, shots, delivery, caption style
-captions/<n>-<slug>.ass     caption file in the reference style (captions.py --script ... --ass-only)
-reels/<n>-<slug>.mp4        optional: a rendered motion-graphics version (/reel-factory) when they want finished videos
+captions/<n>-<slug>.ass     caption file in the reference style, no video needed: captions.py --style workspace/dna/<trend>/style_dna.json
+                            --script <spoken lines only, plain text> --ass-only --out captions/<n>-<slug>.ass
+reels/<n>-<slug>.mp4        optional: a rendered motion-graphics version (/reel-factory, --ref workspace/dna/<trend>
+                            reuses step 3's analysis) when they want finished videos
 posts/<n>-<slug>.md         caption + hashtags per platform (ig-caption / yt-seo)
 ```
 
@@ -51,7 +53,8 @@ title, scriptcheck, panel hold at 3 s / end, effort to film. Then "film this
 one first and why". End with: **ship it, or change it?**
 
 If a source was unreachable (YouTube blocked, no transcript), the pack says so
-on the first line. Scripts written without trend evidence are labelled
+on the first line: RADAR.md names every unreachable radar source at its top
+(`sources` in radar.json: YouTube, autocomplete, Reddit, Google Trends). Scripts written without trend evidence are labelled
 "unvalidated" and never dressed up as researched.
 
 ## Full loop (weekly)

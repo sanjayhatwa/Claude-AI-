@@ -329,6 +329,9 @@ class TestCutDecisions(unittest.TestCase):
         self.assertEqual(spans("a million views"), [("1,000,000", "count")])
         self.assertEqual(spans("the 2nd step"), [("2nd", "ordinal")])
         self.assertEqual(spans("no numbers here"), [])
+        # a number's label never hangs on a cut-off phrase ("90 / shipped 3 games in"): the unit after it reads instead
+        ws = W("I shipped 3 games in 90 days.")
+        self.assertEqual([autoedit._label(ws, s) for s in autoedit.number_spans(ws)], ["games in 90 days", "days"])
         # the currency that was said is the currency on screen
         self.assertEqual(spans("I paid \u20ac500 for it"), [("\u20ac500", "money")])
         self.assertEqual(spans("It costs \u00a320 now"), [("\u00a320", "money")])
@@ -435,6 +438,16 @@ class TestPlacement(unittest.TestCase):
         low = dict(seg, face=[390.0, 900.0, 690.0, 1450.0], F=[540.0, 1175.0])   # a face low in the frame
         moved, note = autoedit.fit_captions(style, [low], 1080, 1920, E)
         self.assertLess(autoedit.caption_band(moved, 1920)[1], 900.0, "no room below: above the head")
+        # a close-up whose chin leaves room for the captions but not for the full gap: they stay under the chin
+        # (a few px of gap must not send them up onto the hair)
+        top0, bottom0 = autoedit.caption_band(style, 1920)
+        chin = 0.80 * 1920 - (bottom0 - top0) - 10.0
+        k = min(E["zoom"], autoedit.MAX_TOTAL_ZOOM)
+        close = dict(seg, F=[540.0, 900.0], face=[300.0, 900.0 - (900.0 - 500.0) / k, 780.0, 900.0 + (chin - 900.0) / k])
+        moved, note = autoedit.fit_captions(style, [close], 1080, 1920, E)
+        top, bottom = autoedit.caption_band(moved, 1920)
+        self.assertGreaterEqual(top, chin - 1e-6)
+        self.assertLessEqual(bottom, 0.80 * 1920 + 1e-6)
         clear = dict(style, center_y_pct=70.0)
         self.assertEqual(autoedit.fit_captions(clear, [seg], 1080, 1920, E), (clear, None))
         self.assertEqual(autoedit.fit_captions(style, [dict(seg, face=None)], 1080, 1920, E), (style, None))

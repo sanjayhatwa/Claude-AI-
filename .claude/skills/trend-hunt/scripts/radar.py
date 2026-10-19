@@ -21,7 +21,10 @@ What it does, in order:
   6. GAPS     searches people make that few outlier videos answer yet
 
 Writes radar.json (everything), RADAR.md (the readable brief) and
-swipe-input.tsv (for ig-viral/swipe.py).
+swipe-input.tsv (for ig-viral/swipe.py). A source that could not be reached
+(YouTube, autocomplete, Reddit, Google Trends) is named at the top of
+RADAR.md and recorded in radar.json's "sources", so missing data never reads
+as "nothing trending".
 
 Read, do not scrape: ~20 searches, a few dozen channel and video lookups and
 a handful of Reddit and Trends requests, spaced out. No login anywhere.
@@ -47,6 +50,20 @@ import trends  # noqa: E402
 
 UA = "Mozilla/5.0 (viral-hyper-agent research; low volume)"
 PAUSE = 1.2
+
+# How each source answered this run: "ok", "partial" (some requests failed) or "unreachable" (all failed).
+# Written to radar.json as "sources" and named at the top of RADAR.md, because an empty Reddit or Trends
+# list otherwise looks the same as "nothing is trending there".
+SOURCES = {}
+SOURCE_NAMES = {"youtube": "YouTube", "autocomplete": "YouTube autocomplete", "reddit": "Reddit",
+                "google_trends": "Google Trends"}
+
+
+def mark(src, ok):
+    """Record one request to a source (see SOURCES)."""
+    now = "ok" if ok else "unreachable"
+    was = SOURCES.get(src)
+    SOURCES[src] = now if was in (None, now) else "partial"
 
 MODIFIERS = ["", "mistakes", "pov", "storytime", "tips", "explained", "vs", "tier list",
              "day in the life", "before and after", "facts", "challenge", "myths", "reaction",
@@ -119,8 +136,10 @@ def autocomplete(niche, stems=("", "how to", "why", "best", "is"), limit=20):
             for s in parse_autocomplete(http_json(url)):
                 if s not in out:
                     out.append(s)
+            mark("autocomplete", True)
         except Exception as e:
             warn("autocomplete", e)
+            mark("autocomplete", False)
             break
         time.sleep(PAUSE)
     return out[:limit]
@@ -145,8 +164,10 @@ def reddit(niche, subs, limit=25):
     for u in urls:
         try:
             rows += parse_reddit(http_json(u))
+            mark("reddit", True)
         except Exception as e:
             warn("reddit", e)
+            mark("reddit", False)
         time.sleep(PAUSE * 1.5)
     seen, out = set(), []
     for r in sorted(rows, key=lambda r: -(r["score"] + 2 * r["comments"])):
@@ -174,10 +195,13 @@ def parse_trends_rss(xml_text):
 
 def google_trends(geo="US"):
     try:
-        return parse_trends_rss(http_text("https://trends.google.com/trending/rss?geo=%s" % geo))
+        out = parse_trends_rss(http_text("https://trends.google.com/trending/rss?geo=%s" % geo))
     except Exception as e:
         warn("google trends", e)
+        mark("google_trends", False)
         return []
+    mark("google_trends", True)
+    return out
 
 
 def youtube_longform(queries, per_query=15):
@@ -361,11 +385,19 @@ def warn(src, e):
 
 # --------------------------------------------------------------------------- report
 
-def render(niche, picked, all_clusters, ac, red, gt, gp, n_rows, reachable):
+def render(niche, picked, all_clusters, ac, red, gt, gp, n_rows, reachable, sources=None):
     L = ["# Trend radar: %s" % niche, "", "Generated %s. %d videos ranked into %d clusters." % (
         dt.date.today().isoformat(), n_rows, len(all_clusters)), ""]
     if not reachable:
         L += ["**YouTube was not reachable from this machine, so there is no ranked video evidence below.**", ""]
+    others = [(SOURCE_NAMES[k], (sources or {}).get(k)) for k in SOURCE_NAMES if k != "youtube"]
+    down = [name for name, v in others if v == "unreachable"]
+    part = [name for name, v in others if v == "partial"]
+    if down:
+        L += ["**Not reachable from this machine: %s.** Nothing was read from %s, so a missing section below "
+              "means no data, not that nothing is trending there." % (", ".join(down), "it" if len(down) == 1 else "them"), ""]
+    if part:
+        L += ["**Only partly read: %s** (some requests failed; the run's messages say which)." % ", ".join(part), ""]
     L += ["## Trends to ride (varied by format)", ""]
     if not picked:
         L += ["None with enough evidence. Widen the niche, add accounts, or run the manual TikTok/Instagram pass.", ""]
@@ -423,6 +455,7 @@ def main():
     ap.add_argument("--no-long", action="store_true", help="skip long-form YouTube")
     a = ap.parse_args()
     os.makedirs(a.dir, exist_ok=True)
+    SOURCES.clear()
 
     print("1/6 expand", file=sys.stderr)
     ac = autocomplete(a.niche)
@@ -438,6 +471,7 @@ def main():
     gt = google_trends(a.geo)
     rows = shorts + long_rows
     reachable = bool(rows)
+    SOURCES["youtube"] = "ok" if reachable else "unreachable"
 
     print("3/6 enrich: baselines for %d videos" % len(rows), file=sys.stderr)
     ranked, _ = trends.rank(rows, top=None) if rows else ([], [])
@@ -458,10 +492,10 @@ def main():
     data = {"niche": a.niche, "date": dt.date.today().isoformat(), "queries": queries, "autocomplete": ac,
             "reddit": red, "google_trends": gt, "videos": ranked, "trends": picked,
             "all_clusters": [dict(c, examples=[e.get("id") for e in c["examples"]]) for c in clusters],
-            "gaps": gp, "youtube_reachable": reachable}
+            "gaps": gp, "youtube_reachable": reachable, "sources": dict(SOURCES)}
     trends.save(data, os.path.join(a.dir, "radar.json"))
     trends.save(trends.to_tsv(ranked[:60]), os.path.join(a.dir, "swipe-input.tsv"))
-    md = render(a.niche, picked, clusters, ac, red, gt, gp, len(ranked), reachable)
+    md = render(a.niche, picked, clusters, ac, red, gt, gp, len(ranked), reachable, SOURCES)
     trends.save(md + "\n", os.path.join(a.dir, "RADAR.md"))
     print(md)
 

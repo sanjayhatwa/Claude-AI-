@@ -94,6 +94,10 @@ class TestTranscripts(unittest.TestCase):
                 got = extract.load_captions(p)
                 self.assertEqual([x["w"] for x in got], ["nobody", "tells", "you"], name)
                 self.assertEqual(got[0]["s"], 0.0, name)
+            bom = os.path.join(tmp, "bom.json")   # Windows Notepad / PowerShell 5 save UTF-8 with a BOM
+            with open(bom, "w", encoding="utf-8-sig") as f:
+                json.dump({"words": words}, f)
+            self.assertEqual([x["w"] for x in extract.load_captions(bom)], ["nobody", "tells", "you"])
             bad = os.path.join(tmp, "bad.json")
             with open(bad, "w", encoding="utf-8") as f:
                 json.dump({"text": "no timings here"}, f)

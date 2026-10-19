@@ -445,6 +445,26 @@ class PlannerTest(unittest.TestCase):
                 self.assertNotIn(h.split()[-1].lower(), dangling, (line, n, h))
                 self.assertLessEqual(len(h.split()), n + 2)
 
+    def test_long_line_without_a_comma_splits_between_phrases(self):
+        # no comma or pivot word: the beat break goes before "to", not after "my" (mid-phrase, with a whip and a whoosh)
+        line = "I rebuilt the first room of my own game 12 times to find out why."
+        self.assertEqual(planner._split_long(line), ["I rebuilt the first room of my own game 12 times", "to find out why."])
+        for line in ("The quick brown fox jumps over the lazy dog every single morning near the old red barn.",
+                     "one two three four five six seven eight nine ten eleven twelve thirteen fourteen"):
+            parts = planner._split_long(line)
+            self.assertEqual(" ".join(parts), line)
+            self.assertTrue(all(3 <= len(p.split()) <= 13 for p in parts), parts)
+            self.assertNotIn(re.sub(r"\W", "", parts[0].split()[-1].lower()), planner._DANGLING, parts)
+        # a short tail after the number is its label (the captions carry the rest); a short line keeps its lead-in
+        for text, want in (("I rebuilt the first room of my own game 12 times", "times"), ("I lost $300 today", "I lost today"),
+                           ("73% of viewers decide in the first second", "of viewers decide in the first second")):
+            self.assertEqual(planner._label_around(text, planner._number(text)), want)
+        # the counter's number counts as shown text, so a caption that only repeats the card is left out
+        call = {"template": "counter_reveal", "params": {"value": 12.0, "label": "times to find out why"}}
+        self.assertGreaterEqual(planner._overlap_share("own game 12 times to find out why.", [call]), 0.6)
+        self.assertLess(planner._overlap_share("own game 12 times to find out why.",
+                                               [dict(call, template="kinetic_text")]), 0.6)
+
     def test_symbol_only_prompt_still_opens_on_a_hook(self):
         for prompt in ("🔥🔥🔥", "!!! ???", "***"):
             plan = planner.heuristic_plan(prompt, None, None, 8)

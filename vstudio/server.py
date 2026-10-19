@@ -19,7 +19,8 @@ API (JSON in and out; errors are {"error": "..."} with a matching status):
     POST /api/projects/<id>/jobs             {"kind", "args"} -> job (kinds in jobs.KINDS)
     GET  /api/projects/<id>/jobs             that project's jobs
     GET  /api/projects/<id>/spec?path=P      a timeline spec, its validation errors, versions, renders
-    PUT  /api/projects/<id>/spec?path=P      save a spec [&version=new saves spec.vN.json] [&force=1]
+    PUT  /api/projects/<id>/spec?path=P      save a spec in uploads/ or a job's out/ [&version=new saves spec.vN.json]
+                                             [&force=1]
     POST /api/projects/<id>/ask              {"message", "spec_path"} -> Claude edits the spec, saved as a new version
     GET  /api/jobs[?project=<id>]            jobs
     GET  /api/jobs/<id>                      one job with outputs and the end of its log
@@ -35,8 +36,12 @@ are refused (DNS rebinding); requests another website's page makes are
 refused (Origin and Sec-Fetch-Site checks), and responses carry
 Cross-Origin-Resource-Policy: same-origin. Upload names cannot contain
 folders, and every path from a request is resolved (symlinks included) and
-must stay inside its project folder. There is no login: anyone who can reach
-the port can use the studio, which is why it stays on 127.0.0.1.
+must stay inside its project folder. Specs are only written in uploads/ and
+jobs' out/ folders, never over studio bookkeeping (job.json and the rest, in
+any letter case), and a queued job's commands are always built again from its
+kind and arguments. Specs Claude edits may only add files that are in the
+project. There is no login: anyone who can reach the port can use the studio,
+which is why it stays on 127.0.0.1.
 """
 
 import argparse
@@ -371,9 +376,13 @@ class Studio:
             names = sorted(os.listdir(folder), key=str.lower)
         except OSError:
             return out
+        cutoff = time.time() - PARTIAL_UPLOAD_MAX_AGE
         for name in names:
             full = os.path.join(folder, name)
-            if name.startswith(".") or not os.path.isfile(full):
+            if name.startswith("."):
+                self._drop_abandoned_upload(full, cutoff)   # left by a studio stopped mid-upload
+                continue
+            if not os.path.isfile(full):
                 continue
             st = os.stat(full)
             out.append({"name": name, "path": "uploads/" + name, "size": st.st_size, "mtime": round(st.st_mtime, 3),
@@ -468,7 +477,7 @@ class Studio:
             raise ApiError(507, "not enough disk space for this file (%.1f GB free)" % (free / 1e9))
         tmp = os.path.join(folder, ".upload-%s.part" % secrets.token_hex(6))
         got = 0
-        self._inflight.add(tmp)
+        self._inflight.add(os.path.realpath(tmp))
         try:
             with open(tmp, "wb") as f:
                 while got < length:
@@ -493,7 +502,7 @@ class Studio:
         except OSError as e:
             raise save_error(e, name) from None
         finally:
-            self._inflight.discard(tmp)
+            self._inflight.discard(os.path.realpath(tmp))
             jobs.remove_file(tmp)
         self.touch(pid)
         base = os.path.basename(final)
@@ -514,15 +523,20 @@ class Studio:
                 names = os.listdir(folder)
             except OSError:
                 continue
-            for name in names:
-                full = os.path.join(folder, name)
-                try:
-                    if PARTIAL_UPLOAD_RE.match(name) and os.path.getmtime(full) < cutoff and full not in self._inflight:
-                        os.remove(full)
-                        removed += 1
-                except OSError:
-                    pass
+            removed += sum(self._drop_abandoned_upload(os.path.join(folder, n), cutoff) for n in names)
         return removed
+
+    def _drop_abandoned_upload(self, full, cutoff):
+        """Remove `full` when it is an upload temp file last written before `cutoff`; True when removed."""
+        if not PARTIAL_UPLOAD_RE.match(os.path.basename(full)) or os.path.realpath(full) in self._inflight:
+            return False
+        try:
+            if os.path.getmtime(full) >= cutoff:
+                return False
+            os.remove(full)
+            return True
+        except OSError:
+            return False
 
     def drop_inflight_uploads(self):
         """At shutdown: remove the temp files of uploads still being received (their threads die with the process)."""

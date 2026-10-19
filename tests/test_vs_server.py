@@ -983,6 +983,10 @@ class StudioStateTest(unittest.TestCase):
         self.assertFalse(os.path.exists(stale))
         self.assertTrue(os.path.exists(fresh), "an upload that is still being written is left alone")
         self.assertTrue(os.path.exists(other), "only the studio's own temp files are removed")
+        # restarted soon after the stop: the leftover goes once it is old, the next time the project is listed
+        os.utime(fresh, (old, old))
+        self.assertEqual([u["name"] for u in st.uploads(pid)], ["keep.part"])
+        self.assertFalse(os.path.exists(fresh))
 
     def test_uploads_in_flight_are_removed_at_shutdown(self):
         st = self.studio()
@@ -1177,6 +1181,260 @@ class DoctorTest(unittest.TestCase):
             code = doctor.main([])
         self.assertIn(code, (0, 1))
         self.assertIn("ffmpeg", out.getvalue())
+
+    def test_help_lists_every_environment_variable_the_code_reads(self):
+        import contextlib
+        import glob
+        import re
+        from vstudio import __main__ as cli
+        read = set()
+        for path in glob.glob(os.path.join(ROOT, "vstudio", "*.py")):
+            with open(path, encoding="utf-8") as f:
+                read |= set(re.findall(r"\bVSTUDIO_[A-Z_]+\b", f.read()))
+        self.assertTrue({"VSTUDIO_WORKSPACE", "VSTUDIO_OFFLINE", "VSTUDIO_NO_WHISPER"} <= read)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cli.main(["help"]), 0)
+        for name in read:
+            self.assertIn(name, out.getvalue())
+
+    def test_package_fixes_name_only_what_is_missing(self):
+        real = importlib.util.find_spec
+
+        def find_spec(name, *a, **kw):
+            return None if name in ("cv2", "scenedetect") else real(name, *a, **kw)
+
+        with mock.patch.object(doctor, "externally_managed", lambda: False), \
+                mock.patch("importlib.util.find_spec", find_spec):
+            item = doctor.check_python_packages()
+        self.assertFalse(item["ok"])
+        # not "-r requirements.txt": pip installs a file all or nothing, and OCR or whisper may have no build
+        self.assertEqual(item["fix"], "python -m pip install opencv-python-headless scenedetect")
+
+    def test_package_fixes_on_a_python_that_takes_no_pip_installs(self):
+        tmp = tempfile.mkdtemp(prefix="vs_doctor_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with mock.patch.object(doctor, "externally_managed", lambda: True), mock.patch.object(doctor.paths, "REPO", tmp):
+            self.assertIn("run ./setup.sh", doctor.pip_fix("numpy"))
+            os.makedirs(os.path.join(tmp, ".venv", "bin"))
+            with open(os.path.join(tmp, ".venv", "bin", "python"), "w"):
+                pass
+            self.assertIn("source .venv/bin/activate", doctor.pip_fix("numpy"))
+        if sys.prefix != sys.base_prefix:
+            self.assertFalse(doctor.externally_managed(), "a virtual environment always takes pip installs")
+
+
+# ----------------------------------------------------------------------------- setup.sh and studio.sh
+
+def make_wheel(folder, name, version="1.0"):
+    """A minimal pure-Python wheel: pip installs it with no build tools and no network."""
+    import base64
+    import hashlib
+    import zipfile
+    os.makedirs(folder, exist_ok=True)
+    dist = "%s-%s.dist-info" % (name, version)
+    files = {"%s/__init__.py" % name: "VERSION = %r\n" % version,
+             "%s/METADATA" % dist: "Metadata-Version: 2.1\nName: %s\nVersion: %s\n" % (name, version),
+             "%s/WHEEL" % dist: "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n"}
+    record = []
+    with zipfile.ZipFile(os.path.join(folder, "%s-%s-py3-none-any.whl" % (name, version)), "w") as z:
+        for arc, text in files.items():
+            data = text.encode()
+            z.writestr(arc, data)
+            digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+            record.append("%s,sha256=%s,%d" % (arc, digest, len(data)))
+        z.writestr("%s/RECORD" % dist, "\n".join(record + ["%s/RECORD,," % dist]) + "\n")
+
+
+def externally_managed_python():
+    """A Python that refuses pip installs outside a virtual environment (PEP 668: Homebrew's, Debian's)
+    and can make one, or None."""
+    probe = ("import ensurepip, os, sys, sysconfig, venv\n"
+             "sys.exit(0 if sys.version_info >= (3, 10) and sys.prefix == sys.base_prefix and "
+             "os.path.isfile(os.path.join(sysconfig.get_path('stdlib'), 'EXTERNALLY-MANAGED')) else 1)")
+    for name in ["python3"] + ["python3.%d" % m for m in range(10, 16)]:
+        exe = shutil.which(name)
+        if exe and subprocess.run([exe, "-c", probe], capture_output=True).returncode == 0:
+            return exe
+    return None
+
+
+@unittest.skipIf(os.name == "nt" or not shutil.which("bash"), "the shell scripts are for macOS and Linux")
+class SetupScriptTest(unittest.TestCase):
+    """setup.sh and studio.sh in a copy of the repo with a stand-in vstudio, offline: pip installs
+    from a folder of local wheels only, and HOME is a temp folder."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="vs_setup_")
+        self.repo = os.path.join(self.tmp, "repo")
+        os.makedirs(os.path.join(self.repo, "vstudio"))
+        for name in ("setup.sh", "studio.sh", "setup.ps1"):
+            shutil.copy2(os.path.join(ROOT, name), self.repo)
+        stub = {"__init__.py": "",
+                "__main__.py": "import os, sys\nprint('VSTUDIO-RAN', sys.executable, *sys.argv[1:])\n"
+                               "print('FAKE-ARCH', os.environ.get('FAKE_ARCH'))\n",
+                "reframe.py": "def ensure_model():\n    return None\n"}
+        for name, text in stub.items():
+            with open(os.path.join(self.repo, "vstudio", name), "w") as f:
+                f.write(text)
+        self.wheels = os.path.join(self.tmp, "wheels")
+        make_wheel(self.wheels, "vs_fake_core")
+        make_wheel(self.wheels, "vs_fake_extra")
+        self.bin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin)
+        self.home = os.path.join(self.tmp, "home")
+        os.makedirs(self.home)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def requirements(self, *lines):
+        with open(os.path.join(self.repo, "requirements.txt"), "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+    def put_on_path(self, name, script):
+        """A command `name` on PATH that runs `script` (shell)."""
+        path = os.path.join(self.bin, name)
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\n" + script + "\n")
+        os.chmod(path, 0o755)
+
+    def run_script(self, *argv):
+        env = {"PATH": self.bin + os.pathsep + "/usr/bin:/bin", "HOME": self.home, "LANG": "C.UTF-8",
+               "PYTHONUSERBASE": os.path.join(self.home, ".local"), "PIP_NO_INDEX": "1",
+               "PIP_FIND_LINKS": self.wheels, "PIP_CONFIG_FILE": os.devnull, "PIP_DISABLE_PIP_VERSION_CHECK": "1"}
+        r = subprocess.run(["bash"] + list(argv), cwd=self.repo, env=env, capture_output=True, text=True, timeout=600)
+        return r.returncode, r.stdout + r.stderr
+
+    def make_venv(self, where):
+        import venv
+        try:
+            venv.create(where, with_pip=True)
+        except Exception as e:                      # e.g. Debian without python3-venv
+            self.skipTest("cannot make a virtual environment here: %s" % e)
+        return os.path.join(where, "bin", "python")
+
+    def test_externally_managed_python_gets_a_project_venv(self):
+        py = externally_managed_python()
+        if not py:
+            self.skipTest("no externally managed Python (PEP 668) on this computer")
+        self.put_on_path("python3", 'exec "%s" "$@"' % py)
+        self.requirements("vs-fake-core      # needed")
+        code, out = self.run_script("setup.sh", "--no-tools")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Done.", out)
+        venv_py = os.path.join(self.repo, ".venv", "bin", "python")
+        self.assertTrue(os.path.isfile(venv_py), out)
+        self.assertEqual(subprocess.run([venv_py, "-c", "import vs_fake_core"]).returncode, 0, out)
+        self.assertRegex(out, r"VSTUDIO-RAN \S*\.venv/bin/python doctor")
+        self.assertIn("source .venv/bin/activate", out)
+        # the start script uses that environment, and setup uses it again on the next run
+        code, out = self.run_script("studio.sh")
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out, r"VSTUDIO-RAN \S*\.venv/bin/python serve --open")
+        self.requirements("vs-fake-core", "vs-fake-extra")
+        code, out = self.run_script("setup.sh", "--no-tools")
+        self.assertEqual(code, 0, out)
+        self.assertIn("using the project environment in .venv", out)
+        self.assertEqual(subprocess.run([venv_py, "-c", "import vs_fake_extra"]).returncode, 0, out)
+
+    def test_a_package_without_a_build_only_costs_its_feature(self):
+        py = self.make_venv(os.path.join(self.tmp, "env"))
+        self.put_on_path("python3", 'exec "%s" "$@"' % py)
+        # vs-fake-missing has no build (like OCR or whisper on a brand-new Python): pip would refuse the whole file
+        self.requirements("vs-fake-core   # frames", "# optional", "vs-fake-missing", "vs-fake-extra")
+        code, out = self.run_script("setup.sh", "--no-tools")
+        self.assertEqual(code, 0, out)
+        self.assertIn("not installed: vs-fake-missing", out)
+        self.assertIn("Done.", out)
+        self.assertEqual(subprocess.run([py, "-c", "import vs_fake_core, vs_fake_extra"]).returncode, 0, out)
+        self.assertFalse(os.path.exists(os.path.join(self.repo, ".venv")), "an active environment is used as it is")
+        # a package the studio cannot start without stops setup with a clear message
+        self.requirements("vs-fake-core", "Pillow>=9")
+        code, out = self.run_script("setup.sh", "--no-tools")
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("could not install: Pillow>=9", out)
+        self.assertNotIn("Done.", out)
+
+    def fake_windows_python(self, name, machine, real):
+        """A stand-in for a Windows Python of the given machine (ARM64, AMD64) that runs `real` for the rest."""
+        path = os.path.join(self.tmp, "pythons", name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write('#!/bin/sh\ncase "$*" in\n'
+                    '  *version_info*platform.machine*) echo "1 %s"; exit 0 ;;\n'
+                    '  *platform.machine*) echo "%s"; exit 0 ;;\n'
+                    'esac\nFAKE_ARCH=%s exec "%s" "$@"\n' % (machine, machine, machine, real))
+        os.chmod(path, 0o755)
+        return path
+
+    def run_setup_ps1(self, arch):
+        pwsh = shutil.which("pwsh")
+        if not pwsh:
+            self.skipTest("PowerShell (pwsh) is not installed")
+        env = {"PATH": self.bin + os.pathsep + "/usr/bin:/bin", "HOME": self.home, "PROCESSOR_ARCHITECTURE": arch,
+               "PIP_NO_INDEX": "1", "PIP_FIND_LINKS": self.wheels, "PIP_CONFIG_FILE": os.devnull,
+               "PIP_DISABLE_PIP_VERSION_CHECK": "1", "DOTNET_CLI_TELEMETRY_OPTOUT": "1"}
+        r = subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-File", os.path.join(self.repo, "setup.ps1"),
+                            "-NoTools", "-Yes"], cwd=self.repo, env=env, capture_output=True, text=True, timeout=600)
+        return r.returncode, r.stdout + r.stderr
+
+    def test_setup_ps1_picks_the_x64_python_on_arm64_windows(self):
+        real = self.make_venv(os.path.join(self.tmp, "env"))
+        arm = self.fake_windows_python("arm", "ARM64", real)
+        x64 = self.fake_windows_python("x64", "AMD64", real)
+        self.put_on_path("python", 'exec "%s" "$@"' % arm)
+        # the launcher: its default (-3) is the ARM64 build, the exact tag 3.12 the x64 one
+        self.put_on_path("py", 'tag="$1"; shift\ncase "$tag" in\n  -3) exec "%s" "$@" ;;\n'
+                               '  -V:3.12) exec "%s" "$@" ;;\nesac\necho "No suitable Python runtime found" >&2\n'
+                               'exit 103' % (arm, x64))
+        self.requirements("vs-fake-core", "vs-fake-missing   # optional, no build here")
+        code, out = self.run_setup_ps1("ARM64")
+        self.assertEqual(code, 0, out)
+        self.assertIn("FAKE-ARCH AMD64", out)
+        self.assertNotIn("FAKE-ARCH ARM64", out)
+        self.assertIn("not installed: vs-fake-missing", out)
+        self.assertIn("Done.", out)
+        self.assertEqual(subprocess.run([real, "-c", "import vs_fake_core"]).returncode, 0, out)
+        # an x64 computer keeps using "python" as before
+        self.put_on_path("python", 'exec "%s" "$@"' % x64)
+        code, out = self.run_setup_ps1("AMD64")
+        self.assertEqual(code, 0, out)
+        self.assertIn("FAKE-ARCH AMD64", out)
+
+    def test_setup_ps1_explains_an_arm64_only_python(self):
+        real = self.make_venv(os.path.join(self.tmp, "env"))
+        arm = self.fake_windows_python("arm", "ARM64", real)
+        self.put_on_path("python", 'exec "%s" "$@"' % arm)
+        self.requirements("vs-fake-core", "opencv-python-headless")      # no ARM64 build of OpenCV
+        code, out = self.run_setup_ps1("ARM64")
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("ARM64 build", out)
+        self.assertIn("--architecture x64", out)
+        self.assertIn("could not install: opencv-python-headless", out)
+        self.assertNotIn("Done.", out)
+
+    def test_studio_sh_starts_the_python_that_has_the_packages(self):
+        # stand-ins: both answer the version probe; only "with" has numpy and OpenCV (find_spec finds them)
+        run = 'case "$1" in -c) exit 0 ;; esac\necho "%s $*"'
+        without = 'case "$*" in *find_spec*) exit 1 ;; esac\n' + run % "PYTHON-WITHOUT"
+        self.put_on_path("python3", without)
+        self.put_on_path("python", run % "PYTHON-WITH")
+        code, out = self.run_script("studio.sh", "--port", "0")
+        self.assertEqual(code, 0, out)
+        self.assertIn("PYTHON-WITH -m vstudio serve --open --port 0", out)
+        # with no Python that has them, the first Python 3.10+ starts (the health check says what is missing)
+        self.put_on_path("python", without)
+        code, out = self.run_script("studio.sh")
+        self.assertIn("PYTHON-WITHOUT -m vstudio serve --open", out)
+        # the project environment comes first
+        os.makedirs(os.path.join(self.repo, ".venv", "bin"))
+        with open(os.path.join(self.repo, ".venv", "bin", "python"), "w") as f:
+            f.write("#!/bin/sh\n" + run % "PYTHON-VENV" + "\n")
+        os.chmod(os.path.join(self.repo, ".venv", "bin", "python"), 0o755)
+        self.put_on_path("python", run % "PYTHON-WITH")
+        code, out = self.run_script("studio.sh")
+        self.assertIn("PYTHON-VENV -m vstudio serve --open", out)
 
 
 # ----------------------------------------------------------------------------- the page in a real browser

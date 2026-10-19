@@ -236,8 +236,10 @@ RESTRICTED = ("subscriber_only", "premium_only", "needs_auth")   # yt-dlp availa
 def _video_skip(msg):
     """True when a lookup failed because of this one video (members-only, age-restricted, private,
     removed, upcoming, geo-blocked), not because of the connection or a rate limit: skip it and go on."""
-    m = (msg or "").lower()
-    if not m or _is_rate_limit(m) or re.search(r"not a bot|unusual traffic", m):
+    m = (msg or "").lower().replace("’", "'")
+    # "Video unavailable. This content isn't available, try again later." is YouTube limiting the whole
+    # session (yt-dlp before 2024.08 printed no "rate-limited" with it): a reason to stop, not a skip
+    if not m or _is_rate_limit(m) or re.search(r"not a bot|unusual traffic|content isn't available|try again later", m):
         return False
     return bool(re.search(r"members.only|join this channel|confirm your age|age.restrict|inappropriate for some users|"
                           r"private video|video is private|video unavailable|no longer available|has been removed|"

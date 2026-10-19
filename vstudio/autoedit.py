@@ -876,8 +876,12 @@ def fit_captions(style, segs, W, H, E):
     _, T, _, B = safe_zone(W, H)
     if fy1 + m + 2 * half <= B:
         cy = fy1 + m + half
+    elif fy1 + 2 * half <= B:      # under the chin with a thinner gap beats a jump onto the hair
+        cy = B - half
     elif fy0 - m - 2 * half >= T:
         cy = fy0 - m - half
+    elif fy0 - 2 * half >= T:
+        cy = T + half
     else:
         return style, "the captions cover part of the face: there is no room above or below it"
     old = float(style.get("center_y_pct") or 68)
@@ -1089,6 +1093,8 @@ def _label(ws, span):
     before = [_bare(w["w"]) for w in ws[max(0, span["a"] - 6):span["a"]]]
     while before and _tok(before[0]) in STOP | LEAD_WORDS:
         before.pop(0)
+    if before and after and _tok(before[-1]) in DANGLING:
+        return after   # "shipped 3 games in" would hang under the 90: the unit reads "90 / days" (captions say the rest)
     return " ".join(before) or after
 
 
@@ -1811,8 +1817,10 @@ def _focus(video, segs, src, canvas, reframed, o, rep):
         g["focus"] = [round(focus[0], 4), round(focus[1], 4)]
         prev_focus = g["focus"]
         s, ox, oy = cover_map(src, canvas, g["focus"])
-        if faces and detected:
-            with_face += 1
+        if faces:
+            # a shot whose own samples all missed (a turn of the head, motion blur) still has the face the
+            # framing holds from the take around it: graphics keep off it too, never land on the speaker
+            with_face += 1 if detected else 0
             fx, fy, fw, fh = (float(np.median([f[i] for f in faces])) for i in range(4))
             rect = [fx * src[0] * s - ox, fy * src[1] * s - oy, (fx + fw) * src[0] * s - ox,
                     (fy + fh) * src[1] * s - oy]

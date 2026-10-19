@@ -63,6 +63,33 @@ def _ffmpeg_install_hint():
     return "sudo apt install ffmpeg   (or your distribution's package)"
 
 
+def externally_managed():
+    """True when pip refuses to install into this Python (PEP 668: Homebrew's and many Linux
+    distributions' Pythons, outside a virtual environment)."""
+    if sys.prefix != sys.base_prefix:
+        return False
+    try:
+        import sysconfig
+        return os.path.isfile(os.path.join(sysconfig.get_path("stdlib"), "EXTERNALLY-MANAGED"))
+    except Exception:
+        return False
+
+
+def pip_fix(*packages):
+    """The fix that installs `packages` for the Python running the studio.
+
+    Only the missing packages are named: a whole requirements file fails as soon as one optional
+    package has no build for this Python (OCR or whisper on a brand-new Python version).
+    """
+    if externally_managed():
+        if os.path.isfile(os.path.join(paths.REPO, ".venv", "bin", "python")):
+            return ("this Python takes no pip installs (Homebrew, uv or the system manages it); setup put the packages "
+                    "in .venv: start the studio with ./studio.sh, or run `source .venv/bin/activate` first")
+        return ("this Python takes no pip installs (Homebrew, uv or the system manages it): run ./setup.sh, which "
+                "installs into a project environment in .venv")
+    return "python -m pip install " + " ".join(packages)
+
+
 # --------------------------------------------------------------------------- checks
 
 def check_python():
@@ -110,7 +137,7 @@ def check_ffprobe():
 
 
 def check_ytdlp():
-    fix = "python -m pip install -U yt-dlp"
+    fix = pip_fix("-U", "yt-dlp")
     if importlib.util.find_spec("yt_dlp") is not None:
         try:
             from yt_dlp import version as ytv
@@ -129,7 +156,7 @@ def check_rapidocr():
     ok = importlib.util.find_spec("rapidocr_onnxruntime") is not None
     return _item("RapidOCR", ok, "installed (reads on-screen text locally)" if ok else
                  "not installed (style extraction cannot read on-screen text)",
-                 "python -m pip install rapidocr-onnxruntime")
+                 pip_fix("rapidocr-onnxruntime"))
 
 
 def _hf_cache_dirs():
@@ -159,7 +186,7 @@ def whisper_models():
 def check_whisper():
     if importlib.util.find_spec("faster_whisper") is None:
         return _item("faster-whisper", False, "not installed (word timing from speech; captions files and YouTube "
-                     "captions still work)", "python -m pip install faster-whisper")
+                     "captions still work)", pip_fix("faster-whisper"))
     models = whisper_models()
     if models:
         return _item("faster-whisper", True, "installed; model(s) on disk: " + ", ".join(models))
@@ -177,10 +204,10 @@ def check_face():
     try:
         import cv2
     except ImportError:
-        return _item("Face tracking", False, "OpenCV is not installed", "python -m pip install opencv-python-headless")
+        return _item("Face tracking", False, "OpenCV is not installed", pip_fix("opencv-python-headless"))
     if not hasattr(cv2, "FaceDetectorYN"):
         return _item("Face tracking", False, "OpenCV %s has no FaceDetectorYN (reframing falls back to centre crops)"
-                     % cv2.__version__, "python -m pip install -U opencv-python-headless")
+                     % cv2.__version__, pip_fix("-U", "opencv-python-headless"))
     model = face_model()
     if model:
         return _item("Face tracking", True, "OpenCV %s, YuNet model %s" % (cv2.__version__, os.path.basename(model)))
@@ -302,7 +329,7 @@ def check_python_packages():
                                 ("librosa", "librosa"), ("scenedetect", "scenedetect"))
                if importlib.util.find_spec(mod) is None]
     return _item("Python packages", not missing, "numpy, Pillow, OpenCV, librosa, scenedetect" if not missing else
-                 "missing: " + ", ".join(missing), "python -m pip install -r requirements.txt",
+                 "missing: " + ", ".join(missing), pip_fix(*missing),
                  required=bool({"numpy", "Pillow"} & set(missing)))
 
 

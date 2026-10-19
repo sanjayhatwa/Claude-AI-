@@ -377,6 +377,7 @@ def render(spec, out_path, preview=False, progress=None, workdir=None, base_dir=
 def render_frame(spec, t, preview=False) -> numpy.ndarray  # HxWx3 uint8 (no captions)
 def still(spec, t, out_png) -> str
 def main(argv=None) -> int   # vstudio render spec.json --out out.mp4 [--preview] [--still 2.5 --out f.png]
+                             #     [--workdir DIR] (keep the captions .ass, silent video, audio mix) [--quiet]
 ```
 `preview=True` renders at half resolution and half fps (fast drafts).
 Video decoding: one ffmpeg reader per video layer, sequential.
@@ -435,10 +436,19 @@ def plan_edit(video, words, opts) -> dict      # returns a TIMELINE SPEC; opts k
 def main(argv=None) -> int
 # vstudio autoedit raw.mp4 --out-dir DIR [--words w.json | --captions f.srt] [--style style_dna.json]
 #     [--aspect 9:16|16:9|1:1|4:5|source] [--broll DIR] [--music m.mp3] [--no-zoom] [--no-graphics]
-#     [--no-sfx] [--max-duration 60] [--energy high|medium|calm] [--hook "TEXT"] [--render] [--preview]
+#     [--no-sfx] [--no-captions] [--max-duration 60] [--energy auto|high|medium|calm] [--hook "TEXT"]
+#     [--fps 30] [--size WxH] [--whisper-model small] [--lang CODE] [--render] [--preview]
 ```
+`--energy auto` (default) picks the intensity from the speaking rate. `--fps`
+defaults to 30 (24/25 when the source is); `--size` overrides the aspect's
+1080p size. Transcript, best first: `--words`, `--captions`, a sidecar next
+to the video with the same name (`transcribe.SIDECAR_EXT`: `.words.json`,
+`.json3`, `.srt`, `.vtt`, `.en.srt`, `.en.vtt`, `.en.json3`), faster-whisper
+(`--whisper-model`, `--lang`), else silence-only cuts.
 Writes `DIR/edit.json` (timeline), `DIR/EDIT_REPORT.md` (what was cut and
-why, seconds saved, graphics added), and with `--render`, `DIR/edited.mp4`.
+why, seconds saved, graphics added), `DIR/transcript.json` after a whisper
+run (pass it back with `--words` to skip transcribing), and with `--render`,
+`DIR/edited.mp4`.
 
 ### channel.py / thumbs.py
 ```python
@@ -476,10 +486,15 @@ def main(argv=None) -> int   # vstudio plan compile plan.json --out spec.json
 def make_reel(prompt, refs=(), competitors=(), assets=(), script=None, voice=None, music=None,
               aspect="9:16", duration=30, out_dir=None, llm="auto", render=True, preview=False) -> dict
 def main(argv=None) -> int
-# vstudio reel --prompt "..." [--ref URL|FILE]... [--competitor URL|FILE]... [--asset FILE]...
-#     [--script FILE] [--voice FILE] [--music FILE] [--aspect 9:16] [--duration 30]
-#     [--out-dir DIR] [--llm auto|claude|none] [--plan plan.json] [--no-render] [--preview]
+# vstudio reel --prompt "..." [--ref URL|FILE|DIR|style_dna.json]... [--competitor URL|FILE|DIR]...
+#     [--asset FILE]... [--script FILE] [--voice FILE] [--music FILE] [--aspect 9:16] [--duration 30]
+#     [--out-dir DIR] [--llm auto|claude|none] [--plan plan.json] [--no-render] [--preview] [--no-qa]
 ```
+A `--ref` / `--competitor` folder (extract.py's output, e.g. `workspace/dna/<slug>`)
+or `style_dna.json` is reused as it is, not measured again. `--plan` uses the
+given plan; `BRIEF.md` and `analysis.json` are rebuilt from the arguments of
+that run, so agent mode passes step 1's prompt, inputs and duration again
+(their analysis is reused). `--no-qa` skips the QA pass.
 Writes `DIR/BRIEF.md`, `DIR/plan.json`, `DIR/spec.json`, `DIR/reel.mp4`,
 `DIR/QA.md` (output re-extracted and compared to the reference DNA).
 Compiled specs carry `meta.beats` (beat times and lines) and
@@ -489,14 +504,23 @@ instead of a caption); QA measures pace on the latter.
 ### jobs.py / server.py
 ```python
 # vstudio serve [--host 127.0.0.1] [--port 4320] [--workspace workspace/studio] [--open]
+#     [--parallel 1] [--max-upload-gb 4] [--verbose]
 ```
+`--parallel`: renders that may run at once (plan and script jobs never
+wait); `--max-upload-gb`: largest upload; `--verbose`: log every request.
 API (JSON): `GET /api/health`, `GET /api/projects`, `POST /api/projects`,
 `GET /api/projects/<id>`, `PUT /api/projects/<id>/upload?name=<file>`
-(raw body), `POST /api/projects/<id>/jobs` `{kind, args}` with kind in
-`reel, autoedit, channel, extract, render, script, plan`,
-`GET /api/jobs/<id>`, `POST /api/jobs/<id>/cancel`,
-`GET|PUT /api/projects/<id>/spec?path=...`, `POST /api/projects/<id>/ask`
+(raw body), `DELETE /api/projects/<id>/upload?name=<file>`,
+`POST /api/projects/<id>/jobs` `{kind, args}` with kind in `jobs.KINDS`:
+`reel, autoedit, channel, extract, render, script, plan, template`
+(`template`: a still or short preview of one catalog template, `{name, params,
+aspect, still, duration, energy, background}`),
+`GET /api/projects/<id>/jobs`, `GET /api/jobs[?project=<id>]`,
+`GET /api/jobs/<id>`, `GET /api/jobs/<id>/log?offset=N` (live log tail),
+`POST /api/jobs/<id>/cancel`,
+`GET|PUT /api/projects/<id>/spec?path=...` (PUT: `&version=new` saves a new
+version, `&force=1`), `POST /api/projects/<id>/ask`
 `{message, spec_path}` (Claude edits the spec), `GET /api/templates`,
-`GET /api/doctor`, `GET /files/<project>/<path>` (Range support for video
-seeking). Binds 127.0.0.1 only by default. Workspace layout:
+`GET /api/doctor[?refresh=1]`, `GET /files/<project>/<path>` (Range support
+for video seeking; `?download=1` to save). Binds 127.0.0.1 only by default. Workspace layout:
 `workspace/studio/projects/<id>/{project.json, uploads/, jobs/<job>/{job.json, log.txt, out/}}`.

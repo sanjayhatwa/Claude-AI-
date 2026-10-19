@@ -183,7 +183,7 @@ CAPTION_EXTS = (".json3", ".vtt", ".srt")
 
 def load_captions(path):
     """Words from a captions or words file: json3, SRT, VTT or any words-JSON shape (words_from_json)."""
-    with open(path, encoding="utf-8", errors="replace") as f:
+    with open(path, encoding="utf-8-sig", errors="replace") as f:   # -sig: Notepad and PowerShell 5 write a BOM
         raw = f.read()
     low = path.lower()
     if low.endswith((".json3", ".json")) or raw.lstrip().startswith(("{", "[")):

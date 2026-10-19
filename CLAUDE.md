@@ -20,6 +20,19 @@ of it.
 - Short status line per stage; findings and drafts go into `workspace/`, not
   only into chat.
 
+## Running Python
+
+Skills write commands as `python3 <script>` and `python -m vstudio <cmd>`.
+Both mean the same thing: the Python that setup installed the packages for.
+Pick it once per session and use it for every command:
+
+- `.venv/` exists (setup made one): `.venv/bin/python` on macOS/Linux,
+  `.venv/Scripts/python.exe` on Windows.
+- Otherwise macOS/Linux: `python3` (python.org and Homebrew install no
+  `python`). Windows: `python`, or `py -3`; there `python3` is usually the
+  Microsoft Store stub that prints "Python was not found" (exit 9009).
+- `<that python> -m vstudio doctor` shows whether it has the packages.
+
 ## Map
 
 - `.claude/agents/`: `viral-hyper-agent` (conductor), `trend-scout`,
@@ -27,7 +40,7 @@ of it.
   `video-editor`, `growth-strategist`, `publisher`
 - `.claude/skills/`: `viral`, `trend-hunt` (radar.py), `viral-extract`
   (extract.py, captions.py), `script-forge` (voiceprint.py, scriptcheck.py),
-  `reel-mimic`, `reel-factory`, `auto-edit`, `channel-dna`, `studio`,
+  `reel-mimic`, `reel-factory`, `auto-edit` (cut_moment.py), `channel-dna`, `studio`,
   `publish`, `brand-deals`, plus `yt-*` (11), `ig-*` (13), `founder-*` (11)
 - `vstudio/`: the local video engine and web app (`python -m vstudio`);
   contract in `vstudio/ARCHITECTURE.md`

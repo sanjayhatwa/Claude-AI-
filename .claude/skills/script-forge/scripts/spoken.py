@@ -19,7 +19,13 @@ SKILLS = os.path.dirname(os.path.dirname(HERE))
 SLOP = os.path.join(SKILLS, "ig-human", "slop.json")
 
 WORD_RE = re.compile(r"[A-Za-z0-9$%']+(?:[.,][0-9]+)?")
-SENT_RE = re.compile(r"[^.!?\n]+[.!?]*")
+# A sentence ends at . ! ? (plus closing quotes or brackets) followed by a space or the end of the line,
+# so "1.5 seconds", "$4.99" and "vstudio.app" stay whole. A full stop after ABBREV never ends one
+# ("Dr. Smith", "vs. them", "e.g. this"); after ABBREV_END only when the next word is capitalised
+# ("etc. Then" ends, "etc. and" goes on). The same rule as vstudio's planner.
+SENT_END_RE = re.compile(r"[.!?]+[\"'”’)\]]*(?=\s|$)")
+ABBREV = {"vs", "v", "dr", "mr", "mrs", "ms", "prof", "st", "mt", "e.g", "i.e", "cf", "approx", "ca"}
+ABBREV_END = {"etc", "inc", "ltd", "co", "corp", "jr", "sr", "u.s", "u.k", "a.m", "p.m", "no"}
 CONTRACTION_RE = re.compile(r"\b\w+'(?:s|t|re|ve|ll|d|m)\b", re.I)
 NUMBER_RE = re.compile(r"\$?\b\d[\d,.]*(?:%|k|K|x)?\b")
 CUE_RE = re.compile(r"^\s*(?:\[.*\]|\(.*\)|#|>|[-*]?\s*(?:on[- ]screen|text|b[- ]?roll|shot|cut|sfx|music|"
@@ -86,7 +92,8 @@ CTA_RE = re.compile(r"(?i)\b(follow|comment|save|share|subscribe|link in (?:my )
 
 def load_slop():
     try:
-        return json.load(open(SLOP, encoding="utf-8"))
+        with open(SLOP, encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
         return {"words": [], "phrases": [], "structures": []}
 
@@ -119,8 +126,34 @@ def spoken_lines(script):
     return out
 
 
+def _ends_sentence(text, i, j):
+    """True when the punctuation text[i:j] closes a sentence (not an abbreviation's full stop)."""
+    mark = text[i:j]
+    if not mark.startswith(".") or mark.rstrip("\"'”’)]") != ".":
+        return True                                     # ! ? and ... always end the sentence
+    word = re.search(r"([A-Za-z][A-Za-z.]*)$", text[:i])
+    word = word.group(1).lower() if word else ""
+    nxt = text[j:].lstrip()[:1]
+    if word in ABBREV:
+        return False
+    if word in ABBREV_END or re.fullmatch(r"(?:[a-z]\.)+[a-z]", word):
+        if word == "no":
+            return not (nxt.isdigit() or nxt == "#")    # "No. 1 rule" goes on; "No. I didn't." ends
+        return nxt.isupper()
+    return True
+
+
 def sentences(text):
-    return [s.strip() for s in SENT_RE.findall(text) if WORD_RE.search(s)]
+    """Spoken sentences with their end punctuation; a line break also ends one."""
+    out = []
+    for line in str(text or "").split("\n"):
+        start = 0
+        for m in SENT_END_RE.finditer(line):
+            if _ends_sentence(line, m.start(), m.end()):
+                out.append(line[start:m.end()].strip())
+                start = m.end()
+        out.append(line[start:].strip())
+    return [s for s in out if WORD_RE.search(s)]
 
 
 def words(text):

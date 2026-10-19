@@ -23,7 +23,9 @@ template's peak, a transition and the CTA):
 - Hook readable in under 1 s, 2-6 words, one accent word.
 - Nothing in the top 11% / bottom 20% safe zones, nothing over a face.
 - Consistent font family, colours from the brief, one motion idea per beat.
-- Cut rate and caption style within 20% of the reference (`QA.md`).
+- Every `QA.md` row passes: cut rate and mean shot within 35% of the
+  reference, caption size within 20%, caption position within 6% of the
+  height, words per card within 1, same case, close colours. Fix each warn.
 - Every visible transition has a sound.
 
 Return: paths to `reel.mp4`, `plan.json`, `BRIEF.md`, `QA.md`, the stills

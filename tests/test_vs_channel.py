@@ -815,6 +815,19 @@ class TestSyntheticChannels(unittest.TestCase):
         self.assertEqual(ch["status"], "partial")
         self.assertTrue([g for g in ch["gaps"] if "kept failing" in g])
 
+    def test_which_lookup_errors_are_one_video_only(self):
+        skip = channel._video_skip
+        self.assertTrue(skip("ERROR: [youtube] x: Join this channel to get access to members-only content"))
+        self.assertTrue(skip("ERROR: [youtube] x: Sign in to confirm your age. This video may be inappropriate "
+                             "for some users."))
+        self.assertTrue(skip("ERROR: [youtube] x: Video unavailable. This video is private"))
+        # the whole session is being limited: these must count towards stopping, never be skipped past
+        self.assertFalse(skip("ERROR: [youtube] x: Video unavailable. This content isn't available, try again later."))
+        self.assertFalse(skip("ERROR: [youtube] x: Video unavailable. This content isn’t available."))
+        self.assertFalse(skip("ERROR: [youtube] x: Sign in to confirm you're not a bot."))
+        self.assertFalse(skip("ERROR: [youtube] x: HTTP Error 429: Too Many Requests"))
+        self.assertFalse(skip(None))
+
 
 class TestThumbDownloadTls(unittest.TestCase):
     def test_download_uses_the_certifi_aware_context(self):

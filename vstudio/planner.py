@@ -779,11 +779,14 @@ def _overlap_share(say, calls):
         return 0.0
     shown = set()
     for c in calls:
-        for v in _call_params(c).values():
+        shows_number = REQUIRED_NUMBERS.get(c.get("template"), []) if isinstance(c.get("template"), str) else []
+        for k, v in _call_params(c).items():
             vals = v if isinstance(v, list) else [v]
             for x in vals:
                 if isinstance(x, str):
                     shown.update(pick(x))
+                elif k in shows_number and _isnum(x):      # the counter's 12 is the spoken "12"
+                    shown.add(("%f" % x).rstrip("0").rstrip("."))
     return sum(1 for w in words if w in shown) / float(len(words))
 
 
@@ -1277,6 +1280,15 @@ def _split_long(sentence, max_words=13):
         if re.search(r"[,;:]$", words[i - 1]) or words[i].lower() in ("but", "because", "so", "and", "which", "until"):
             if best is None or abs(i - mid) < abs(best - mid):
                 best = i
+    if best is None:
+        # no comma or pivot word: cut before a word that opens a phrase ("... 12 times | to find out why"), else
+        # nearest the middle where the first part does not end on a word that leaves it hanging ("... of my | own")
+        bare = [re.sub(r"[^\w']", "", w.lower().replace("’", "'")) for w in words]
+        inner = [i for i in range(3, len(words) - 2) if bare[i - 1] not in _DANGLING]
+        best = min((i for i in inner if bare[i] in _PHRASE_OPENERS and abs(i - mid) <= len(words) / 4.0),
+                   key=lambda i: abs(i - mid), default=None)
+        if best is None:
+            best = min(inner, key=lambda i: abs(i - mid), default=None)
     cut = best or int(mid)
     return _split_long(" ".join(words[:cut]), max_words) + _split_long(" ".join(words[cut:]), max_words)
 
@@ -1337,6 +1349,9 @@ _DANGLING = set("a an the and or but so nor yet to of in on at for with from by 
 _CLAUSE = set("where when whenever if because before after until while which who whom whose that so but unless "
               "since though although whereas then".split())
 _SUBJECTS = set("i i'll i'm i've we we'll we're you you'll you're they it it's this he she".split())
+# Words a spoken phrase can open with: a long line with no comma is split before one of them.
+_PHRASE_OPENERS = _CLAUSE | set("to for with from about into without in on at by over under near through across "
+                                "and or".split())
 
 
 def _clause_start(words, i):
@@ -1472,8 +1487,11 @@ def _label_around(text, num):
     a = (num.get("span_from") or num["span"])[0]
     after = clean_say(re.sub(r"^\s*(?:percent|dollars?|bucks|x)\b", "", text[num["span"][1]:], flags=re.I))
     after = after.strip(" ,.:;-!?")
-    # "73% of viewers decide..." reads on its own; the words before only help a short tail ("I lost $300 today")
-    rest = after if len(after.split()) >= 3 else (clean_say(text[:a]).strip(" ,.:;-") + " " + after).strip()
+    # "73% of viewers decide..." reads on its own; the words before only help a short tail ("I lost $300 today"),
+    # and only when they are few: "I rebuilt the first room of my own game 12 times" is labelled "times", never
+    # "I rebuilt the first room of my own game times" (the captions carry the rest)
+    before = clean_say(text[:a]).strip(" ,.:;-")
+    rest = after if len(after.split()) >= 3 or (after and len(before.split()) > 4) else (before + " " + after).strip()
     rest = re.sub(r"^(?:because|and|but|so|that|which|while|that's|thats|it's|its)\s+", "", rest, flags=re.I)
     return headline(rest, 8, cap=False) if rest else ""
 

@@ -56,8 +56,12 @@ Takes 3 to 8 minutes. It's polite by design: a few dozen requests, spaced out.
 For the top 2 to 3 trends, run `/viral-extract` on the best example of each
 so the writing stage has its exact style, pace and hook shape.
 
-If YouTube is unreachable (some cloud sandboxes block it), RADAR.md says so.
-Continue with Steps 2 and 3. Never invent numbers to fill the gap.
+If a source is unreachable (some cloud sandboxes block YouTube, Reddit or
+Google), RADAR.md says so at the top, naming each one, and radar.json records
+it under `sources` (`ok`, `partial` or `unreachable` for youtube,
+autocomplete, reddit and google_trends). An empty section from an unreachable
+source means no data, not "nothing trending". Continue with Steps 2 and 3.
+Never invent numbers to fill the gap.
 
 ## Step 2: Instagram and TikTok, by hand, at human speed
 

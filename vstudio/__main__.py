@@ -1,6 +1,7 @@
 """python -m vstudio <command> [args]  -  run `python -m vstudio help` for the list."""
 
 import importlib
+import os
 import sys
 
 COMMANDS = {
@@ -18,11 +19,26 @@ COMMANDS = {
 }
 
 
+# Every environment variable the package reads (tests check that none is missing here).
+ENVIRONMENT = [
+    ("VSTUDIO_WORKSPACE", "the workspace folder (default: workspace/ in this repo)"),
+    ("VSTUDIO_CLAUDE_BIN", "the claude executable, when it is not on PATH"),
+    ("VSTUDIO_CLAUDE_MODEL", "the model Claude Code plans with (default: the CLI's default)"),
+    ("VSTUDIO_FONTS", "extra font folders, separated by '%s'" % os.pathsep),
+    ("VSTUDIO_OFFLINE", "set to 1 to never download the YuNet face model (face tracking then uses OpenCV's older detector)"),
+    ("VSTUDIO_FACE_MODEL", "a YuNet face model (.onnx) for channel thumbnail analysis (default: workspace/models)"),
+    ("VSTUDIO_NO_WHISPER", "set to 1 to skip whisper when measuring reference videos (no speech-model download)"),
+]
+
+
 def usage():
     print("Viral Studio\n\nusage: python -m vstudio <command> [args]\n")
     for name, (_, doc) in COMMANDS.items():
         print("  %-10s %s" % (name, doc))
     print("\n`python -m vstudio <command> --help` for a command's options.")
+    print("\nEnvironment variables:")
+    for name, doc in ENVIRONMENT:
+        print("  %-21s %s" % (name, doc))
 
 
 def main(argv=None):
