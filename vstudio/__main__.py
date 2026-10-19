@@ -55,5 +55,17 @@ def main(argv=None):
     return mod.main(argv) or 0
 
 
+def _utf8_stdio():
+    """Print any script: Windows gives a piped stdout (Claude Code, the studio's job logs) the ANSI code
+    page, which cannot encode Hindi, CJK, emoji or a rupee sign in prompts, paths and titles (the command
+    would stop after its work with UnicodeEncodeError), and the studio reads job logs as UTF-8."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):   # not a text stream (pythonw, a replaced stream)
+            pass
+
+
 if __name__ == "__main__":
+    _utf8_stdio()
     sys.exit(main())

@@ -102,14 +102,38 @@ def _ts(t):
     return parts[0] * 3600 + parts[1] * 60 + parts[2]
 
 
+def _vtt_parser():
+    """vstudio.transcribe.parse_vtt when this repo's vstudio can be imported, else None."""
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+    try:
+        if os.path.isfile(os.path.join(repo, "vstudio", "transcribe.py")) and repo not in sys.path:
+            sys.path.append(repo)
+        from vstudio.transcribe import parse_vtt
+    except Exception:   # a copy of the skills without vstudio next to it: the cue-by-cue reader below
+        return None
+    return parse_vtt
+
+
 def parse_srt_vtt(text):
+    """Words from SRT or WebVTT cues, spread evenly over each cue.
+
+    WebVTT goes through vstudio.transcribe.parse_vtt when vstudio is there: YouTube's auto-captions
+    put cue settings on the timing line ("align:start position:0%"), repeat the line before in every
+    cue (rolling display) and time each word inline, and read cue by cue they come out as settings,
+    lost first lines and every line two or three times. Without vstudio, cue settings and tags are
+    still left out here."""
+    text = text.replace("\r", "").lstrip("\ufeff")
+    if text.lstrip().startswith("WEBVTT"):
+        parse_vtt = _vtt_parser()
+        if parse_vtt is not None:
+            return parse_vtt(text)
     words = []
-    blocks = re.split(r"\n\s*\n", text.replace("\r", ""))
+    blocks = re.split(r"\n\s*\n", text)
     for b in blocks:
-        m = re.search(r"([\d:.,]+)\s*-->\s*([\d:.,]+)", b)
+        m = re.search(r"([\d:.,]+)\s*-->\s*([\d:.,]+)[^\n]*", b)   # [^\n]*: cue settings are not words
         if not m:
             continue
-        a, z = _ts(m.group(1)), _ts(m.group(2).split()[0])
+        a, z = _ts(m.group(1)), _ts(m.group(2))
         body = b[m.end():].strip()
         body = re.sub(r"<[^>]+>", "", body)
         toks = body.split()

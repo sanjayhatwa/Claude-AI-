@@ -1,7 +1,7 @@
 # Viral Hyper Agent: Python tools
 yt-dlp                  # public video data, captions, single reference downloads
 numpy
-opencv-python-headless  # frames, colours, cuts
+opencv-python-headless>=4.8  # frames, colours, cuts, face tracking (4.5-4.7 cannot run the YuNet face model)
 scenedetect             # shot detection
 librosa                 # tempo and beats
 Pillow

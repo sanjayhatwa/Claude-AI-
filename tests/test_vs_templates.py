@@ -905,6 +905,19 @@ class TestCLI(unittest.TestCase):
         code, _, err = self.run_main(["build", "nope"])
         self.assertEqual(code, 2)
 
+    def test_any_vstudio_command_prints_through_a_windows_pipe(self):
+        """`python -m vstudio ...` with stdout piped as cp1252 (Windows: Claude Code, the studio's job logs)
+        writes UTF-8 instead of stopping with UnicodeEncodeError on a rupee sign or Hindi."""
+        import subprocess
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = dict(os.environ, PYTHONIOENCODING="cp1252")
+        r = subprocess.run([sys.executable, "-m", "vstudio", "templates", "build", "stat", "--params",
+                            json.dumps({"value": "₹500", "label": "नमस्ते"})],
+                           cwd=repo, env=env, capture_output=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr.decode("utf-8", "replace")[-400:])
+        texts = [L.get("text") for L in json.loads(r.stdout.decode("utf-8"))]
+        self.assertIn("₹500", texts)
+
     def test_preview_without_render_writes_the_spec(self):
         import vstudio
         saved = sys.modules.get("vstudio.render", "missing")

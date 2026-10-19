@@ -35,6 +35,32 @@ class TestTranscripts(unittest.TestCase):
         self.assertEqual(w[0]["w"], "Nobody")
         self.assertAlmostEqual(w[4]["s"], 1.9, places=2)
 
+    def test_youtube_auto_vtt_reads_each_word_once(self):
+        # yt-dlp's auto-subs VTT (extract --captions, captions.py --srt, voiceprint, cut_moment): cue settings on the
+        # timing line, a " " line above the new words, and every cue repeating the line before it
+        vtt = ("﻿WEBVTT\nKind: captions\nLanguage: en\n\n"
+               "00:00:00.320 --> 00:00:02.270 align:start position:0%\n \n"
+               "so<00:00:00.640><c> today</c><00:00:00.960><c> I'm</c><00:00:01.280><c> going</c>"
+               "<00:00:01.600><c> to</c>\n\n"
+               "00:00:02.270 --> 00:00:02.280 align:start position:0%\nso today I'm going to\n \n\n"
+               "00:00:02.280 --> 00:00:04.550 align:start position:0%\nso today I'm going to\n"
+               "show<00:00:02.600><c> you</c><00:00:02.900><c> three</c><00:00:03.300><c> settings</c>\n")
+        words = extract.parse_srt_vtt(vtt)
+        self.assertEqual(" ".join(w["w"] for w in words), "so today I'm going to show you three settings")
+        self.assertEqual((words[1]["s"], words[5]["s"]), (0.64, 2.28))
+        path = os.path.join(tempfile.mkdtemp(), "auto.en.vtt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(vtt)
+        self.assertEqual(len(extract.load_captions(path)), 9)
+        # without vstudio next to the skills, cue settings are still not words
+        saved = extract._vtt_parser
+        extract._vtt_parser = lambda: None
+        try:
+            got = extract.parse_srt_vtt("WEBVTT\n\n00:01.000 --> 00:02.000 line:90% align:center\nHello friends\n")
+        finally:
+            extract._vtt_parser = saved
+        self.assertEqual([w["w"] for w in got], ["Hello", "friends"])
+
     def test_json3(self):
         data = {"events": [{"tStartMs": 0, "segs": [{"utf8": "hey"}, {"utf8": " you", "tOffsetMs": 300}]}]}
         self.assertEqual([x["w"] for x in extract.parse_json3(data)], ["hey", "you"])
