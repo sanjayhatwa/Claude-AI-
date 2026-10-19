@@ -19,8 +19,11 @@ What the edit does, driven by the words (transcribe.py) and the audio:
             calm, keeping 0.08-0.12 s of breath on each side), filler words
             (um, uh, er; "like", "so", "you know" only when pauses or an
             "um" isolate them; stutters such as "the the"), retakes (a
-            phrase restarted with the same 3+ words after a hesitation: the
-            last take is kept) and, with --max-duration, the lowest-value
+            phrase restarted with the same 3+ words after a pause, a cut
+            filler or a dash / ellipsis: the last take is kept; a sentence
+            or a comma-closed clause counts only when what it said comes
+            back, so "if you want views, if you want followers, ..." stays)
+            and, with --max-duration, the lowest-value
             sentences from the middle (no keywords, no numbers), never the
             hook or the ending. Word edges are first tightened against the audio, cut
             points snap to the quietest 10 ms nearby, and segments are

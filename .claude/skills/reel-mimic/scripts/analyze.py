@@ -15,8 +15,8 @@ Writes into --out:
 Results are cached per input (URL, or file content) in ~/.reelmimic/cache/analysis/: the same reference is analysed once.
 
 Lessons baked in (each one broke a real run):
-    - phone screen recordings: the video is a strip in the middle of a UI → cropdetect, then analyse the proxy
-    - stereo recordings with inverted phase cancel to silence when summed to mono → measure L, R and L+R separately
+    - phone screen recordings: the video is a strip in the middle of a UI -> cropdetect, then analyse the proxy
+    - stereo recordings with inverted phase cancel to silence when summed to mono -> measure L, R and L+R separately
     - loudness: normalise the chosen channel so beat tracking sees the music, not the noise floor
 """
 import argparse, hashlib, json, os, re, shutil, subprocess, sys, collections
@@ -119,6 +119,20 @@ def shots(path):
     return [[round(sec(a), 3), round(sec(b), 3)] for a, b in lst]
 
 
+def imwrite(path, img, params=()):
+    """cv2.imwrite for any path: on Windows OpenCV opens files in the ANSI code page, so a folder name
+    with Hindi or accented letters fails there, silently. Encoding in memory and writing with Python
+    works everywhere. Returns True when the file was written."""
+    import cv2
+    ok, buf = cv2.imencode(os.path.splitext(path)[1] or ".png", img, list(params))
+    if not ok:
+        print("could not encode", os.path.basename(path), file=sys.stderr)
+        return False
+    with open(path, "wb") as f:
+        f.write(buf.tobytes())
+    return True
+
+
 def sheets(path, dur, cuts, out):
     n = int(min(dur, 64)); cols = 8; rows = max(1, -(-n // cols))
     run(["ffmpeg", "-v", "error", "-y", "-i", path, "-vf", f"fps={n / dur:.5f},scale=300:-2,tile={cols}x{rows}", "-frames:v", "1",
@@ -141,7 +155,7 @@ def sheets(path, dur, cuts, out):
             h = tiles[0].shape[0]; tiles = [t if t.shape[0] == h else cv2.resize(t, (300, h)) for t in tiles]
             while len(tiles) % 8: tiles.append(np.zeros_like(tiles[0]))
             grid = np.vstack([np.hstack(tiles[r:r + 8]) for r in range(0, len(tiles), 8)])
-            cv2.imwrite(os.path.join(out, "sheet_scenes.jpg"), grid, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            imwrite(os.path.join(out, "sheet_scenes.jpg"), grid, [cv2.IMWRITE_JPEG_QUALITY, 85])
 
 
 def shot_details(path, cuts, dur):
@@ -160,7 +174,7 @@ def _shot_details_star(args): return _shot_details_part(*args)
 
 
 def _shot_details_part(path, spans, offset):
-    """Per shot: camera motion (optical flow → push/pull/pan/tilt/rotate/static + speed) and look (brightness, contrast,
+    """Per shot: camera motion (optical flow -> push/pull/pan/tilt/rotate/static + speed) and look (brightness, contrast,
     dark ratio, colourfulness, dominant colours). These numbers let the plan and the review match the reference shot by shot."""
     try:
         import numpy as np, cv2
@@ -194,7 +208,7 @@ def _shot_details_part(path, spans, offset):
         mv = {"pan_x": round(tx / W_ / span, 4), "tilt_y": round(ty / H_ / span, 4), "zoom": round(zoom / span, 4), "rotate": round(rot / span, 4)}
         kind = []
         if abs(mv["zoom"]) > 0.006: kind.append("push_in" if mv["zoom"] > 0 else "pull_out")
-        if abs(mv["pan_x"]) > 0.008: kind.append("move_left" if mv["pan_x"] > 0 else "move_right")   # content moves right → camera moves left
+        if abs(mv["pan_x"]) > 0.008: kind.append("move_left" if mv["pan_x"] > 0 else "move_right")   # content moves right -> camera moves left
         if abs(mv["tilt_y"]) > 0.008: kind.append("move_up" if mv["tilt_y"] > 0 else "move_down")
         if abs(mv["rotate"]) > 0.01: kind.append("roll/orbit")
         mv["kind"] = kind or ["static"]
@@ -312,7 +326,7 @@ def flashes(path, dur):
 
 
 def cache_key(src):
-    """URL → the URL; local file → its size plus the first and last 4 MB (the same file copied into another project hits)."""
+    """URL -> the URL; local file -> its size plus the first and last 4 MB (the same file copied into another project hits)."""
     h = hashlib.sha1(f"v{ANALYZE_VERSION}|".encode())
     if os.path.isfile(src):
         size = os.path.getsize(src); h.update(str(size).encode())
@@ -326,20 +340,31 @@ def cache_key(src):
 
 def summary(rep, out):
     info, crop, au = rep["video"], rep["crop"], rep["audio"]
-    print(f"video   {info['width']}x{info['height']} {info['fps']}fps {info['duration']:.1f}s" + (f"  crop → {crop['w']}x{crop['h']} ({crop['note']})" if crop else ""))
+    print(f"video   {info['width']}x{info['height']} {info['fps']}fps {info['duration']:.1f}s" + (f"  crop -> {crop['w']}x{crop['h']} ({crop['note']})" if crop else ""))
     print(f"shots   {rep['pacing']}")
     if rep.get("look_summary"): print(f"look    {rep['look_summary']}")
     if au.get("present") and not au.get("silent"):
         print(f"audio   {au['bpm']} bpm, first beat {au['first_beat']}s, noise floor {au['noise_floor_db']} dB, phase_inverted={au['phase_inverted']}")
         print(f"best 30s windows: {[c['start'] for c in au['best_30s_starts']]}")
-        print(f"peak candidates (build → hit): {[(p['t'], p['kind']) for p in au.get('peak_candidates', [])]}")
-    if rep.get("flashes"): print(f"flash frames: {rep['flashes']}")
-    elif au.get("silent"): print("audio   SILENT —", au["note"])
+        print(f"peak candidates (build -> hit): {[(p['t'], p['kind']) for p in au.get('peak_candidates', [])]}")
+    elif au.get("silent"): print("audio   SILENT -", au["note"])
     else: print("audio   none")
+    if rep.get("flashes"): print(f"flash frames: {rep['flashes']}")
     print("wrote", os.path.join(out, "report.json"))
 
 
+def _safe_stdio():
+    """Never die on printing: Windows writes piped stdout as cp1252, which cannot encode many titles,
+    paths or notes; a character it cannot show becomes '?' instead of a crash after the work is done."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main():
+    _safe_stdio()
     ap = argparse.ArgumentParser()
     ap.add_argument("src"); ap.add_argument("--out", required=True)
     ap.add_argument("--no-cache", action="store_true")

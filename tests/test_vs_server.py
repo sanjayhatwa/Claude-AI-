@@ -7,11 +7,14 @@ renders video or needs the network. The last test drives the page in a headless
 browser (Python Playwright, or Node Playwright with a preinstalled Chromium) and
 is skipped when neither is available."""
 
+import errno
 import http.client
 import importlib.util
+import io
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -20,6 +23,7 @@ import time
 import types
 import unittest
 import urllib.parse
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -75,6 +79,20 @@ def make_project(root, pid="p1"):
     os.makedirs(os.path.join(path, "jobs"), exist_ok=True)
     jobs.write_json(os.path.join(path, "project.json"), {"id": pid, "name": pid, "created": 1, "updated": 1})
     return path
+
+
+def fake_llm_module(answer, available=True):
+    """A stand-in vstudio.llm whose complete_json returns `answer` (or answer(prompt)); prompts land in .calls."""
+    mod = types.ModuleType("vstudio.llm")
+    mod.LLMUnavailable = type("LLMUnavailable", (Exception,), {})
+    mod.calls = []
+    mod.available = lambda: available
+
+    def complete_json(prompt, schema=None, system=None, timeout=900, retries=2):
+        mod.calls.append(prompt)
+        return answer(prompt) if callable(answer) else answer
+    mod.complete_json = complete_json
+    return mod
 
 
 # ----------------------------------------------------------------------------- pure functions
@@ -133,6 +151,44 @@ class PureFunctionTest(unittest.TestCase):
         self.assertEqual(server.parse_range("bytes=5-2", 100), "ignore")
         self.assertEqual(server.parse_range("items=0-1", 100), "ignore")
         self.assertEqual(server.parse_range("bytes=0-1,5-6", 100), "ignore")
+        # more digits than int() converts (4300) answer like any huge number, never a ValueError
+        huge = "9" * 5000
+        self.assertIsNone(server.parse_range("bytes=%s-" % huge, 100))
+        self.assertEqual(server.parse_range("bytes=0-%s" % huge, 100), (0, 99))
+        self.assertEqual(server.parse_range("bytes=-%s" % huge, 100), (0, 99))
+        self.assertEqual(server.parse_range("bytes=\u00b2-", 100), "ignore")
+
+    def test_parse_count(self):
+        self.assertEqual(server.parse_count("42"), 42)
+        self.assertEqual(server.parse_count(" 7 "), 7)
+        for bad in [None, "", "\u00b2", "\u0663", "-1", "1e3", "0x10", "9" * 5000]:
+            self.assertIsNone(server.parse_count(bad), repr(bad))
+
+    def test_upload_names_fit_in_bytes_and_path_length(self):
+        # 112 Devanagari letters are 336 bytes in UTF-8: over the 255-byte limit of macOS and Linux disks
+        name = server.clean_upload_name("\u0915" * 112 + ".mp4")
+        self.assertTrue(name.endswith(".mp4"))
+        self.assertLessEqual(len(name.encode("utf-8")), server.MAX_NAME_BYTES)
+        self.assertLessEqual(len(server.clean_upload_name("\U0001F600" * 100 + ".mov").encode("utf-8")), server.MAX_NAME_BYTES)
+        # Windows without long paths: the whole path, " (99)" included, stays under the limit
+        folder = os.path.join(self.tmp, "uploads")
+        limit = len(folder) + 40
+        fitted = server.fit_upload_name(folder, "a" * 100 + ".mp4", max_path=limit)
+        self.assertTrue(fitted.endswith(".mp4"))
+        self.assertLessEqual(len(os.path.join(folder, fitted)) + len(" (99)"), limit)
+        self.assertEqual(server.fit_upload_name(folder, "short.mp4", max_path=limit), "short.mp4")
+        self.assertEqual(server.fit_upload_name(folder, "a" * 300 + ".mp4", max_path=None), "a" * 300 + ".mp4")
+        with self.assertRaises(server.ApiError):
+            server.fit_upload_name(folder, "clip.mp4", max_path=len(folder) + 4)
+
+    def test_windows_wrapper_check_uses_creation_time(self):
+        procs = {7: ("C:\\Python312\\python.exe", 1111), 8: ("C:\\Windows\\notepad.exe", 5)}
+        with mock.patch.object(jobs, "_windows_process", lambda pid: procs.get(pid)):
+            self.assertTrue(jobs._windows_alive(7, 1111))
+            self.assertFalse(jobs._windows_alive(7, 2222), "a python.exe that got the pid later is not the wrapper")
+            self.assertTrue(jobs._windows_alive(7, None), "records from before creation times were kept")
+            self.assertFalse(jobs._windows_alive(8, None))
+            self.assertFalse(jobs._windows_alive(9, 1111))
 
     def test_host_allowed(self):
         for ok in ["127.0.0.1:4320", "localhost:4320", "localhost", "[::1]:4320", "studio.localhost:4320", "192.168.1.5:4320", None]:
@@ -304,6 +360,65 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(r.get(ids[2])["queue_position"], 1)
         for i in ids:
             self.assertEqual(r.wait(i, 15)["status"], "done")
+
+    def test_restart_rebuilds_queued_commands_from_kind_and_args(self):
+        a = self.runner()
+        first = a.submit("p1", "render", {"sleep": 1.0})
+        second = a.submit("p1", "render", {"sleep": 0})
+        third = a.submit("p1", "render", {"sleep": 0})
+        a.close()
+        marker = os.path.join(self.tmp, "PWNED")
+        jdir = os.path.join(self.tmp, "projects", "p1", "jobs")
+        record = jobs.read_json(os.path.join(jdir, second["id"], "job.json"))
+        record.update(steps=[[sys.executable, "-c", "open(%r, 'w').write('ran')" % marker]], cwd=self.tmp, light=True)
+        jobs.write_json(os.path.join(jdir, second["id"], "job.json"), record)
+        record = jobs.read_json(os.path.join(jdir, third["id"], "job.json"))
+        record.update(args={"spec": "../../../etc/passwd"})
+        jobs.write_json(os.path.join(jdir, third["id"], "job.json"), record)
+        b = self.runner()
+        self.assertEqual(b.get(third["id"])["status"], "failed", "args that no longer pass the checks do not run")
+        self.assertEqual(b.wait(second["id"], 15)["status"], "done")
+        self.assertFalse(os.path.exists(marker), "a queued job's commands come from its kind's builder, not from job.json")
+        self.assertIn("result.txt", [o["name"] for o in b.get(second["id"])["outputs"]])
+        self.assertEqual(b.wait(first["id"], 15)["status"], "done")
+
+    def test_runner_keeps_the_wrapper_creation_time(self):
+        with mock.patch.object(jobs, "process_created", lambda pid: 4242):
+            a = self.runner()
+            job = a.submit("p1", "render", {"sleep": 1.0})
+        record = jobs.read_json(os.path.join(self.tmp, "projects", "p1", "jobs", job["id"], "job.json"))
+        self.assertEqual(record["pid_created"], 4242)
+        a.close()
+        seen = []
+        real = jobs.wrapper_alive
+        with mock.patch.object(jobs, "wrapper_alive", lambda pid, jid, created=None: seen.append(created) or real(pid, jid, created)):
+            b = self.runner()
+        self.assertIn(4242, seen, "restart recovery checks the process by pid and creation time")
+        self.assertEqual(b.wait(job["id"], 15)["status"], "done")
+
+    def test_wrapper_lines_append_even_through_a_non_append_stdout(self):
+        # On Windows a child does not inherit append mode: its stdout writes at its own position.
+        # A plain read/write handle at the end of the file behaves the same way on every platform.
+        jdir = os.path.join(self.tmp, "wrapped")
+        os.makedirs(jdir)
+        steps = [[sys.executable, "-c", "print('first-step-' + 'output')"],      # the command line differs from
+                 [sys.executable, "-c", "print('second-step-' + 'output')"]]     # what it prints
+        jobs.write_json(os.path.join(jdir, "job.json"), {"id": "x", "kind": "render", "steps": steps, "cwd": ROOT})
+        log = os.path.join(jdir, "log.txt")
+        with open(log, "wb"):
+            pass
+        with open(log, "r+b") as out:
+            out.seek(0, os.SEEK_END)
+            r = subprocess.run([sys.executable, "-m", "vstudio.jobs", "exec", jdir], stdout=out, stderr=subprocess.STDOUT,
+                               cwd=ROOT, env=jobs.job_env(), timeout=60)
+        self.assertEqual(r.returncode, 0)
+        with open(log, encoding="utf-8") as f:
+            text = f.read()
+        needles = ["== render job x started", "== step 1/2", "first-step-output", "== step 2/2",
+                   "second-step-output", "== exit 0"]
+        for n in needles:
+            self.assertIn(n, text)
+        self.assertEqual([text.index(n) for n in needles], sorted(text.index(n) for n in needles), text)
 
 
 # ----------------------------------------------------------------------------- the HTTP server
@@ -671,6 +786,107 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(any("outside the project" in e for e in data["errors"]), data["errors"])
         self.assertFalse(os.path.exists(os.path.join(self.pdir(), "uploads", "ask3.v2.json")))
 
+    @unittest.skipIf(timeline is None, "timeline module not available")
+    def test_ask_cannot_reach_home_folder_or_font_files_outside_the_project(self):
+        home = os.path.join(self.tmp, "home")
+        os.makedirs(home, exist_ok=True)
+        for name in ("private.png", "secret.ttf"):
+            with open(os.path.join(home, name), "wb") as f:
+                f.write(b"x")
+        with open(os.path.join(self.pdir(), "uploads", "brand.ttf"), "wb") as f:
+            f.write(b"x")
+        words = [{"w": "HI", "start": 0.0, "end": 0.5}]
+        cases = {
+            "home_src": lambda s: s["layers"].append({"type": "image", "src": "~/private.png", "start": 0, "end": 1}),
+            "font_abs": lambda s: s["layers"][0].update(font=os.path.join(home, "secret.ttf")),
+            "font_home": lambda s: s["layers"][0].update(font="~/secret.ttf"),
+            "caption_font": lambda s: s.update(captions={"words": words, "font": os.path.join(home, "secret.ttf")}),
+            "caption_candidates": lambda s: s.update(captions={"words": words, "style": {
+                "font_candidates": [os.path.join(home, "secret.ttf")]}}),
+        }
+        with mock.patch.dict(os.environ, {"HOME": home, "USERPROFILE": home}):
+            for name, change in cases.items():
+                path = self.put_spec(VALID_SPEC, "ask_%s.json" % name)
+                sneaky = json.loads(json.dumps(VALID_SPEC))
+                change(sneaky)
+                self.with_llm(fake_llm_module({"summary": "added a logo", "spec": sneaky}))
+                status, _, data = self.call("POST", "/api/projects/%s/ask" % self.pid, {"message": "logo", "spec_path": path})
+                self.assertEqual(status, 422, name)
+                self.assertTrue(any("outside the project" in e for e in data["errors"]), (name, data["errors"]))
+                self.assertFalse(os.path.exists(os.path.join(self.pdir(), "uploads", "ask_%s.v2.json" % name)), name)
+            # a font file that is in the project is fine
+            path = self.put_spec(VALID_SPEC, "ask_font_ok.json")
+            ok = json.loads(json.dumps(VALID_SPEC))
+            ok["layers"][0]["font"] = "brand.ttf"
+            self.with_llm(fake_llm_module({"summary": "brand font", "spec": ok}))
+            status, _, data = self.call("POST", "/api/projects/%s/ask" % self.pid, {"message": "font", "spec_path": path})
+            self.assertEqual(status, 200, data)
+
+    def test_bookkeeping_files_are_protected_in_any_case(self):
+        job = self.submit("render", {"sleep": 0})[2]
+        self.wait_job(job["id"])
+        jid = job["id"]
+        url = "/api/projects/%s/spec?path=%%s" % self.pid
+        for rel in ["project.json", "PROJECT.JSON", "Project.Json", "Chat.JSON", "x.json",
+                    "jobs/%s/JOB.JSON" % jid, "jobs/%s/Job.json" % jid, "jobs/%s/Exit.json" % jid,
+                    "jobs/%s/other.json" % jid]:
+            status, _, data = self.call("PUT", url % urllib.parse.quote(rel), VALID_SPEC)
+            self.assertEqual(status, 403, (rel, data))
+        for rel in ["jobs/%s/JOB.JSON" % jid, "PROJECT.json"]:
+            self.assertEqual(self.call("GET", url % urllib.parse.quote(rel))[0], 403, rel)
+        names = os.listdir(os.path.join(self.pdir(), "jobs", jid))
+        self.assertEqual(sorted(n for n in names if n.lower().endswith(".json")), ["exit.json", "job.json"])
+        self.assertEqual(jobs.read_json(os.path.join(self.pdir(), "jobs", jid, "job.json"))["id"], jid)
+        self.assertEqual(self.call("PUT", url % ("jobs/%s/out/spec.json" % jid), VALID_SPEC)[0], 200)
+        self.assertEqual(self.call("PUT", url % "uploads/fine.json", VALID_SPEC)[0], 200)
+
+    # ---- odd numbers in headers and queries
+
+    def raw(self, request):
+        """Send raw bytes; returns the status code of the answer (None when the connection just closed)."""
+        with socket.create_connection(("127.0.0.1", self.port), timeout=10) as s:
+            s.sendall(request)
+            data = b""
+            while True:
+                try:
+                    chunk = s.recv(65536)
+                except (ConnectionResetError, socket.timeout):
+                    break
+                if not chunk:
+                    break
+                data += chunk
+        while data.startswith(b"HTTP/1.1 100"):           # skip an interim "100 Continue"
+            data = data.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in data else b""
+        line = data.split(b"\r\n", 1)[0].split()
+        return int(line[1]) if len(line) > 1 and line[1].isdigit() else None
+
+    def test_odd_numbers_in_headers_and_queries(self):
+        host = b"Host: 127.0.0.1:%d\r\nConnection: close\r\n" % self.port
+        # '\xb2' is a superscript two: str.isdigit() says yes, int() says no
+        self.assertEqual(self.raw(b"POST /api/projects HTTP/1.1\r\n" + host + b"Content-Length: \xb2\r\n\r\n"), 411)
+        self.assertEqual(self.raw(b"GET /nope HTTP/1.1\r\n" + host + b"Content-Length: \xb2\r\n\r\n"), 404)
+        self.assertEqual(self.raw(b"PUT /api/projects/%s/upload?name=a.bin HTTP/1.1\r\n" % self.pid.encode() + host +
+                                  b"Expect: 100-continue\r\nContent-Length: \xb2\r\n\r\n"), 411)
+        self.upload("range.mp4", b"0123456789")
+        self.assertEqual(self.raw(b"GET /files/%s/uploads/range.mp4 HTTP/1.1\r\n" % self.pid.encode() + host +
+                                  b"Range: bytes=" + b"9" * 5000 + b"-\r\n\r\n"), 416)
+        self.assertEqual(self.call("GET", "/api/jobs?limit=%C2%B2")[0], 200)
+        job = self.submit("render", {"sleep": 0})[2]
+        self.wait_job(job["id"])
+        status, _, data = self.call("GET", "/api/jobs/%s/log?offset=%%C2%%B2" % job["id"])
+        self.assertEqual(status, 200)
+        self.assertIn("== exit 0", data["text"])
+
+    def test_long_non_ascii_upload_name(self):
+        name = "कुछ " * 40 + ".mp4"           # 160 characters, 400+ bytes in UTF-8
+        status, _, info = self.upload(name, b"abc")
+        self.assertEqual(status, 201, info)
+        self.assertTrue(info["name"].endswith(".mp4"))
+        status, _, again = self.upload(name, b"abc")
+        self.assertEqual(status, 201, again)
+        self.assertTrue(again["name"].endswith(" (2).mp4"))
+        self.assertTrue(os.path.isfile(os.path.join(self.pdir(), "uploads", again["name"])))
+
     # ---- catalog and doctor
 
     @unittest.skipIf(templates is None, "templates module not available")
@@ -685,6 +901,166 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIsInstance(data, list)
         self.assertIn("ffmpeg", [c["name"] for c in data])
+
+
+class StudioStateTest(unittest.TestCase):
+    """The Studio object without HTTP: symlinked workspaces, partial uploads, disk errors, Windows file locks."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="vs_state_")
+        self.studios = []
+        self.old_llm = sys.modules.get("vstudio.llm")
+
+    def tearDown(self):
+        for st in self.studios:
+            st.runner.close(cancel_running=True)
+        if self.old_llm is None:
+            sys.modules.pop("vstudio.llm", None)
+        else:
+            sys.modules["vstudio.llm"] = self.old_llm
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def studio(self, workspace=None):
+        st = server.Studio(workspace or os.path.join(self.tmp, "ws"), quiet=True, builder=fake_builder)
+        self.studios.append(st)
+        return st
+
+    def round_trip(self, st, pid):
+        """Every path the spec API hands out is project-relative and opens again."""
+        self.assertEqual(st.write_spec(pid, "uploads/s.json", VALID_SPEC)["path"], "uploads/s.json")
+        data = st.read_spec(pid, "uploads/s.json")
+        self.assertEqual(data["path"], "uploads/s.json")
+        self.assertEqual([v["path"] for v in data["versions"]], ["uploads/s.json"])
+        self.assertEqual(st.read_spec(pid, data["path"])["path"], "uploads/s.json")
+        saved = st.write_spec(pid, data["path"], VALID_SPEC, new_version=True)
+        self.assertEqual(saved["path"], "uploads/s.v2.json")
+        self.assertEqual([v["path"] for v in st.read_spec(pid, saved["path"])["versions"]],
+                         ["uploads/s.json", "uploads/s.v2.json"])
+        with open(os.path.join(st.project_dir(pid), "uploads", "clip.mp4"), "wb") as f:
+            f.write(b"x")
+        self.assertIn("uploads/clip.mp4", [m["path"] for m in st.read_spec(pid, "uploads/s.json")["renders"]])
+        self.assertIn("uploads/s.v2.json", [s["path"] for s in st.find_specs(pid)])
+        changed = json.loads(json.dumps(VALID_SPEC))
+        changed["layers"][0]["text"] = "HELLO"
+        sys.modules["vstudio.llm"] = fake_llm_module({"summary": "said hello", "spec": changed})
+        asked = st.ask(pid, "say hello", "uploads/s.json")
+        self.assertEqual(asked["path"], "uploads/s.v3.json")
+        self.assertIn("# Current spec (uploads/s.json)", sys.modules["vstudio.llm"].calls[0])
+        self.assertIn("- clip.mp4 (video", sys.modules["vstudio.llm"].calls[0])
+
+    @unittest.skipIf(os.name == "nt", "symlinks need extra rights on Windows")
+    def test_workspace_behind_a_symlink(self):
+        real = os.path.join(self.tmp, "private", "var")         # like macOS /var -> /private/var
+        os.makedirs(real)
+        os.symlink(real, os.path.join(self.tmp, "var"))
+        st = self.studio(os.path.join(self.tmp, "var", "ws"))
+        self.round_trip(st, st.create_project("x")["id"])
+
+    @unittest.skipIf(os.name == "nt", "symlinks need extra rights on Windows")
+    def test_project_folder_linked_from_another_drive(self):
+        st = self.studio()
+        pid = st.create_project("x")["id"]
+        pdir = os.path.join(st.projects_dir, pid)
+        moved = os.path.join(self.tmp, "external", pid)
+        os.makedirs(os.path.dirname(moved))
+        shutil.move(pdir, moved)
+        os.symlink(moved, pdir)
+        self.round_trip(st, pid)
+
+    def test_stale_partial_uploads_are_removed_at_start(self):
+        st = self.studio()
+        pid = st.create_project("x")["id"]
+        up = os.path.join(st.project_dir(pid), "uploads")
+        stale, fresh, other = (os.path.join(up, n) for n in (".upload-aaaaaaaaaaaa.part", ".upload-bbbbbbbbbbbb.part",
+                                                              "keep.part"))
+        for p in (stale, fresh, other):
+            with open(p, "wb") as f:
+                f.write(b"x" * 100)
+        old = time.time() - 3600
+        os.utime(stale, (old, old))
+        os.utime(other, (old, old))
+        self.studio()                                       # the studio starts again on the same workspace
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.exists(fresh), "an upload that is still being written is left alone")
+        self.assertTrue(os.path.exists(other), "only the studio's own temp files are removed")
+
+    def test_uploads_in_flight_are_removed_at_shutdown(self):
+        st = self.studio()
+        pid = st.create_project("x")["id"]
+        gate, started = threading.Event(), threading.Event()
+
+        class Slow(io.RawIOBase):
+            sent = False
+
+            def read(self, n=-1):
+                if not self.sent:
+                    self.sent = True
+                    return b"x" * 10
+                started.set()
+                gate.wait(10)
+                return b""
+
+        errors = []
+        t = threading.Thread(target=lambda: errors.append(self._try(st.save_upload, pid, "big.mp4", Slow(), 1000)))
+        t.start()
+        self.assertTrue(started.wait(10))
+        up = os.path.join(st.project_dir(pid), "uploads")
+        self.assertEqual(len([n for n in os.listdir(up) if n.endswith(".part")]), 1)
+        st.drop_inflight_uploads()
+        self.assertEqual([n for n in os.listdir(up) if n.endswith(".part")], [])
+        gate.set()
+        t.join(10)
+        self.assertFalse(os.path.exists(os.path.join(up, "big.mp4")))
+
+    @staticmethod
+    def _try(fn, *args):
+        try:
+            return fn(*args)
+        except Exception as e:
+            return e
+
+    def test_disk_full_during_upload_is_a_clear_error(self):
+        st = self.studio()
+        pid = st.create_project("x")["id"]
+        real_open = open
+
+        class Full(io.BytesIO):
+            def write(self, b):
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+        def fake_open(path, mode="r", *a, **kw):
+            if os.path.basename(str(path)).startswith(".upload-"):
+                real_open(path, mode, *a, **kw).close()
+                return Full()
+            return real_open(path, mode, *a, **kw)
+
+        with mock.patch("vstudio.server.open", fake_open, create=True):
+            with self.assertRaises(server.ApiError) as cm:
+                st.save_upload(pid, "a.mp4", io.BytesIO(b"x" * 10), 10)
+        self.assertEqual(cm.exception.status, 507)
+        self.assertIn("disk", cm.exception.message)
+        self.assertEqual(os.listdir(os.path.join(st.project_dir(pid), "uploads")), [])
+        self.assertEqual(server.save_error(OSError(errno.ENAMETOOLONG, "File name too long"), "x.mp4").status, 400)
+
+    def test_replace_waits_while_windows_holds_the_file(self):
+        st = self.studio()
+        pid = st.create_project("x")["id"]
+        real = os.replace
+        failures = []
+
+        def held(src, dst):
+            if os.path.basename(dst) in ("s.json", "c.mp4") and len([f for f in failures if f == dst]) < 3:
+                failures.append(dst)
+                raise PermissionError(13, "The process cannot access the file because it is being used")
+            return real(src, dst)
+
+        with mock.patch("os.replace", held):
+            self.assertTrue(st.write_spec(pid, "uploads/s.json", VALID_SPEC)["saved"])
+            info = st.save_upload(pid, "c.mp4", io.BytesIO(b"abc"), 3)
+        self.assertEqual(len(failures), 6)
+        self.assertEqual(info["name"], "c.mp4")
+        up = os.path.join(st.project_dir(pid), "uploads")
+        self.assertEqual(sorted(os.listdir(up)), ["c.mp4", "s.json"])
 
 
 class ScriptJobTest(unittest.TestCase):

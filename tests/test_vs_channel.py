@@ -134,6 +134,59 @@ class FakeFetch:
         return dst
 
 
+class MiniFetch:
+    """A small YouTube channel built inside a test: long-form only, metadata from `meta`; a lookup
+    for a video not in `meta` fails with errors.get(id) (default: no answer)."""
+
+    online = False
+
+    def __init__(self, entries, meta, errors=None, chinfo=None):
+        self.entries, self.meta, self.errors = entries, meta, errors or {}
+        self.chinfo = chinfo or {"channel": "Test Chan", "channel_id": "UCtest", "uploader_id": "@test"}
+        self.last_error = None
+        self.calls = collections.Counter()
+
+    def list_channel(self, url, tab, limit):
+        self.calls["list"] += 1
+        if tab != "videos":
+            self.last_error = "ERROR: [youtube:tab] Test Chan: This channel does not have a %s tab" % tab
+            return None
+        return dict(self.chinfo, title="Test Chan - Videos", entries=self.entries[:limit])
+
+    def video_meta(self, url):
+        self.calls["meta"] += 1
+        vid = re.search(r"v=([\w-]{11})", url).group(1)
+        if vid in self.meta:
+            self.last_error = None
+            return self.meta[vid]
+        self.last_error = self.errors.get(vid, "ERROR: no answer")
+        return None
+
+    def download_thumb(self, url, path):
+        return None
+
+    def download_clip(self, url, path, seconds):
+        return None
+
+    def captions(self, url, dir):
+        return None
+
+
+def mini_channel(views, title="Lesson %d on piano scales", **extra):
+    """(entries, meta) for long-form videos with these views, newest first, one every 3 days."""
+    import datetime
+    entries, meta = [], {}
+    for i, v in enumerate(views):
+        vid = ("V%010d" % i)[:11]
+        t = title % i
+        entries.append(dict({"id": vid, "url": "https://www.youtube.com/watch?v=" + vid, "title": t,
+                             "view_count": v, "duration": 600}, **extra.get("entry", {})))
+        meta[vid] = {"title": t, "view_count": v, "like_count": 10, "comment_count": 1, "duration": 600,
+                     "upload_date": (datetime.date(2026, 10, 1) - datetime.timedelta(days=3 * i)).strftime("%Y%m%d"),
+                     "tags": [], "description": ""}
+    return entries, meta
+
+
 def thumbs_for_fixture(folder):
     with open(os.path.join(FIX, "kitchenlab.json"), encoding="utf-8") as f:
         data = json.load(f)
@@ -385,6 +438,20 @@ class TestTitlesAndTopics(unittest.TestCase):
         self.assertIn("ラーメン", labels)   # ramen
         self.assertIn("料理", labels)               # cooking
 
+    def test_reach_hashtags_are_not_topics(self):
+        caps = ["easy pasta dinner", "pasta carbonara the right way", "garlic bread hack", "garlic bread in air fryer",
+                "chocolate mug cake", "mug cake in 1 minute", "smash burger tutorial", "smash burger sauce"]
+        junk = ["#fyp #viral", "#foryoupage #trending", "#fyp #foryou", "#viral #xyzbca", "#fypシ #parati",
+                "#explorepage #reelsinstagram", "#viralvideo #capcut", "#foryou #fyp"]
+        recs = [{"id": str(i), "title": "%s %s #food" % (c, junk[i % len(junk)]), "tags": [], "format": "short",
+                 "description": "", "recency": i / 7.0} for i, c in enumerate(caps)]
+        topics = quiet(channel.topic_model, recs)
+        words = " ".join(t["label"] + " " + " ".join(t["keywords"]) for t in topics)
+        for bad in ("fyp", "viral", "foryou", "foryoupage", "trending", "xyzbca", "explorepage", "capcut", "parati"):
+            self.assertNotIn(bad, words.split(), topics)
+        labels = {t["label"] for t in topics}
+        self.assertTrue({"smash burger", "mug cake", "garlic bread"} <= labels, labels)
+
     def test_over_index(self):
         recs = [{"multiple": m, "flag": m > 2} for m in (5, 4, 3, 1, 1, 0.9, 0.8, 0.5, 0.4, 0.3)]
         res = channel.over_index(recs, [("flag", "flag", lambda r: r["flag"])])
@@ -399,6 +466,66 @@ class TestTitlesAndTopics(unittest.TestCase):
         self.assertAlmostEqual(c["per_format"]["long"]["per_week"], 1.0)
         self.assertEqual(c["top_days"], ["Tue"])
         self.assertEqual(c["per_format"]["long"]["last_upload_days_ago"], 2)
+
+
+class TestReportWording(unittest.TestCase):
+    def test_numbers(self):
+        self.assertEqual(channel._n(999950), "1M")          # not "1000K"
+        self.assertEqual(channel._n(1e9 - 1), "1B")         # not "1000M"
+        self.assertEqual(channel._n(999949), "999.9K")
+        self.assertEqual(channel._n(1234567), "1.2M")
+        self.assertEqual(channel._n(999.6), "1K")
+        self.assertEqual(channel._n(42), "42")
+
+    def test_even_number_of_dives_gives_whole_wpm(self):
+        def dive(wpm, first, energy):
+            return {"id": "v%d" % wpm, "format": "short", "status": "ok", "title": "t", "multiple": 3.0,
+                    "dialogue": {"wpm": wpm, "wpm_first_10s": first, "time_to_first_word_s": 0.2,
+                                 "sentences": {"mean_words": 7.0, "short_share": 0.3},
+                                 "rehooks": {"mean_gap_s": 4.0}, "per_100_words": {"you": 3.0}},
+                    "energy": {"score": energy, "label": "medium"}, "edit": {"cuts_per_10s": 2.0}}
+        ds = channel.deep_summary([dive(170, 180, 60), dive(182, 185, 63)])["short"]
+        self.assertEqual((ds["wpm"], ds["wpm_first_10s"], ds["energy"]), (176, 182, 62))
+        self.assertIsInstance(ds["wpm"], int)
+        ch = channel._new_channel("x", "youtube")
+        ch["deep_summary"] = {"short": ds}
+        text = " ".join(channel.playbook(ch) + channel.executive_summary(ch))
+        self.assertIn("176 wpm", text)
+        self.assertNotIn(".0 wpm", text)
+
+    def test_urls_in_commands_are_quoted(self):
+        self.assertEqual(channel._q("https://www.youtube.com/watch?v=abcdefghijk"),
+                         '"https://www.youtube.com/watch?v=abcdefghijk"')
+        self.assertEqual(channel._arg("/tmp/my dir", "a.mp4"), '"%s"' % os.path.normpath("/tmp/my dir/a.mp4"))
+
+    @unittest.skipUnless(HAVE_FFMPEG, "needs ffmpeg")
+    def test_whisper_failure_is_not_called_silence(self):
+        from unittest import mock
+        from vstudio import paths
+        tmp = tempfile.mkdtemp(prefix="vs_whisper_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        clip = make_clip(os.path.join(tmp, "c.mp4"))
+
+        class F(FakeFetch):
+            def captions(self, url, dir):
+                return None
+
+        ex = paths.load_skill("extract")
+        real_find = importlib.util.find_spec
+        find = lambda name, *a: object() if name == "faster_whisper" else real_find(name, *a)
+
+        def boom(*a, **kw):
+            raise RuntimeError("HTTP Error 403: Forbidden")
+
+        r = {"id": "abcdefghijk", "format": "short", "url": "https://www.youtube.com/shorts/abcdefghijk",
+             "title": "t", "views": 1000, "multiple": 2.0}
+        with mock.patch.object(channel.importlib.util, "find_spec", find), \
+                mock.patch.object(ex, "whisper_words", boom), mock.patch.object(ex, "text_dna", lambda *a, **k: (None, [])), \
+                mock.patch.object(channel, "_edit_report", lambda *a: (None, "skipped")):
+            d = quiet(channel.deep_dive, r, F(tmp, clip), tmp, None)
+        notes = " | ".join(d["notes"])
+        self.assertIn("403", notes)
+        self.assertNotIn("heard no speech", notes)
 
 
 class TestEnergyAndType(unittest.TestCase):
@@ -499,6 +626,34 @@ class TestThumbs(unittest.TestCase):
         self.assertAlmostEqual(t["aspect"], 480 / 270.0, delta=0.05)
         self.assertEqual(t["dominant_hue"], "red")
 
+    def test_dark_designs_are_not_trimmed(self):
+        import numpy as np
+        from PIL import Image, ImageDraw
+        # a 16:9 thumbnail (maxresdefault) with a near-black design and a bright subject: nothing to trim
+        im = Image.new("RGB", (1280, 720), (8, 8, 10))
+        ImageDraw.Draw(im).rectangle((480, 200, 800, 520), fill=(240, 200, 60))
+        p = os.path.join(self.tmp, "dark_design.jpg")
+        im.save(p, quality=95)
+        t = thumbs.analyze_thumb(p, ocr=False, faces=False)
+        self.assertAlmostEqual(t["aspect"], 16 / 9.0, delta=0.02)
+        whole = np.asarray(im.convert("L"), dtype="float32").mean() / 255.0
+        self.assertAlmostEqual(t["brightness"], whole, delta=0.04)
+        self.assertLess(t["brightness"], 0.35)                      # the "dark" trait can fire
+        # the same design as hqdefault (480x360): only YouTube's 45 px bars go, the dark design stays
+        hq = Image.new("RGB", (480, 360), (0, 0, 0))
+        hq.paste(im.resize((480, 270)), (0, 45))
+        p = os.path.join(self.tmp, "dark_hq.jpg")
+        hq.save(p, quality=95)
+        t = thumbs.analyze_thumb(p, ocr=False, faces=False)
+        self.assertAlmostEqual(t["aspect"], 16 / 9.0, delta=0.03)
+        self.assertLess(t["brightness"], 0.35)
+        # a vertical video's hqdefault: pillarbox bars beside a 9:16 picture
+        pb = Image.new("RGB", (480, 360), (0, 0, 0))
+        ImageDraw.Draw(pb).rectangle((139, 0, 340, 359), fill=(60, 140, 220))
+        p = os.path.join(self.tmp, "pillar.jpg")
+        pb.save(p, quality=95)
+        self.assertAlmostEqual(thumbs.analyze_thumb(p, ocr=False, faces=False)["aspect"], 9 / 16.0, delta=0.03)
+
     def test_text_colors_outline(self):
         if not HAVE_OCR:
             self.skipTest("needs rapidocr")
@@ -524,6 +679,25 @@ class TestThumbs(unittest.TestCase):
             self.assertEqual(im.width, 10 + 3 * 330)
             self.assertGreater(im.height, 2 * 180)
         self.assertEqual(thumbs.sheet([], os.path.join(self.tmp, "none.jpg")), "")
+
+    def test_sheet_labels_in_other_scripts(self):
+        """Inter has no Devanagari or CJK: those characters must come from a font that has them."""
+        from vstudio import fonts
+        hindi = "आसान चिकन करी"
+        found, _ = fonts.glyph_fallbacks("Inter Regular", hindi)
+        if not found:
+            self.skipTest("no installed font has Devanagari (or Inter is missing)")
+        runs = quiet(thumbs._runs, "6.2x " + hindi, 13, "Regular")
+        primary = thumbs._font(13, "Regular")
+        deva = [f for t, f in runs if any("ऀ" <= c <= "ॿ" for c in t)]
+        self.assertTrue(deva and all(f is not primary for f in deva), runs)
+        # vowel signs stay in the run of their consonant (shaped together)
+        self.assertTrue(any("चि" in t for t, _ in runs), runs)
+        p = os.path.join(self.tmp, "s_hi.jpg")
+        draw_thumb(p, "x", True)
+        out = quiet(thumbs.sheet, [p], os.path.join(self.tmp, "sheet_hi.jpg"), labels=["6.2x\n" + hindi],
+                    title="चैनल: 料理")
+        self.assertTrue(os.path.isfile(out))
 
     def test_faces_with_a_detector(self):
         """The face path, with a stand-in for cv2.FaceDetectorYN (same setInputSize/detect interface)."""
@@ -559,6 +733,168 @@ class TestThumbs(unittest.TestCase):
         finally:
             if old:
                 os.environ["VSTUDIO_FACE_MODEL"] = old
+
+
+class TestSyntheticChannels(unittest.TestCase):
+    """analyze() on small channels built in the test (MiniFetch)."""
+
+    def run_analyze(self, fetch, urls=("@test",), **kw):
+        tmp = tempfile.mkdtemp(prefix="vs_channel_syn_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        kw.setdefault("deep", 0)
+        data = quiet(channel.analyze, list(urls), tmp, fetch=fetch, **kw)
+        with open(os.path.join(tmp, "CHANNEL_DNA.md"), encoding="utf-8") as f:
+            return data, f.read()
+
+    def test_members_only_videos_are_skipped_not_a_reason_to_stop(self):
+        entries, meta = mini_channel([10000 + 500 * i for i in range(40)])
+        locked = [e["id"] for e in entries[:5]]   # the 5 newest: members-only
+        for v in locked:
+            meta.pop(v)
+        errors = {v: "ERROR: [youtube] %s: Join this channel to get access to members-only content like this video, "
+                     "and other exclusive perks." % v for v in locked}
+        data, md = self.run_analyze(MiniFetch(entries, meta, errors), max_videos=30)
+        ch = data["channels"][0]
+        self.assertEqual(ch["status"], "ok")
+        self.assertEqual(ch["metadata"]["looked_up"], 35)
+        self.assertGreater(ch["cadence"]["dated"], 20)
+        self.assertFalse([g for g in ch["gaps"] if "kept failing" in g])
+        self.assertTrue([g for g in ch["gaps"] if "members-only" in g])
+
+    def test_flat_availability_skips_the_lookup(self):
+        entries, meta = mini_channel([10000 + 500 * i for i in range(12)])
+        for e in entries[:3]:
+            e["availability"] = "subscriber_only"
+        fetch = MiniFetch(entries, meta)
+        ch = self.run_analyze(fetch, max_videos=30)[0]["channels"][0]
+        self.assertEqual(fetch.calls["meta"], 9)
+        self.assertEqual(ch["metadata"], {"looked_up": 9, "selected": 9})
+
+    def test_zero_median_keeps_the_breakout(self):
+        """A new channel: most uploads at 0 views, one took off."""
+        entries, meta = mini_channel([0] * 8 + [5, 40, 3000, 12], title="Guitar chords lesson %d")
+        data, md = self.run_analyze(MiniFetch(entries, meta), max_videos=30)
+        f = data["channels"][0]["formats"]["long"]
+        self.assertEqual(f["median_views"], 0)
+        self.assertEqual(f["best"][0]["views"], 3000)
+        self.assertGreater(f["best"][0]["multiple"], 2)
+        self.assertEqual(f["outliers"], 1)
+        self.assertIn("median is 0 views", f["baseline_note"])
+        self.assertNotIn("fewer than 4 videos with views", md)
+        self.assertIn("| long-form | 12 | 0 | 1 (", md)
+
+    def test_unreachable_channel_is_a_data_gap(self):
+        class Offline(MiniFetch):
+            def list_channel(self, url, tab, limit):
+                self.last_error = ("ERROR: [youtube:tab] mkbhd: Unable to download API page: <urlopen error Tunnel "
+                                   "connection failed: 403 Forbidden> (caused by ProxyError)")
+                return None
+
+        data, md = self.run_analyze(Offline([], {}), urls=("@mkbhd",), max_videos=3)
+        ch = data["channels"][0]
+        self.assertEqual(ch["status"], "unreachable")
+        self.assertTrue(ch["gaps"] and "not reachable" in ch["gaps"][0], ch["gaps"])
+        gaps = md.split("## Data gaps", 1)[1]
+        self.assertNotIn("None noted", gaps)
+        self.assertIn("Nothing could be read", gaps)
+
+    def test_skipped_sections_are_data_gaps(self):
+        entries, meta = mini_channel([1000 * (i + 1) for i in range(6)])
+        data, md = self.run_analyze(MiniFetch(entries, meta), max_videos=10, deep=0)
+        self.assertTrue([g for g in data["channels"][0]["gaps"] if g.startswith("No deep dive")])
+
+    def test_rate_limits_still_stop_the_lookups(self):
+        entries, meta = mini_channel([10000 + 500 * i for i in range(20)])
+        errors = {}
+        for e in entries[:6]:
+            meta.pop(e["id"])
+            errors[e["id"]] = "ERROR: [youtube] x: HTTP Error 429: Too Many Requests"
+        fetch = MiniFetch(entries, meta, errors)
+        ch = self.run_analyze(fetch, max_videos=30)[0]["channels"][0]
+        self.assertEqual(fetch.calls["meta"], 5)
+        self.assertEqual(ch["status"], "partial")
+        self.assertTrue([g for g in ch["gaps"] if "kept failing" in g])
+
+
+class TestThumbDownloadTls(unittest.TestCase):
+    def test_download_uses_the_certifi_aware_context(self):
+        """python.org Python on macOS has no system CA certificates: the download must pass a context."""
+        import ssl
+        from unittest import mock
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new("RGB", (480, 360), (200, 60, 60)).save(buf, "JPEG")
+        seen = {}
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def urlopen(req, timeout=None, context=None):
+            seen["context"] = context
+            return Resp(buf.getvalue())
+
+        tmp = tempfile.mkdtemp(prefix="vs_tls_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        f = channel.YtDlpFetch(pause=0)
+        with mock.patch.object(channel.urllib.request, "urlopen", urlopen):
+            got = f.download_thumb("https://i.ytimg.com/vi/abcdefghijk/maxresdefault.jpg", os.path.join(tmp, "t.jpg"))
+        self.assertTrue(got and os.path.isfile(got))
+        self.assertIsInstance(seen["context"], ssl.SSLContext)
+
+    def test_certificate_failures_are_named_in_the_gaps(self):
+        class Fetch(MiniFetch):
+            def download_thumb(self, url, path):
+                self.last_error = ("thumbnail %s: <urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify "
+                                   "failed: unable to get local issuer certificate (_ssl.c:1006)>" % url)
+                return None
+
+        entries, meta = mini_channel([1000 * (i + 1) for i in range(6)])
+        tmp = tempfile.mkdtemp(prefix="vs_tls_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        ch = quiet(channel.analyze, ["@test"], tmp, deep=0, fetch=Fetch(entries, meta))["channels"][0]
+        gap = [g for g in ch["gaps"] if "thumbnails could not be downloaded" in g]
+        self.assertTrue(gap and "Install Certificates" in gap[0], ch["gaps"])
+
+
+class TestCaptionsTrack(unittest.TestCase):
+    """YtDlpFetch.captions with yt-dlp stubbed: which file it hands the deep dive."""
+
+    def fetch_leaving(self, names, lang=None):
+        tmp = tempfile.mkdtemp(prefix="vs_caps_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        f = channel.YtDlpFetch(pause=0)
+        url = "https://www.youtube.com/watch?v=abcdefghijk"
+        if lang:
+            f._lang[url] = lang
+        seen = []
+
+        def run(args, timeout):
+            seen.append(args)
+            for n in names:
+                with open(os.path.join(tmp, n), "w", encoding="utf-8") as fh:
+                    fh.write('{"events": []}' if n.endswith(".json3") else "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhi\n")
+            return True
+
+        f._run = run
+        got = f.captions(url, tmp)
+        return (os.path.basename(got) if got else None), seen[0]
+
+    def test_tiktok_vtt_is_used(self):
+        got, args = self.fetch_leaving(["subs.eng-US.vtt"])
+        self.assertEqual(got, "subs.eng-US.vtt")
+        self.assertIn("json3/vtt/srt", args)
+
+    def test_original_language_track_beats_the_translation(self):
+        self.assertEqual(self.fetch_leaving(["subs.en.json3", "subs.hi-orig.json3"])[0], "subs.hi-orig.json3")
+        self.assertEqual(self.fetch_leaving(["subs.en.json3", "subs.en-orig.json3"])[0], "subs.en-orig.json3")
+        got, args = self.fetch_leaving(["subs.en.json3", "subs.hi.json3"], lang="hi")
+        self.assertEqual(got, "subs.hi.json3")
+        self.assertIn("hi", args[args.index("--sub-langs") + 1].split(","))
+        self.assertIsNone(self.fetch_leaving(["subs.en.json3"], lang="hi")[0])
 
 
 class TestFaceDetectorThatCannotRun(unittest.TestCase):
@@ -635,6 +971,30 @@ class TestTikTokFallback(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_share_links_are_video_links(self):
+        """The app's Share button makes vm.tiktok.com/... and tiktok.com/t/... links: one video each."""
+        class Fetch(FakeFetch):
+            def list_channel(self, url, tab, limit):
+                if url.startswith("tiktokuser:"):
+                    return dict(self.tt, entries=self.tt["entries"][:limit])
+                if "vm.tiktok.com" in url or "/t/" in url:   # yt-dlp resolves a share link to one video
+                    return {"id": "7400000000000000000", "title": "one video", "channel_id": "MS4wLjABAAAAkitchenlab"}
+                self.last_error = "ERROR: [tiktok:user] kitchenlab: Unable to extract secondary user ID"
+                return None
+
+            def video_meta(self, url):
+                return {"channel_id": "MS4wLjABAAAAkitchenlab", "uploader": "kitchenlab",
+                        "webpage_url": TT + "/video/7400000000000000000"}
+
+        tmp = tempfile.mkdtemp(prefix="vs_channel_tt_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        data = quiet(channel.analyze, ["https://vm.tiktok.com/ZMhvqjabc/", "https://www.tiktok.com/t/ZTRabc123/"],
+                     tmp, max_videos=5, deep=0, fetch=Fetch(tmp))
+        for ch in data["channels"]:
+            self.assertEqual(ch["status"], "ok", ch["input"])
+            self.assertEqual(ch["url"], TT)
+            self.assertEqual(ch["inventory"]["short"]["listed"], 10)
+
 
 @unittest.skipUnless(HAVE_OCR, "needs rapidocr")
 class TestCli(unittest.TestCase):
@@ -656,6 +1016,34 @@ class TestCli(unittest.TestCase):
         finally:
             channel.YtDlpFetch = real
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_cp1252_piped_stdout_does_not_crash(self):
+        """Windows pipes stdout as cp1252 (strict): an emoji in the channel name must not crash the run."""
+        tmp = tempfile.mkdtemp(prefix="vs_channel_cp_")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        fake = FakeFetch(tmp)
+        fake.tt = dict(fake.tt, uploader="Rise ☀️ Daily आसान", channel="Rise ☀️ Daily")
+        real = channel.YtDlpFetch
+        channel.YtDlpFetch = lambda: fake
+        self.addCleanup(setattr, channel, "YtDlpFetch", real)
+        raw = io.BytesIO()
+        out = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = channel.main([TT, "--out-dir", os.path.join(tmp, "o"), "--max-videos", "5", "--no-download"])
+        out.flush()
+        self.assertEqual(rc, 0)
+        self.assertIn(b"Rise ? Daily", raw.getvalue().replace(b"??", b"?"))
+
+    def test_default_folder_names_do_not_collide(self):
+        h = lambda u: channel.slug(channel._handle_from_url(channel.normalize_url(u)))
+        self.assertEqual(h("https://www.youtube.com/watch?v=abcdefghijk"), "video-abcdefghijk")
+        self.assertNotEqual(h("https://www.youtube.com/watch?v=abcdefghijk"), h("https://youtu.be/zzzzzzzzzzz"))
+        self.assertEqual(h(TT + "/video/7400000000000000000"), "kitchenlab")
+        self.assertEqual(h("@mkbhd"), "mkbhd")
+        hindi_a, hindi_b = h("@कुकिंग"), h("@हिंदी")
+        self.assertNotEqual(hindi_a, hindi_b)
+        self.assertTrue(hindi_a.startswith("channel-") and re.match(r"^[a-z0-9-]+$", hindi_a), hindi_a)
+        self.assertEqual(channel.slug("Café Lab"), "cafe-lab")
 
 
 if __name__ == "__main__":

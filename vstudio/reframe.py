@@ -9,12 +9,17 @@ reframe.py - follow the speaker's face so a 16:9 recording can be cropped to
 
 How it works
     Frames are sampled at the requested times (one ffmpeg pass at a few
-    frames per second, scaled to 640 px wide; sparse times are fetched with
-    one seek each instead). Each frame goes through OpenCV's YuNet face
-    detector (cv2.FaceDetectorYN with face_detection_yunet_2023mar.onnx from
-    the OpenCV model zoo, about 230 KB, downloaded into workspace/models and
-    checked against its published SHA-256). Without YuNet a Haar cascade is
-    used when OpenCV ships one; otherwise nothing is detected.
+    frames per second, scaled to 640 px on the long side; sparse times are
+    fetched with one seek each instead) and each one goes through the face
+    detector as it is decoded, so only a frame or two is ever held in
+    memory, however long the recording. The detector is OpenCV's YuNet
+    (cv2.FaceDetectorYN with face_detection_yunet_2023mar.onnx from the
+    OpenCV model zoo, about 230 KB, downloaded into workspace/models with
+    certifi's certificates trusted too and checked against its published
+    SHA-256). OpenCV 4.5.4 to 4.7 load that model but cannot run it; a
+    test detection finds that out, says to update OpenCV (4.8 or newer)
+    and moves on. Without YuNet a Haar cascade is used when OpenCV ships
+    one; otherwise nothing is detected.
 
     The face to follow is the largest confident one; when another face of
     similar size is closer to where the speaker was a moment ago, that one
@@ -60,14 +65,14 @@ _ZOO = "opencv/opencv_zoo/main/models/face_detection_yunet/" + MODEL_NAME
 MODEL_URLS = ["https://raw.githubusercontent.com/" + _ZOO,
               "https://media.githubusercontent.com/media/" + _ZOO]
 
-SAMPLE_WIDTH = 640       # frames are analysed at this width (faces of talking heads are large)
+SAMPLE_SIZE = 640        # frames are analysed at most this long on their long side (talking heads are large)
 MIN_SCORE = 0.7          # YuNet confidence for a face
 MAX_RATE = 4.0           # frames per second decoded at most in the single-pass sampler
 JUMP = 0.15              # normalized move between detections that counts as a different shot
 EMA = 0.4                # smoothing factor inside a run (higher = follows faster)
 HEADROOM = 0.40          # where the face sits vertically when the crop trims top and bottom
 
-_STATE = {"yunet": None, "yunet_path": None, "haar": None, "warned": False}
+_STATE = {"yunet": None, "yunet_path": None, "haar": None, "warned": False, "broken": None}
 
 
 # --------------------------------------------------------------------------- model
@@ -105,10 +110,12 @@ def ensure_model(download=True, timeout=60):
     if not download or os.environ.get("VSTUDIO_OFFLINE"):
         return None
     paths.ensure(paths.MODELS)
+    from . import fonts   # its SSL context also trusts certifi (python.org builds on macOS ship no certificates)
+    ctx = fonts._ssl_context()
     errors = []
     for url in MODEL_URLS:
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as r:
+            with urllib.request.urlopen(url, timeout=timeout, context=ctx) as r:
                 data = r.read(MODEL_SIZE * 4)
         except OSError as e:
             errors.append("%s: %s" % (url, e))
@@ -128,20 +135,33 @@ def ensure_model(download=True, timeout=60):
     return None
 
 
+LOG_SILENT, LOG_ERROR = 0, 2    # OpenCV log levels
+
+
+def _cv_log_level(cv2, level):
+    """Set OpenCV's log level (cv2.utils.logging in OpenCV 5, cv2.setLogLevel in 4.x); False if it cannot."""
+    log = getattr(getattr(cv2, "utils", None), "logging", None)
+    put = getattr(log, "setLogLevel", None) or getattr(cv2, "setLogLevel", None)
+    try:
+        put(level)
+        return True
+    except (TypeError, AttributeError, cv2.error):
+        return False
+
+
 def _quiet_cv2():
     import cv2
-    try:  # OpenCV 5 logs a backend notice for every new network
-        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
-    except AttributeError:
-        pass
+    _cv_log_level(cv2, LOG_ERROR)   # OpenCV 5 logs a backend notice for every new network
     return cv2
 
 
 def _yunet():
-    """A YuNet detector when the model is on disk and OpenCV has FaceDetectorYN, else None."""
+    """A YuNet detector when the model is on disk and this OpenCV can run it, else None."""
     path = model_path()
     if _STATE["yunet"] is not None and _STATE["yunet_path"] == path:
         return _STATE["yunet"]
+    if _STATE["broken"] == path:
+        return None
     cv2 = _quiet_cv2()
     if not hasattr(cv2, "FaceDetectorYN") or not os.path.isfile(path):
         return None
@@ -152,8 +172,29 @@ def _yunet():
             print("reframe: OpenCV could not load %s: %s" % (path, e), file=sys.stderr)
             _STATE["warned"] = True
         return None
+    # OpenCV 4.5.4 to 4.7 create a detector for the 2023mar model, then fail on every detect(): try one
+    _cv_log_level(cv2, LOG_SILENT)   # (and keep OpenCV's own error dump of that failure off the console)
+    try:
+        det.setInputSize((320, 240))
+        det.detect(np.zeros((240, 320, 3), np.uint8))
+    except cv2.error as e:
+        _broken(path, e)
+        return None
+    finally:
+        _cv_log_level(cv2, LOG_ERROR)
     _STATE["yunet"], _STATE["yunet_path"] = det, path
     return det
+
+
+def _broken(path, err):
+    """Stop using YuNet for this model (this OpenCV cannot run it) and say how to fix it, once."""
+    cv2 = _quiet_cv2()
+    _STATE["yunet"], _STATE["yunet_path"], _STATE["broken"] = None, None, path
+    why = [ln for ln in str(err).strip().splitlines() if ln.strip()]
+    print("reframe: OpenCV %s cannot run the YuNet face model (%s); face tracking uses %s. Update OpenCV to 4.8 "
+          "or newer: pip install -U opencv-python-headless" % (
+              cv2.__version__, (why[-1] if why else type(err).__name__)[:200],
+              "the Haar cascade" if _haar() is not None else "centre crops"), file=sys.stderr)
 
 
 def _haar():
@@ -183,24 +224,29 @@ def detect_faces(frame_bgr):
 
     Uses YuNet when its model is present (see ensure_model), else a Haar
     cascade if OpenCV ships one, else returns []. Large frames are analysed
-    at 640 px wide and the boxes scaled back.
+    at 640 px on the long side and the boxes scaled back.
     """
     if frame_bgr is None or getattr(frame_bgr, "ndim", 0) != 3 or frame_bgr.size == 0:
         return []
     cv2 = _quiet_cv2()
     h, w = frame_bgr.shape[:2]
-    k = min(1.0, SAMPLE_WIDTH / float(max(w, h)))
+    k = min(1.0, SAMPLE_SIZE / float(max(w, h)))
     img = frame_bgr if k >= 1.0 else cv2.resize(frame_bgr, (max(1, int(w * k)), max(1, int(h * k))),
                                                interpolation=cv2.INTER_AREA)
     img = np.ascontiguousarray(img)
     out = []
     det = _yunet()
     if det is not None:
-        det.setInputSize((img.shape[1], img.shape[0]))
-        _, faces = det.detect(img)
-        for f in faces if faces is not None else []:
-            out.append((float(f[0]) / k, float(f[1]) / k, float(f[2]) / k, float(f[3]) / k, float(f[14])))
-    else:
+        try:
+            det.setInputSize((img.shape[1], img.shape[0]))
+            _, faces = det.detect(img)
+        except cv2.error as e:
+            _broken(model_path(), e)
+            det = None
+        else:
+            for f in faces if faces is not None else []:
+                out.append((float(f[0]) / k, float(f[1]) / k, float(f[2]) / k, float(f[3]) / k, float(f[14])))
+    if det is None:
         cc = _haar()
         if cc is not None:
             gray = cv2.equalizeHist(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
@@ -231,19 +277,30 @@ def _read_exact(stream, n):
     return bytes(buf)
 
 
-def sample_frames(video, times, width=SAMPLE_WIDTH):
-    """{t: BGR frame} for the requested times (each the nearest decoded frame), at `width` px wide.
+def sample_frames(video, times, size=SAMPLE_SIZE):
+    """{t: BGR frame} for the requested times (each the nearest decoded frame), at most `size` px on the long side.
 
-    Dense times are read in one ffmpeg pass at up to 4 frames per second;
-    sparse ones with one seek each. Times past the end may be missing.
+    Holds every frame at once: for many times use iter_frames() and handle
+    each frame as it comes.
+    """
+    return dict(iter_frames(video, times, size))
+
+
+def iter_frames(video, times, size=SAMPLE_SIZE):
+    """(t, BGR frame) for the requested times in time order, at most `size` px on the long side.
+
+    Times are rounded to the millisecond, and several times may share one
+    frame (the nearest decoded one). Dense times are read in one ffmpeg pass
+    at up to 4 frames per second; sparse ones with one seek each. Times
+    past the end may be missing. Only the frame being yielded is held.
     """
     info = timeline.probe(video) or {}
     sw, sh = info.get("width") or 0, info.get("height") or 0
     ts = sorted({round(float(t), 3) for t in times if t is not None and float(t) >= 0})
     if not ts or not sw or not sh:
-        return {}
-    w = max(2, int(min(width, sw)) // 2 * 2)
-    h = max(2, int(round(w * sh / float(sw) / 2.0)) * 2)
+        return
+    k = min(1.0, size / float(max(sw, sh)))
+    w, h = max(2, int(round(sw * k / 2.0)) * 2), max(2, int(round(sh * k / 2.0)) * 2)
     n = w * h * 3
     ff = _ffmpeg()
     base = [ff, "-nostdin", "-hide_banner", "-loglevel", "error"]
@@ -251,15 +308,14 @@ def sample_frames(video, times, width=SAMPLE_WIDTH):
     gaps = [b - a for a, b in zip(ts, ts[1:]) if b - a > 1e-3]
     rate = min(MAX_RATE, max(2.0, 1.0 / max(min(gaps) if gaps else 1.0, 1.0 / MAX_RATE)))
     span = ts[-1] - ts[0]
-    out = {}
     if span * rate + 1 > 4 * len(ts) + 40:
         # sparse: one seek per time costs less than decoding everything in between
         for t in ts:
             r = subprocess.run(base + ["-ss", "%.3f" % t, "-i", video, "-frames:v", "1", "-vf",
                                        "scale=%d:%d" % (w, h)] + tail, capture_output=True)
             if len(r.stdout) >= n:
-                out[t] = np.frombuffer(r.stdout[:n], np.uint8).reshape(h, w, 3)
-        return out
+                yield t, np.frombuffer(r.stdout[:n], np.uint8).reshape(h, w, 3)
+        return
     # the fps filter's frame k shows source time seek + (k + 0.5) / rate, so seek half a frame early
     seek = max(0.0, ts[0] - 0.5 / rate)
     want = {}
@@ -270,26 +326,24 @@ def sample_frames(video, times, width=SAMPLE_WIDTH):
                   "-vf", "fps=%r,scale=%d:%d" % (rate, w, h)] + tail
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     try:
-        k = 0
-        prev = None
-        while k <= last:
+        i = 0
+        frame = None
+        while i <= last:
             buf = _read_exact(proc.stdout, n)
             if len(buf) < n:
                 break
-            prev = np.frombuffer(buf, np.uint8).reshape(h, w, 3)
-            for t in want.get(k, ()):
-                out[t] = prev
-            k += 1
-        if prev is not None:   # times just past the last decoded frame take the last frame
-            for kk, tt in want.items():
-                if kk >= k and kk <= k + 1:
-                    for t in tt:
-                        out.setdefault(t, prev)
+            frame = np.frombuffer(buf, np.uint8).reshape(h, w, 3)
+            for t in want.get(i, ()):
+                yield t, frame
+            i += 1
+        if frame is not None:   # times just past the last decoded frame take the last frame
+            for kk in (i, i + 1):
+                for t in want.get(kk, ()):
+                    yield t, frame
     finally:
         proc.kill()
         proc.stdout.close()
         proc.wait()
-    return out
 
 
 # --------------------------------------------------------------------------- tracking
@@ -397,7 +451,9 @@ def track(video, times, aspect=(9, 16), download=True):
     None, "detected": bool (a face was seen in that very frame)}; method is
     "yunet" or "haar" when faces were found, else "centre"; detector is the
     detector that ran (None when neither YuNet nor a Haar cascade exists).
-    download=False never fetches the YuNet model.
+    download=False never fetches the YuNet model. Raises ValueError for a
+    file without a video stream and RuntimeError when ffmpeg is missing or
+    OpenCV's detector fails.
     """
     info = timeline.probe(video)
     if not info or not info.get("has_video"):
@@ -409,13 +465,23 @@ def track(video, times, aspect=(9, 16), download=True):
     how = method()
     raw = [None] * len(times)
     if how and times:
-        frames = sample_frames(video, times)
+        # detect while decoding, so no more than a frame or two is ever in memory
+        cv2 = _quiet_cv2()
+        seen, last, faces = {}, None, []
+        try:
+            for t, fr in iter_frames(video, times):
+                if fr is not last:
+                    faces, last = detect_faces(fr), fr
+                seen[t] = (faces, fr.shape[1], fr.shape[0])
+        except cv2.error as e:   # a detector OpenCV cannot run: the caller falls back to centre framing
+            raise RuntimeError("face detection failed: %s" % (str(e).strip().splitlines() or [e])[-1])
+        how = method()   # YuNet may have turned out unusable on this OpenCV
         prev = None
         for i, t in enumerate(times):
-            fr = frames.get(round(t, 3))
-            if fr is None:
+            hit = seen.get(round(t, 3))
+            if hit is None:
                 continue
-            raw[i] = _pick(detect_faces(fr), fr.shape[1], fr.shape[0], prev)
+            raw[i] = _pick(*hit, prev)
             if raw[i] is not None:
                 prev = raw[i]
     found = sum(1 for r in raw if r is not None)

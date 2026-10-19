@@ -8,7 +8,8 @@ card, highlight on the spoken word, and timing.
         --video my_take.mp4 --out my_take_captioned.mp4
 
 Where the words and their timing come from, best first:
-    --words words.json     [{"w": "Nobody", "s": 0.0, "e": 0.32}, ...] (extract.py's transcript.json works)
+    --words words.json     [{"w": "Nobody", "s": 0.0, "e": 0.32}, ...] (extract.py's transcript.json),
+                           {"words": [...]}, whisper {"segments": [...]} or YouTube json3
     --srt file.srt         an SRT/VTT you already have (CapCut and Premiere export these)
     (nothing)              local faster-whisper transcribes the video, if installed
     --script script.txt    no recording yet: timed at the reference's pace, for a preview
@@ -184,6 +185,21 @@ def build_ass(words, cap, W, H, font, pop=False):
     return "\n".join(head + events) + "\n", len(cards)
 
 
+def filter_path(path):
+    """A file path as an option value inside an ffmpeg -vf filter graph.
+
+    Two parsers read it, so it is escaped twice: first for the filter's option parser
+    (\\ ' :), then for the graph parser (\\ ' [ ] , ;). Escaping once breaks on Windows drive
+    letters (C:/...) and on any apostrophe. Backslashes become forward slashes first, which
+    ffmpeg accepts on Windows too. (The same rule as vstudio.render.ffmpeg_filter_path.)"""
+    p = os.path.abspath(path).replace("\\", "/")
+    for ch in ("\\", "'", ":"):
+        p = p.replace(ch, "\\" + ch)
+    for ch in ("\\", "'", "[", "]", ",", ";"):
+        p = p.replace(ch, "\\" + ch)
+    return p
+
+
 def probe_size(video):
     r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
                         "stream=width,height", "-of", "json", video], capture_output=True, text=True)
@@ -211,7 +227,10 @@ def main():
     W, H = probe_size(a.video)
 
     if a.words:
-        words = json.load(open(a.words, encoding="utf-8"))
+        try:   # transcript.json, {"words": [...]}, whisper segments or json3: extract.py reads them all
+            words = extract.load_captions(a.words)
+        except ValueError as e:
+            sys.exit(str(e))
     elif a.srt:
         words = extract.parse_srt_vtt(open(a.srt, encoding="utf-8", errors="replace").read())
     elif a.script:
@@ -224,6 +243,8 @@ def main():
         if not words:
             sys.exit("No words to caption: pass --words, --srt or --script, or pip install faster-whisper")
 
+    if not words:
+        sys.exit("No words to caption in %s" % (a.words or a.srt or a.script or a.video))
     font = a.font or (cap.get("font_candidates") or ["Montserrat Black"])[0]
     ass, n = build_ass(words, cap, W, H, font, a.pop)
     ass_path = os.path.splitext(a.out)[0] + ".ass"
@@ -232,9 +253,9 @@ def main():
     print("wrote %s (%d cards, font %s)" % (ass_path, n, font), file=sys.stderr)
     if a.ass_only:
         return
-    flt = "ass=%s" % ass_path.replace("\\", "/").replace(":", "\\:")
+    flt = "ass=filename=%s" % filter_path(ass_path)
     if a.fonts_dir:
-        flt += ":fontsdir=%s" % a.fonts_dir.replace("\\", "/").replace(":", "\\:")
+        flt += ":fontsdir=%s" % filter_path(a.fonts_dir)
     r = subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", a.video, "-vf", flt,
                         "-c:a", "copy", "-c:v", "libx264", "-pix_fmt", "yuv420p", a.out])
     if r.returncode != 0:

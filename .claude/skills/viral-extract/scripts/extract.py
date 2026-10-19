@@ -16,9 +16,12 @@ Writes into --out:
     style_dna.json      everything, machine-readable (captions.py reads this)
     STYLE_DNA.md        the recreate spec, human-readable
 
-Transcript sources, best first: --captions FILE (json3/srt/vtt), YouTube
-auto-captions for a YouTube URL, local faster-whisper if installed. None of
-them is required; without one the dialogue section says so.
+Transcript sources, best first: --captions FILE (json3, SRT, VTT, or a words
+JSON: transcript.json, {"words": [...]} or whisper {"segments": [...]}), the
+YouTube captions for a YouTube URL (the original-language speech track, never
+the machine translation), local faster-whisper if installed (on the GPU when it
+can, else the CPU). None of them is required; without one the dialogue section
+says so.
 
 What this cannot do: name a font with certainty from pixels. It measures the
 font's weight, width, case and colour and proposes free look-alikes; the
@@ -53,17 +56,41 @@ CONTRACTION_RE = re.compile(r"\b\w+'(?:s|t|re|ve|ll|d|m)\b", re.I)
 # --------------------------------------------------------------------------- transcript
 
 def parse_json3(data):
+    """Words from YouTube json3 captions.
+
+    Auto-captions time every word (one seg per word, with tOffsetMs). Uploaded captions hold a
+    whole line in one seg, so that line's words are spread evenly from the seg's start to the next
+    seg, the end of the event (dDurationMs) or the next event, whichever comes first, the way
+    parse_srt_vtt spreads a cue; giving them all the line's start time would read as words spoken
+    at once followed by a pause."""
+    events = [ev for ev in data.get("events") or []
+              if any((s.get("utf8") or "").strip() for s in ev.get("segs") or [])]
     words = []
-    for ev in data.get("events") or []:
-        start = ev.get("tStartMs", 0)
+    for k, ev in enumerate(events):
+        start = ev.get("tStartMs") or 0
+        end = start + (ev.get("dDurationMs") or 0)
+        nxt_ev = (events[k + 1].get("tStartMs") or 0) if k + 1 < len(events) else None
+        if nxt_ev is not None and nxt_ev > start:
+            end = min(end, nxt_ev) if end > start else nxt_ev
         segs = [s for s in ev.get("segs") or [] if (s.get("utf8") or "").strip()]
-        for seg in segs:
-            t = (start + seg.get("tOffsetMs", 0)) / 1000.0
-            for w in seg["utf8"].split():
-                words.append({"w": w, "s": round(t, 3), "e": None})
+        offs = [start + (s.get("tOffsetMs") or 0) for s in segs]
+        for i, seg in enumerate(segs):
+            toks = seg["utf8"].split()
+            a = offs[i]
+            z = offs[i + 1] if i + 1 < len(segs) else end
+            if len(toks) == 1:
+                words.append({"w": toks[0], "s": round(a / 1000.0, 3), "e": None})
+                continue
+            if z <= a:   # no length known: a nominal 0.35 s per word (about 170 wpm)
+                z = a + 350 * len(toks)
+            step = (z - a) / float(len(toks))
+            for j, w in enumerate(toks):
+                words.append({"w": w, "s": round((a + j * step) / 1000.0, 3),
+                              "e": round((a + (j + 1) * step) / 1000.0, 3)})
     for i, w in enumerate(words):
-        nxt = words[i + 1]["s"] if i + 1 < len(words) else w["s"] + 0.4
-        w["e"] = round(min(nxt, w["s"] + 1.0), 3)
+        if w["e"] is None:
+            nxt = words[i + 1]["s"] if i + 1 < len(words) else w["s"] + 0.4
+            w["e"] = round(min(max(nxt, w["s"]), w["s"] + 1.0), 3)
     return words
 
 
@@ -94,39 +121,157 @@ def parse_srt_vtt(text):
     return words
 
 
+def _segment_words(segments):
+    """Whisper-style segments -> words (their own word lists, or the text spread over the segment)."""
+    out = []
+    for seg in segments or []:
+        if not isinstance(seg, dict):
+            continue
+        if isinstance(seg.get("words"), list):
+            out.extend(seg["words"])
+            continue
+        s, e, toks = seg.get("start"), seg.get("end"), str(seg.get("text") or "").split()
+        if not isinstance(s, (int, float)) or not isinstance(e, (int, float)) or not toks or e <= s:
+            continue
+        step = (e - s) / float(len(toks))
+        out.extend({"w": t, "s": s + i * step, "e": s + (i + 1) * step} for i, t in enumerate(toks))
+    return out
+
+
+def words_from_json(data, name="words json"):
+    """[{"w", "s", "e"}] from any words-JSON shape: YouTube json3 ({"events": ...}), a list of
+    {"w"|"word"|"text", "s"|"start", "e"|"end"} (transcript.json), {"words": [...]}, or whisper-style
+    {"segments": [{"words": [...]}]} / {"segments": [{"start", "end", "text"}]}. A token holding several
+    words is spread over its time. Raises ValueError for a shape it does not know."""
+    if isinstance(data, dict):
+        if "events" in data:
+            return parse_json3(data)
+        if isinstance(data.get("words"), list):
+            data = data["words"]
+        elif isinstance(data.get("segments"), list):
+            data = _segment_words(data["segments"])
+        else:
+            raise ValueError("%s: no words found (expected a list of {w, s, e}, {\"words\": [...]}, "
+                             "{\"segments\": [...]} or YouTube json3)" % name)
+    if not isinstance(data, list):
+        raise ValueError("%s: not a words file" % name)
+    if data and isinstance(data[0], dict) and isinstance(data[0].get("words"), list) and "w" not in data[0]:
+        data = _segment_words(data)
+    pick = lambda d, *ks: next((d[k] for k in ks if d.get(k) is not None), None)
+    rows = []
+    for d in data:
+        if not isinstance(d, dict):
+            continue
+        text, s, e = pick(d, "w", "word", "text"), pick(d, "s", "start"), pick(d, "e", "end")
+        if text is None or not isinstance(s, (int, float)) or not str(text).strip():
+            continue
+        rows.append((float(s), float(e) if isinstance(e, (int, float)) else None, str(text).split()))
+    rows.sort(key=lambda r: r[0])
+    words = []
+    for i, (s, e, toks) in enumerate(rows):
+        if e is None or e < s:
+            nxt = rows[i + 1][0] if i + 1 < len(rows) else s + 0.4
+            e = min(max(nxt, s), s + 1.0)
+        step = (e - s) / float(len(toks))
+        words.extend({"w": t, "s": round(s + k * step, 3), "e": round(s + (k + 1) * step, 3)}
+                     for k, t in enumerate(toks))
+    return words
+
+
+CAPTION_EXTS = (".json3", ".vtt", ".srt")
+
+
 def load_captions(path):
+    """Words from a captions or words file: json3, SRT, VTT or any words-JSON shape (words_from_json)."""
     with open(path, encoding="utf-8", errors="replace") as f:
         raw = f.read()
-    if path.endswith(".json3") or raw.lstrip().startswith("{"):
-        return parse_json3(json.loads(raw))
-    if path.endswith(".json"):
-        return json.loads(raw)
+    low = path.lower()
+    if low.endswith((".json3", ".json")) or raw.lstrip().startswith(("{", "[")):
+        return words_from_json(json.loads(raw), os.path.basename(path))
     return parse_srt_vtt(raw)
+
+
+def caption_lang(name):
+    """The language code of a yt-dlp captions file ("subs.hi-orig.json3" -> "hi-orig")."""
+    stem = os.path.basename(name)
+    for ext in CAPTION_EXTS:
+        if stem.lower().endswith(ext):
+            stem = stem[:-len(ext)]
+    return stem.split(".", 1)[1] if "." in stem else ""
+
+
+def pick_captions(files, lang=None):
+    """The captions file that holds what was actually said, best timed, among yt-dlp's
+    "subs.<lang>.<ext>" downloads; None when there is none.
+
+    Order: YouTube's original-language speech track ("<lang>-orig": auto captions with a time per
+    word), then a track in the video's own language (`lang`, from its metadata), then English, then
+    any other track; json3 before VTT before SRT. When the video's language is known and is not
+    English, English tracks are left out: they are YouTube's machine translation, not their words."""
+    base = lambda code: code.lower().replace("_", "-").split("-")[0]
+    want = base(lang) if lang else None
+    ranked = []
+    for f in files or []:
+        ext = os.path.splitext(f)[1].lower()
+        if ext not in CAPTION_EXTS:
+            continue
+        code = caption_lang(f)
+        b = base(code)
+        english = b in ("en", "eng")
+        if code.lower().endswith("-orig"):
+            rank = 0 if want is None or b == want else 1
+        elif want and b == want:
+            rank = 2
+        elif english and want not in (None, "en", "eng"):
+            continue
+        elif english:
+            rank = 3
+        else:
+            rank = 4
+        ranked.append((rank, CAPTION_EXTS.index(ext), len(code), f))
+    return min(ranked)[3] if ranked else None
 
 
 def youtube_captions(url, tmp):
     out = os.path.join(tmp, "subs")
     subprocess.run([sys.executable, "-m", "yt_dlp", "--quiet", "--no-warnings", "--skip-download",
-                    "--write-subs", "--write-auto-subs", "--sub-langs", "en.*,en", "--sub-format", "json3",
-                    "-o", out, url], capture_output=True, timeout=180)
-    files = sorted(f for f in os.listdir(tmp) if f.startswith("subs") and f.endswith(".json3"))
-    if not files:
-        return None
-    return parse_json3(json.load(open(os.path.join(tmp, files[0]), encoding="utf-8")))
+                    "--write-subs", "--write-auto-subs", "--sub-langs", "en.*,en,.*-orig",
+                    "--sub-format", "json3/vtt/srt", "-o", out, url], capture_output=True, timeout=180)
+    best = pick_captions([f for f in os.listdir(tmp) if f.startswith("subs.")])
+    return load_captions(os.path.join(tmp, best)) if best else None
+
+
+GPU_ERROR_RE = re.compile(r"cuda|cublas|cudnn|nvrtc|libcu|gpu|nvidia|device", re.I)
 
 
 def whisper_words(media, model="small", lang=None):
+    """Words with times from local faster-whisper, or None when it is not installed.
+
+    device="auto" picks CUDA whenever an NVIDIA driver is present, but pip's faster-whisper ships
+    without cuBLAS / cuDNN, so on many Windows gaming laptops the first segment raises ("Library
+    cublas64_12.dll is not found"). Such a GPU failure is retried once on the CPU, which always works."""
     try:
         from faster_whisper import WhisperModel
     except ImportError:
         return None
-    m = WhisperModel(model, device="auto", compute_type="int8")
-    segs, _ = m.transcribe(media, word_timestamps=True, language=lang, vad_filter=True)
-    words = []
-    for seg in segs:
-        for w in seg.words or []:
-            words.append({"w": w.word.strip(), "s": round(w.start, 3), "e": round(w.end, 3)})
-    return words
+
+    def run(device):
+        m = WhisperModel(model, device=device, compute_type="int8")
+        segs, _ = m.transcribe(media, word_timestamps=True, language=lang, vad_filter=True)
+        words = []
+        for seg in segs:   # a generator: GPU library errors surface here, so it is read inside the try
+            for w in seg.words or []:
+                words.append({"w": w.word.strip(), "s": round(w.start, 3), "e": round(w.end, 3)})
+        return words
+
+    try:
+        return run("auto")
+    except (RuntimeError, OSError, ValueError) as e:
+        if not GPU_ERROR_RE.search(str(e)):
+            raise
+        print("whisper: the GPU could not run it (%s); transcribing on the CPU instead" % str(e)[:160],
+              file=sys.stderr)
+        return run("cpu")
 
 
 # --------------------------------------------------------------------------- dialogue DNA
@@ -555,8 +700,8 @@ def text_dna(video, out, fps=4.0, max_seconds=180, vocab=None):
         if crop.size == 0:
             continue
         path = os.path.join(crops_dir, "card_%02d.png" % (i + 1))
-        cv2.imwrite(path, crop)
-        c["crop"] = os.path.relpath(path, out)
+        if imwrite(path, crop):
+            c["crop"] = os.path.relpath(path, out)
         tiles.append(crop)
     if tiles:
         _sheet(tiles, os.path.join(out, "fonts_sheet.jpg"))
@@ -581,7 +726,21 @@ def _sheet(tiles, path, width=900):
         canvas = np.full((t.shape[0] + 12, width, 3), 40, "uint8")
         canvas[6:6 + t.shape[0], 0:t.shape[1]] = t
         rows.append(canvas)
-    cv2.imwrite(path, np.vstack(rows))
+    return imwrite(path, np.vstack(rows))
+
+
+def imwrite(path, img, params=()):
+    """cv2.imwrite for any path: on Windows OpenCV opens files in the ANSI code page, so a folder name
+    with Hindi or accented letters fails there, silently. Encoding in memory and writing with Python
+    works everywhere. Returns True when the file was written."""
+    import cv2
+    ok, buf = cv2.imencode(os.path.splitext(path)[1] or ".png", img, list(params))
+    if not ok:
+        print("could not encode %s" % os.path.basename(path), file=sys.stderr)
+        return False
+    with open(path, "wb") as f:
+        f.write(buf.tobytes())
+    return True
 
 
 def _majority(vals, share=0.4):
@@ -684,7 +843,8 @@ def font_size_pct(line_height_pct, case):
 
 def font_candidates(look, path=FONTS_REF, n=4):
     try:
-        ref = json.load(open(path, encoding="utf-8"))["fonts"]
+        with open(path, encoding="utf-8") as f:
+            ref = json.load(f)["fonts"]
     except Exception:
         return []
     def score(f):
@@ -797,7 +957,19 @@ def render_md(dna):
     return "\n".join(L)
 
 
+def _safe_stdio():
+    """Never die on printing: Windows writes piped stdout as cp1252, which cannot encode most
+    transcripts that are not English; a character it cannot show becomes '?' instead of a crash
+    after every file is written."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main():
+    _safe_stdio()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("src")
     ap.add_argument("--out", required=True)
@@ -836,7 +1008,12 @@ def main():
     print("transcript", file=sys.stderr)
     words, source = None, None
     if a.captions:
-        words, source = load_captions(a.captions), "captions file"
+        try:
+            words, source = load_captions(a.captions), "captions file"
+        except ValueError as e:
+            sys.exit(str(e))
+        if not words:
+            print("  no words in %s" % a.captions, file=sys.stderr)
     elif is_url and re.search(r"youtu\.?be", a.src):
         words, source = youtube_captions(a.src, a.out), "youtube captions"
     if not words and not a.no_whisper:

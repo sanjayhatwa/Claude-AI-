@@ -125,18 +125,47 @@ def read_json(path, default=None):
         return default
 
 
+def replace_file(src, dst, attempts=20):
+    """os.replace, retried while Windows refuses it with PermissionError.
+
+    On Windows a reader that has the file open (Python opens files without FILE_SHARE_DELETE) or
+    an antivirus scan of a file that was just written makes a rename fail for a moment.
+    """
+    for attempt in range(attempts - 1):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            time.sleep(0.05 * (attempt + 1))
+    os.replace(src, dst)
+
+
+def remove_file(path, attempts=5):
+    """Remove a file if it exists (retried like replace_file). Never raises; True when it is gone."""
+    for attempt in range(max(1, attempts)):
+        try:
+            os.remove(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except PermissionError:
+            if attempt + 1 < attempts:
+                time.sleep(0.05 * (attempt + 1))
+        except OSError:
+            break
+    return not os.path.exists(path)
+
+
 def write_json(path, data):
     """Write JSON atomically (temp file + rename), so readers never see half a file."""
     tmp = "%s.%s.tmp" % (path, secrets.token_hex(3))
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    for attempt in range(20):
-        try:
-            os.replace(tmp, path)
-            return
-        except PermissionError:      # Windows: a reader has the file open for a moment
-            time.sleep(0.05 * (attempt + 1))
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        replace_file(tmp, path)
+    except BaseException:
+        remove_file(tmp, attempts=1)
+        raise
 
 
 def resolve_in(root, rel, must_exist=True):
@@ -377,6 +406,14 @@ def _link_files(files, folder):
     os.makedirs(folder, exist_ok=True)
     for i, src in enumerate(files):
         dst = os.path.join(folder, "%02d_%s" % (i + 1, os.path.basename(src)))
+        if os.path.exists(dst):              # built before (a queued job is built again after a restart)
+            try:
+                st, dt = os.stat(src), os.stat(dst)
+                if os.path.samefile(src, dst) or (st.st_size, int(st.st_mtime)) == (dt.st_size, int(dt.st_mtime)):
+                    continue
+            except OSError:
+                pass
+            remove_file(dst)
         try:
             os.link(src, dst)
         except OSError:
@@ -781,34 +818,82 @@ def kill_tree(pid, grace=4.0):
         pass
 
 
-def _windows_alive(pid):
+def _windows_process(pid):
+    """(image path, creation time) of a running Windows process, or None when there is none.
+
+    The creation time is the process's FILETIME (100 ns ticks since 1601) as an int, or None when
+    Windows does not say; together with the pid it names one process, even after the pid is reused.
+    """
     import ctypes
     from ctypes import wintypes
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    k32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    k32.GetProcessTimes.argtypes = (wintypes.HANDLE,) + (ctypes.POINTER(wintypes.FILETIME),) * 4
+    k32.QueryFullProcessImageNameW.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                               ctypes.POINTER(wintypes.DWORD))
+    k32.CloseHandle.argtypes = (wintypes.HANDLE,)
     handle = k32.OpenProcess(0x1000, False, pid)          # PROCESS_QUERY_LIMITED_INFORMATION
     if not handle:
-        return False
+        return None
     try:
         code = wintypes.DWORD()
         if not k32.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:   # STILL_ACTIVE
-            return False
+            return None
+        times = [wintypes.FILETIME() for _ in range(4)]   # creation, exit, kernel, user
+        created = None
+        if k32.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+            created = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
         buf = ctypes.create_unicode_buffer(1024)
         size = wintypes.DWORD(1024)
-        if k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
-            return "python" in os.path.basename(buf.value).lower()
-        return True
+        image = buf.value if k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)) else ""
+        return image, created
     finally:
         k32.CloseHandle(handle)
 
 
-def wrapper_alive(pid, job_id):
-    """True when `pid` is still this job's wrapper (checked by command line, so a reused pid does not count)."""
+def process_created(pid):
+    """The creation time of a running process on Windows (to recognise it after a restart), else None.
+
+    Elsewhere the wrapper is recognised by its command line, which holds the job id.
+    """
+    if os.name != "nt" or not pid:
+        return None
+    try:
+        info = _windows_process(int(pid))
+    except Exception:
+        return None
+    return info[1] if info else None
+
+
+def _windows_alive(pid, created=None):
+    """True when the Windows process `pid` runs and is the one started at `created`.
+
+    Windows hands pids out again quickly, often to another python.exe (the restarted studio
+    itself, say), so the image name alone is only used for records written before creation
+    times were kept.
+    """
+    info = _windows_process(pid)
+    if info is None:
+        return False
+    image, started = info
+    if created is not None and started is not None:
+        return started == created
+    return "python" in os.path.basename(image).lower()
+
+
+def wrapper_alive(pid, job_id, created=None):
+    """True when `pid` is still this job's wrapper, so a reused pid does not count.
+
+    macOS/Linux check the command line (it names the job); Windows checks the process creation
+    time `created` that the runner kept when it started the wrapper.
+    """
     if not pid:
         return False
     if os.name == "nt":
         try:
-            return _windows_alive(int(pid))
+            return _windows_alive(int(pid), created)
         except Exception:
             return False
     try:
@@ -850,8 +935,9 @@ class JobRunner:
 
     def __init__(self, root, builder=None, max_parallel=1, light_kinds=LIGHT_KINDS):
         self.root = os.path.abspath(root)
-        self.projects_dir = os.path.join(self.root, "projects")
-        os.makedirs(self.projects_dir, exist_ok=True)
+        os.makedirs(os.path.join(self.root, "projects"), exist_ok=True)
+        # real path, as everything resolve_in() returns (macOS /var -> /private/var, symlinked folders)
+        self.projects_dir = os.path.realpath(os.path.join(self.root, "projects"))
         self.builder = builder or build_steps
         self.max_parallel = max(1, int(max_parallel))
         self.light_kinds = frozenset(light_kinds)
@@ -893,20 +979,45 @@ class JobRunner:
                 if isinstance(job, dict) and job.get("id") == jid and JOB_ID_RE.match(jid):
                     job["project"] = pid
                     records.append(job)
-        records.sort(key=lambda j: j.get("created") or 0)
+        records.sort(key=lambda j: j.get("created") if isinstance(j.get("created"), (int, float)) else 0)
         for job in records:
             self._jobs[job["id"]] = job
             status = job.get("status")
             if status == "queued":
-                self._queue.append(job["id"])
+                if self._rebuild(job):
+                    self._queue.append(job["id"])
             elif status == "running":
                 self._recover(job)
+
+    def _rebuild(self, job):
+        """Build a queued job's commands again from its kind and args, as submit() did.
+
+        Commands only ever come from a kind's builder, which checks every argument; a job.json
+        changed on disk while the studio was stopped cannot make it run anything else. A job whose
+        arguments no longer pass (a file was deleted, say) is marked failed. Returns True when the
+        job can be queued.
+        """
+        jdir = self.job_dir(job)
+        ctx = JobContext(os.path.join(self.projects_dir, job["project"]), jdir, os.path.join(jdir, "out"), [])
+        try:
+            os.makedirs(ctx.out_dir, exist_ok=True)
+            steps = self.builder(job.get("kind"), job.get("args") if job.get("args") is not None else {}, ctx)
+            if not steps or not all(isinstance(s, list) and s and all(isinstance(a, str) for a in s) for s in steps):
+                raise JobError("the job has no command to run")
+        except Exception as e:
+            job.update(status="failed", ended=now(), error="could not run after the restart: %s" % e)
+            self._save(job)
+            return False
+        job.update(steps=steps, notes=ctx.notes, cwd=paths.REPO, light=job.get("kind") in self.light_kinds,
+                   pid=None, pid_created=None)
+        self._save(job)
+        return True
 
     def _recover(self, job):
         exit_info = read_json(os.path.join(self.job_dir(job), "exit.json"))
         if exit_info is not None:
             self._finish(job, exit_info.get("code"), exit_info.get("ended"))
-        elif wrapper_alive(job.get("pid"), job["id"]):
+        elif wrapper_alive(job.get("pid"), job["id"], job.get("pid_created")):
             job["detached"] = True
             threading.Thread(target=self._watch_detached, args=(job["id"],), daemon=True).start()
         else:
@@ -1031,7 +1142,7 @@ class JobRunner:
                 job["cancel_requested"] = True
                 self._save(job)
                 pid = job.get("pid")
-                if pid and (job_id in self._procs or wrapper_alive(pid, job_id)):
+                if pid and (job_id in self._procs or wrapper_alive(pid, job_id, job.get("pid_created"))):
                     threading.Thread(target=kill_tree, args=(pid,), daemon=True).start()
         return self.get(job_id)
 
@@ -1078,6 +1189,7 @@ class JobRunner:
     def _start(self, job):
         jdir = self.job_dir(job)
         job.update(status="running", started=now())
+        self._save(job)              # the wrapper reads its commands from job.json: the runner's record
         try:
             log = open(os.path.join(jdir, "log.txt"), "ab")
             try:
@@ -1092,6 +1204,7 @@ class JobRunner:
             self._changed.notify_all()
             return
         job["pid"] = proc.pid
+        job["pid_created"] = process_created(proc.pid)    # Windows: tells this wrapper from a later pid owner
         self._procs[job["id"]] = proc
         self._save(job)
         self._changed.notify_all()
@@ -1113,7 +1226,7 @@ class JobRunner:
         exit_path = os.path.join(self.job_dir(job), "exit.json")
         while True:
             info = read_json(exit_path)
-            if info is not None or not wrapper_alive(job.get("pid"), job_id):
+            if info is not None or not wrapper_alive(job.get("pid"), job_id, job.get("pid_created")):
                 time.sleep(0.2)
                 info = info or read_json(exit_path)
                 with self._lock:
@@ -1150,32 +1263,41 @@ class JobRunner:
 
 def exec_job(job_dir):
     """Run a job's steps with output into log.txt, then write exit.json. Returns the exit code."""
+    log_path = os.path.join(job_dir, "log.txt")
+
+    def say(line):
+        # The wrapper's own lines go through a fresh append handle each time, never through the
+        # stdout it inherited: on Windows append mode is not inherited (the C runtime emulates it
+        # per descriptor), so that handle writes at its own stale position, on top of the steps' output.
+        with open(log_path, "ab") as f:
+            f.write((line + "\n").encode("utf-8", "replace"))
+
     job = read_json(os.path.join(job_dir, "job.json"))
     if not isinstance(job, dict) or not job.get("steps"):
-        print("job.json is missing or has no steps", flush=True)
+        say("job.json is missing or has no steps")
         return 2
     t0 = time.time()
     code = 0
-    print("== %s job %s started %s" % (job.get("kind"), job.get("id"), time.strftime("%Y-%m-%d %H:%M:%S")), flush=True)
+    say("== %s job %s started %s" % (job.get("kind"), job.get("id"), time.strftime("%Y-%m-%d %H:%M:%S")))
     for note in job.get("notes") or []:
-        print("note: " + note, flush=True)
+        say("note: " + note)
     steps = job["steps"]
     for i, argv in enumerate(steps):
         if len(steps) > 1:
-            print("== step %d/%d" % (i + 1, len(steps)), flush=True)
-        print("$ " + display_command(argv), flush=True)
+            say("== step %d/%d" % (i + 1, len(steps)))
+        say("$ " + display_command(argv))
         try:
             # The log is handed over explicitly: on Windows a child does not reliably inherit
             # file handles it is not given.
-            with open(os.path.join(job_dir, "log.txt"), "ab") as log:
+            with open(log_path, "ab") as log:
                 code = subprocess.call(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                                        cwd=job.get("cwd") or paths.REPO)
         except OSError as e:
-            print("could not start %s: %s" % (argv[0], e), flush=True)
+            say("could not start %s: %s" % (argv[0], e))
             code = 127
         if code != 0:
             break
-    print("== exit %s after %.1f s" % (code, time.time() - t0), flush=True)
+    say("== exit %s after %.1f s" % (code, time.time() - t0))
     write_json(os.path.join(job_dir, "exit.json"), {"code": code, "ended": now()})
     return code
 

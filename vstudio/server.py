@@ -41,6 +41,7 @@ the port can use the studio, which is why it stays on 127.0.0.1.
 
 import argparse
 import email.utils
+import errno
 import http.server
 import ipaddress
 import json
@@ -91,7 +92,12 @@ PAGE_CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 's
             "base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
 
 WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {"COM%d" % i for i in range(1, 10)} | {"LPT%d" % i for i in range(1, 10)}
+# Studio bookkeeping; compared in lower case because macOS and Windows disks ignore case (JOB.JSON is job.json).
 PROTECTED_JSON = {"project.json", "job.json", "exit.json", "chat.json"}
+MAX_NAME_BYTES = 200        # disks allow 255 bytes (UTF-8) per name; the rest is room for " (12)"
+WINDOWS_MAX_PATH = 259      # Windows without long-path support
+PARTIAL_UPLOAD_RE = re.compile(r"^\.upload-[0-9a-f]+\.part$")
+PARTIAL_UPLOAD_MAX_AGE = 600    # seconds without a write before a temp upload counts as abandoned
 
 
 class ApiError(Exception):
@@ -108,32 +114,63 @@ def content_type(path):
     return CONTENT_TYPES.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
 
 
+def _big_int(digits):
+    """int() of an ASCII digit string; past 18 digits just 10**18 (int() refuses more than 4300 digits)."""
+    return int(digits) if len(digits) <= 18 else 10 ** 18
+
+
+def parse_count(raw):
+    """A non-negative whole number written in ASCII digits (Content-Length, ?limit=, ?offset=), else None.
+
+    str.isdigit() is not enough: it accepts '²' and other digits int() refuses, and int() refuses
+    more than 4300 digits.
+    """
+    if not isinstance(raw, str):
+        return None
+    raw = raw.strip()
+    return int(raw) if re.fullmatch(r"[0-9]{1,18}", raw) else None
+
+
 def parse_range(header, size):
     """A single 'bytes=a-b' range as (start, end) inclusive.
 
     Returns "ignore" for headers to ignore (malformed or several ranges:
     the whole file is sent) and None when the range cannot be satisfied (416).
     """
-    m = re.match(r"^\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*$", header or "")
+    m = re.match(r"^\s*bytes\s*=\s*([0-9]*)\s*-\s*([0-9]*)\s*$", header or "")
     if not m or (m.group(1) == "" and m.group(2) == ""):
         return "ignore"
     first, last = m.group(1), m.group(2)
     if first == "":                                   # suffix: the last N bytes
-        n = int(last)
+        n = _big_int(last)
         if n == 0 or size == 0:
             return None
         return max(0, size - n), size - 1
-    start = int(first)
+    start = _big_int(first)
     if start >= size:
         return None
-    end = size - 1 if last == "" else int(last)
+    end = size - 1 if last == "" else _big_int(last)
     if end < start:
         return "ignore"
     return start, min(end, size - 1)
 
 
+def _shorten_name(stem, ext, fits):
+    """stem + ext with the stem cut (never the extension) until fits(name) holds; '' when nothing fits."""
+    if fits(stem + ext):
+        return stem + ext
+    while stem and not fits(stem + ext):
+        stem = stem[:-1]
+    stem = stem.rstrip(" .")                          # a cut can end on a space or dot (Windows drops those)
+    return stem + ext if stem else ""
+
+
 def clean_upload_name(name):
-    """A safe file name for uploads/ (ApiError 400 when the name tries to name a folder or climb out)."""
+    """A safe file name for uploads/ (ApiError 400 when the name tries to name a folder or climb out).
+
+    Long names are shortened (the extension is kept) to 150 characters and MAX_NAME_BYTES bytes of
+    UTF-8: disks count bytes, and Devanagari, CJK or emoji take 3-4 bytes a character.
+    """
     if not isinstance(name, str) or not name.strip():
         raise ApiError(400, "?name= is required")
     name = name.strip()
@@ -147,10 +184,40 @@ def clean_upload_name(name):
     stem, ext = os.path.splitext(name)
     if stem.upper().split(".")[0] in WINDOWS_RESERVED:
         stem = "_" + stem
-    if len(stem) + len(ext) > 150:
-        ext = ext[:20]
-        stem = stem[:150 - len(ext)]
-    return stem + ext
+    if len(ext) > 20 or len(ext.encode("utf-8")) > 40:
+        stem, ext = stem + ext, ""                    # not a real extension: shorten it like the rest
+    short = _shorten_name(stem, ext, lambda n: len(n) <= 150 and len(n.encode("utf-8")) <= MAX_NAME_BYTES)
+    if not short:
+        raise ApiError(400, "that file name cannot be shortened to fit; rename the file and try again")
+    return short
+
+
+def fit_upload_name(folder, name, max_path="auto"):
+    """`name` shortened so folder/name, with room for " (99)", stays within max_path characters.
+
+    max_path "auto" is WINDOWS_MAX_PATH on Windows (where long paths are often switched off) and no
+    limit elsewhere. ApiError 400 when even a short name cannot fit.
+    """
+    if max_path == "auto":
+        max_path = WINDOWS_MAX_PATH if os.name == "nt" else None
+    if not max_path:
+        return name
+    room = max_path - len(os.path.join(folder, "")) - len(" (99)")
+    stem, ext = os.path.splitext(name)
+    short = _shorten_name(stem, ext, lambda n: len(n) <= room)
+    if not short:
+        raise ApiError(400, "the project folder's path is too long for Windows to add files to it (%d characters); "
+                            "move the studio workspace to a shorter path such as C:\\studio" % len(folder))
+    return short
+
+
+def save_error(e, name):
+    """An ApiError the user can act on for an OSError hit while writing an upload or a spec."""
+    if e.errno in (errno.ENOSPC, getattr(errno, "EDQUOT", -1)) or getattr(e, "winerror", None) in (39, 112):
+        return ApiError(507, "the disk filled up while saving %s; free some space and try again" % name)
+    if e.errno == errno.ENAMETOOLONG or getattr(e, "winerror", None) == 206:
+        return ApiError(400, "the name or path of %s is too long for this disk; rename it and try again" % name)
+    return ApiError(500, "could not save %s: %s" % (name, e.strerror or e))
 
 
 def slugify(text, n=40):
@@ -242,8 +309,11 @@ class Studio:
     def __init__(self, workspace=None, runner=None, max_upload=MAX_UPLOAD, allowed_hosts=(), max_parallel=1,
                  builder=None, ask_timeout=600, quiet=False):
         self.workspace = os.path.abspath(workspace or paths.STUDIO)
-        self.projects_dir = os.path.join(self.workspace, "projects")
-        os.makedirs(self.projects_dir, exist_ok=True)
+        os.makedirs(os.path.join(self.workspace, "projects"), exist_ok=True)
+        # The real path (symlinks resolved): request paths are resolved with jobs.resolve_in, which
+        # follows symlinks, so the folder they are made relative to must be spelled the same way
+        # (macOS /var -> /private/var, a symlinked home folder or drive, a Windows junction).
+        self.projects_dir = os.path.realpath(os.path.join(self.workspace, "projects"))
         self.runner = runner or jobs.JobRunner(self.workspace, builder=builder, max_parallel=max_parallel)
         self.max_upload = int(max_upload)
         self.allowed_hosts = tuple(h.lower() for h in allowed_hosts)
@@ -254,16 +324,19 @@ class Studio:
         self._lock = threading.Lock()
         self._doctor = (0.0, None)
         self._templates = None
+        self._inflight = set()             # temp files of uploads being received
+        self.clean_partial_uploads()
 
     # ---- projects
 
     def project_dir(self, pid):
+        """The project's folder as a real path (a project folder may itself be a link to another drive)."""
         if not isinstance(pid, str) or not jobs.PROJECT_ID_RE.match(pid):
             raise ApiError(404, "no such project")
         path = os.path.join(self.projects_dir, pid)
         if not os.path.isfile(os.path.join(path, "project.json")):
             raise ApiError(404, "no such project: %s" % pid)
-        return path
+        return os.path.realpath(path)
 
     def create_project(self, name):
         name = " ".join(str(name or "").split())[:80] or "Untitled project"
@@ -359,7 +432,7 @@ class Studio:
                         candidates.append(full)
         found = []
         for full in candidates:
-            if not full.lower().endswith(".json") or os.path.basename(full) in PROTECTED_JSON:
+            if not full.lower().endswith(".json") or os.path.basename(full).lower() in PROTECTED_JSON:
                 continue
             try:
                 st = os.stat(full)
@@ -381,15 +454,21 @@ class Studio:
     # ---- uploads
 
     def save_upload(self, pid, name, stream, length, overwrite=False):
-        """Stream `length` bytes from `stream` into uploads/<name> in chunks. Returns the saved file's info."""
+        """Stream `length` bytes from `stream` into uploads/<name> in chunks. Returns the saved file's info.
+
+        The name is checked (and shortened to fit the disk) before a byte is read; disk errors while
+        writing come back as ApiErrors (507 disk full, 400 name too long), not as internal errors.
+        """
         pdir = self.project_dir(pid)
         folder = os.path.join(pdir, "uploads")
         os.makedirs(folder, exist_ok=True)
+        name = fit_upload_name(folder, name)
         free = shutil.disk_usage(folder).free
         if length + 200 * 1024 ** 2 > free:
             raise ApiError(507, "not enough disk space for this file (%.1f GB free)" % (free / 1e9))
         tmp = os.path.join(folder, ".upload-%s.part" % secrets.token_hex(6))
         got = 0
+        self._inflight.add(tmp)
         try:
             with open(tmp, "wb") as f:
                 while got < length:
@@ -408,16 +487,47 @@ class Studio:
                     while os.path.exists(final):
                         final = os.path.join(folder, "%s (%d)%s" % (stem, n, ext))
                         n += 1
-                os.replace(tmp, final)
+                jobs.replace_file(tmp, final)
+        except (ConnectionError, TimeoutError):
+            raise                                     # the browser went away: nothing to tell it
+        except OSError as e:
+            raise save_error(e, name) from None
         finally:
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
+            self._inflight.discard(tmp)
+            jobs.remove_file(tmp)
         self.touch(pid)
         base = os.path.basename(final)
         return {"name": base, "path": "uploads/" + base, "size": got, "type": jobs.file_type(base)}
+
+    def clean_partial_uploads(self, max_age=PARTIAL_UPLOAD_MAX_AGE):
+        """Remove upload temp files nobody has written to for max_age seconds (left by a studio that was
+        stopped mid-upload: closing the window or Ctrl+C does not run the upload's own clean-up)."""
+        removed = 0
+        cutoff = time.time() - max_age
+        try:
+            pids = os.listdir(self.projects_dir)
+        except OSError:
+            return 0
+        for pid in pids:
+            folder = os.path.join(self.projects_dir, pid, "uploads")
+            try:
+                names = os.listdir(folder)
+            except OSError:
+                continue
+            for name in names:
+                full = os.path.join(folder, name)
+                try:
+                    if PARTIAL_UPLOAD_RE.match(name) and os.path.getmtime(full) < cutoff and full not in self._inflight:
+                        os.remove(full)
+                        removed += 1
+                except OSError:
+                    pass
+        return removed
+
+    def drop_inflight_uploads(self):
+        """At shutdown: remove the temp files of uploads still being received (their threads die with the process)."""
+        for tmp in list(self._inflight):
+            jobs.remove_file(tmp, attempts=1)
 
     def delete_upload(self, pid, name):
         pdir = self.project_dir(pid)
@@ -433,7 +543,9 @@ class Studio:
 
     # ---- specs
 
-    def spec_path(self, pid, rel, must_exist=True):
+    def spec_path(self, pid, rel, must_exist=True, writable=False):
+        """(project folder, spec file) as real paths. With writable, the file must be somewhere specs
+        are saved: uploads/ or a job's out/ folder (never next to job.json, whose commands a job runs)."""
         pdir = self.project_dir(pid)
         if not isinstance(rel, str) or not rel.lower().endswith(".json"):
             raise ApiError(400, "path must be a .json file in the project")
@@ -441,8 +553,13 @@ class Studio:
             full = jobs.resolve_in(pdir, rel, must_exist=False)
         except jobs.PathError as e:
             raise ApiError(403, str(e)) from None
-        if os.path.basename(full) in PROTECTED_JSON:
+        if os.path.basename(full).lower() in PROTECTED_JSON:
             raise ApiError(403, "%s is studio bookkeeping, not a spec" % os.path.basename(full))
+        if writable:
+            parts = jobs.rel_to(pdir, full).lower().split("/")
+            if not ((len(parts) >= 2 and parts[0] == "uploads") or
+                    (len(parts) >= 4 and parts[0] == "jobs" and parts[2] == "out")):
+                raise ApiError(403, "specs are saved in uploads/ or in a job's out/ folder, not at %s" % rel)
         if must_exist and not os.path.isfile(full):
             raise ApiError(404, "no file %s in the project" % rel)
         return pdir, full
@@ -451,13 +568,13 @@ class Studio:
     def _family(full):
         """(folder, stem) where spec.v3.json and spec.json share stem 'spec'."""
         name = os.path.basename(full)[:-5]
-        return os.path.dirname(full), re.sub(r"\.v\d+$", "", name)
+        return os.path.dirname(full), re.sub(r"\.v[0-9]+$", "", name)
 
     def versions(self, pdir, full):
         folder, stem = self._family(full)
         out = []
         for name in os.listdir(folder):
-            m = re.match(r"^%s(?:\.v(\d+))?\.json$" % re.escape(stem), name)
+            m = re.match(r"^%s(?:\.v([0-9]{1,9}))?\.json$" % re.escape(stem), name)
             if m:
                 p = os.path.join(folder, name)
                 out.append({"path": jobs.rel_to(pdir, p), "version": int(m.group(1) or 1),
@@ -469,7 +586,7 @@ class Studio:
         folder, stem = self._family(full)
         top = 1
         for name in os.listdir(folder):
-            m = re.match(r"^%s\.v(\d+)\.json$" % re.escape(stem), name)
+            m = re.match(r"^%s\.v([0-9]{1,9})\.json$" % re.escape(stem), name)
             if m:
                 top = max(top, int(m.group(1)))
         return os.path.join(folder, "%s.v%d.json" % (stem, top + 1)), top + 1
@@ -518,7 +635,7 @@ class Studio:
     def write_spec(self, pid, rel, spec, new_version=False, force=False):
         if not isinstance(spec, dict):
             raise ApiError(400, "the body must be a JSON object (the spec)")
-        pdir, full = self.spec_path(pid, rel, must_exist=False)
+        pdir, full = self.spec_path(pid, rel, must_exist=False, writable=True)
         if not os.path.isdir(os.path.dirname(full)):
             raise ApiError(404, "folder for %s does not exist" % rel)
         errors, dur, validated = self.validate_spec(spec, os.path.dirname(full)) if "layers" in spec else ([], None, False)
@@ -528,10 +645,10 @@ class Studio:
             version = None
             if new_version:
                 full, version = self.next_version(full)
-            tmp = full + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(spec, f, indent=2, ensure_ascii=False)
-            os.replace(tmp, full)
+            try:
+                jobs.write_json(full, spec)       # temp file + replace, retried while Windows holds the file
+            except OSError as e:
+                raise save_error(e, os.path.basename(full)) from None
         self.touch(pid)
         return {"path": jobs.rel_to(pdir, full), "saved": True, "version": version, "errors": errors,
                 "validated": validated, "duration": dur}
@@ -546,30 +663,58 @@ class Studio:
         return "\n".join(lines) or "(none)"
 
     @staticmethod
-    def _media_paths(spec):
-        """Every file a spec reads (layer and audio sources, the captions style DNA)."""
+    def _font_file(value):
+        """True for a font value the renderer reads as a file (as timeline._looks_like_font_file decides)."""
+        return isinstance(value, str) and (value.lower().endswith((".ttf", ".otf", ".ttc", ".otc"))
+                                           or "/" in value or "\\" in value)
+
+    @classmethod
+    def _media_paths(cls, spec):
+        """Every file a spec makes the renderer read, as (how, value) pairs.
+
+        how is "spec" for values resolved against the spec's folder (layer and audio sources, the
+        captions style DNA, layer font files) and "cwd" for caption fonts, which the font lookup
+        opens as given (relative to the job's working folder).
+        """
         found = set()
-        for L in spec.get("layers") or []:
-            if isinstance(L, dict) and isinstance(L.get("src"), str):
-                found.add(L["src"])
-        for a in spec.get("audio") or []:
+        if not isinstance(spec, dict):
+            return found
+        layers = spec.get("layers") if isinstance(spec.get("layers"), list) else []
+        for L in layers:
+            if not isinstance(L, dict):
+                continue
+            if isinstance(L.get("src"), str):
+                found.add(("spec", L["src"]))
+            if cls._font_file(L.get("font")):
+                found.add(("spec", L["font"]))
+        audio = spec.get("audio") if isinstance(spec.get("audio"), list) else []
+        for a in audio:
             if isinstance(a, dict) and isinstance(a.get("src"), str):
-                found.add(a["src"])
+                found.add(("spec", a["src"]))
         cap = spec.get("captions")
-        if isinstance(cap, dict) and isinstance(cap.get("style_dna"), str):
-            found.add(cap["style_dna"])
+        if isinstance(cap, dict):
+            if isinstance(cap.get("style_dna"), str):
+                found.add(("spec", cap["style_dna"]))
+            style = cap.get("style") if isinstance(cap.get("style"), dict) else {}
+            fonts = [cap.get("font")] + (style.get("font_candidates") if isinstance(style.get("font_candidates"), list)
+                                         else [])
+            found.update(("cwd", f) for f in fonts if cls._font_file(f))
         return found
 
     def _foreign_media(self, old, new, spec_dir, pdir):
         """Problems for files the new spec reads that the old one did not and that lie outside the project.
 
         Claude may only use what is already in the spec or in the project folder, so an answer
-        steered by text inside analysed videos cannot point the renderer at other files.
+        steered by text inside analysed videos cannot point the renderer at other files. Paths are
+        resolved the way the renderer resolves them: '~' is the home folder, relative paths start at
+        the spec's folder (caption fonts: at the job's working folder), symlinks are followed.
         """
         problems = []
         base = os.path.realpath(pdir)
-        for src in sorted(self._media_paths(new) - self._media_paths(old)):
-            full = os.path.realpath(src if os.path.isabs(src) else os.path.join(spec_dir, src))
+        for how, src in sorted(self._media_paths(new) - self._media_paths(old)):
+            # (URLs are checked as paths too: validation refuses them, and on Windows "c://x" is a drive)
+            start = spec_dir if how == "spec" else paths.REPO
+            full = os.path.realpath(os.path.join(start, os.path.expanduser(src)))
             try:
                 inside = os.path.commonpath([base, full]) == base
             except ValueError:
@@ -626,7 +771,7 @@ class Studio:
             raise ApiError(400, "message is required")
         if len(message) > 4000:
             raise ApiError(400, "message is too long (4000 characters at most)")
-        pdir, full = self.spec_path(pid, spec_rel)
+        pdir, full = self.spec_path(pid, spec_rel, writable=True)     # the answer is saved next to it
         with open(full, encoding="utf-8") as f:
             try:
                 spec = json.load(f)
@@ -691,7 +836,10 @@ class Studio:
                            spec=new_spec, summary=summary, saved=False)
         with self._lock:
             new_full, version = self.next_version(full)
-            jobs.write_json(new_full, new_spec)
+            try:
+                jobs.write_json(new_full, new_spec)
+            except OSError as e:
+                raise save_error(e, os.path.basename(new_full)) from None
         record["new_path"] = jobs.rel_to(pdir, new_full)
         self._log_ask(pid, record)
         self.touch(pid)
@@ -769,8 +917,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             sys.stderr.write("  " + (fmt % args) + "\n")
 
     def handle_expect_100(self):
-        length = self.headers.get("Content-Length")
-        if length and length.isdigit() and int(length) > self.studio.max_upload:
+        length = parse_count(self.headers.get("Content-Length"))
+        if length is not None and length > self.studio.max_upload:
             self._body_read = True
             self.close_connection = True
             self._send_json(413, {"error": "file too large (limit %.1f GB)" % (self.studio.max_upload / 1024 ** 3)})
@@ -800,10 +948,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
             self.close_connection = True
             raise ApiError(411, "send a Content-Length (chunked uploads are not supported)")
-        raw = self.headers.get("Content-Length")
-        if raw is None or not raw.strip().isdigit():
-            raise ApiError(411, "Content-Length is required")
-        return int(raw)
+        length = parse_count(self.headers.get("Content-Length"))
+        if length is None:                         # (_fail closes the connection when one was sent unreadable)
+            raise ApiError(411, "a Content-Length (a whole number of bytes) is required")
+        return length
 
     def _read_json(self):
         length = self._content_length()
@@ -824,7 +972,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self._body_read:
             return
         raw = self.headers.get("Content-Length")
-        length = int(raw) if raw and raw.isdigit() else 0
+        length = parse_count(raw)
+        if length is None and raw is not None:
+            self.close_connection = True           # a length we cannot read: do not guess where the body ends
+            length = 0
         if length and length <= 1024 * 1024:
             self.rfile.read(length)
         elif length:
@@ -904,10 +1055,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._fail(500, {"error": "internal error: %s: %s" % (type(e).__name__, e)})
 
     def _fail(self, status, obj):
-        if not self._body_read:
-            raw = self.headers.get("Content-Length")
-            if raw and raw.isdigit() and int(raw) > 0:
-                self.close_connection = True       # the unread body must not be parsed as the next request
+        """Answer an error. Never raises: it runs inside the request's exception handler."""
+        try:
+            if not getattr(self, "_body_read", True):
+                raw = self.headers.get("Content-Length")
+                if raw is not None and parse_count(raw) != 0:
+                    self.close_connection = True   # the unread body must not be parsed as the next request
+        except Exception:
+            self.close_connection = True
         try:
             self._send_json(status, obj)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -1057,7 +1212,8 @@ def r_jobs(h, q):
     pid = q.get("project") or None
     if pid:
         h.studio.project_dir(pid)
-    return h.studio.runner.list(pid, limit=int(q.get("limit") or 200) if (q.get("limit") or "").isdigit() else 200)
+    limit = parse_count(q.get("limit"))
+    return h.studio.runner.list(pid, limit=200 if limit is None else limit)
 
 
 def _job_or_404(h, jid):
@@ -1078,8 +1234,7 @@ def r_job(h, q, jid):
 @route("GET", r"/api/jobs/([^/]+)/log")
 def r_job_log(h, q, jid):
     _job_or_404(h, jid)
-    offset = int(q.get("offset")) if (q.get("offset") or "").isdigit() else 0
-    text, nxt, size = h.studio.runner.log(jid, offset)
+    text, nxt, size = h.studio.runner.log(jid, parse_count(q.get("offset")) or 0)
     return {"text": text, "offset": nxt, "size": size}
 
 
@@ -1207,6 +1362,7 @@ def main(argv=None):
         print("\nstopping")
     finally:
         httpd.server_close()
+        httpd.studio.drop_inflight_uploads()     # half-received files; the rest is cleaned at the next start
         left = httpd.studio.runner.close()
         if left:
             print("%d job(s) still running; they keep going and show up when the studio starts again." % left)

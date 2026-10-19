@@ -72,10 +72,18 @@ def load_rgb(path, width=WORK_WIDTH, trim=True):
 
 
 def trim_bars(rgb, level=18, max_share=0.3):
-    """Crop flat near-black rows/columns at the edges (letterbox / pillarbox padding)."""
+    """Crop the black padding YouTube adds to its 4:3 thumbnail sizes (hqdefault 480x360, sddefault
+    640x480): letterbox bars above and below a 16:9 picture, pillarbox bars beside a vertical one.
+
+    Only a 4:3 image is ever trimmed, and only bars that are symmetric (padding is): a 16:9 thumbnail
+    (maxresdefault) with a dark design keeps its dark edges, which are part of what it looks like.
+    Where the dark design runs on past the padding, exactly the padding a 16:9 (or 9:16) picture
+    needs is cut, never the design."""
     import numpy as np
     lum = rgb.mean(axis=2)
     h, w = lum.shape
+    if not h or not w or abs(w / float(h) - 4 / 3.0) > 0.04:
+        return np.ascontiguousarray(rgb)
 
     def edge(lines, limit):
         n = 0
@@ -87,13 +95,23 @@ def trim_bars(rgb, level=18, max_share=0.3):
                 break
         return n
 
+    def pair(a, b, size, expected):
+        """(cut_a, cut_b) for one axis: the expected padding when both bars reach it, else
+        symmetric bars covering at least 4% of the axis, else nothing."""
+        if expected > 0 and a >= expected - 2 and b >= expected - 2:
+            return expected, expected
+        if a + b >= size * 0.04 and abs(a - b) <= max(2, 0.02 * size):
+            return min(a, b), min(a, b)
+        return 0, 0
+
     top = edge(lum, int(h * max_share))
     bottom = edge(lum[::-1], int(h * max_share))
-    left = edge(lum.T, int(w * max_share))
-    right = edge(lum.T[::-1], int(w * max_share))
-    # a thin dark border is part of the design; only strip real padding
-    top, bottom = (top, bottom) if top + bottom >= h * 0.04 else (0, 0)
-    left, right = (left, right) if left + right >= w * 0.04 else (0, 0)
+    top, bottom = pair(top, bottom, h, int(round((h - w * 9 / 16.0) / 2)))
+    left = right = 0
+    if not (top or bottom):
+        left = edge(lum.T, int(w * 0.45))
+        right = edge(lum.T[::-1], int(w * 0.45))
+        left, right = pair(left, right, w, int(round((w - h * 9 / 16.0) / 2)))
     if top or bottom or left or right:
         rgb = rgb[top:h - bottom, left:w - right]
     return np.ascontiguousarray(rgb)
@@ -489,12 +507,59 @@ def _font(size, weight="SemiBold"):
         return ImageFont.load_default()
 
 
-def _ellipsize(draw, text, font, width):
-    if draw.textlength(text, font=font) <= width:
-        return text
-    while text and draw.textlength(text + "...", font=font) > width:
-        text = text[:-1]
-    return text.rstrip() + "..."
+def _runs(text, size, weight):
+    """[[segment, font]] that draw `text` with Inter and, for characters Inter has no glyph for
+    (Devanagari, CJK, Arabic, symbols...), an installed font that has them (fonts.glyph_fallbacks:
+    Nirmala UI / Yu Gothic on Windows, Kohinoor / Hiragino on macOS, Noto on Linux). Characters no
+    installed font can draw (colour emoji) are left out rather than drawn as boxes."""
+    primary = _font(size, weight)
+    try:
+        from . import fonts
+        found, nobody = fonts.glyph_fallbacks("Inter %s" % weight, text)
+    except Exception:  # no font index: Inter (or Pillow's default) alone
+        return [[text, primary]]
+    if not found and not nobody:
+        return [[text, primary]]
+    faces, runs = {}, []
+    for ch in text:
+        if ch in nobody:
+            continue
+        e = found.get(ch)
+        if e is not None:
+            key = (e["path"], e.get("index", 0), e.get("want_weight"))
+            if key not in faces:
+                try:
+                    faces[key] = fonts.load_face(e, size)
+                except Exception:  # unloadable fallback: Inter's box beats no text
+                    faces[key] = primary
+            f = faces[key]
+        elif runs and not fonts.needs_glyph(ch):
+            f = runs[-1][1]   # marks, joiners, spaces: the font of the character before them
+        else:
+            f = primary
+        if runs and runs[-1][1] is f:
+            runs[-1][0] += ch
+        else:
+            runs.append([ch, f])
+    return runs
+
+
+def _draw_label(draw, xy, text, size, weight, fill, width):
+    """Draw one label line in up to `width` px (ellipsized), with per-script fallback fonts."""
+    runs = _runs(text, size, weight)
+    total = lambda rs: sum(draw.textlength(t, font=f) for t, f in rs)
+    if total(runs) > width:
+        dots = draw.textlength("...", font=runs[-1][1] if runs else _font(size, weight))
+        while runs and total(runs) + dots > width:
+            runs[-1][0] = runs[-1][0][:-1]
+            if not runs[-1][0]:
+                runs.pop()
+        if runs:
+            runs[-1][0] = runs[-1][0].rstrip() + "..."
+    x, y = xy
+    for t, f in runs:
+        draw.text((x, y), t, font=f, fill=fill)
+        x += draw.textlength(t, font=f)
 
 
 def sheet(paths, out_path, labels=None, cols=4, tile_w=320, title=None):
@@ -518,7 +583,7 @@ def sheet(paths, out_path, labels=None, cols=4, tile_w=320, title=None):
     tile_h = int(round(tile_w * min(1.8, max(0.5, statistics.median(aspects)))))
     k = tile_w / 320.0
     pad = int(round(10 * k))
-    f_bold, f_reg = _font(int(round(15 * k)), "Bold"), _font(int(round(13 * k)), "Regular")
+    s_bold, s_reg = int(round(15 * k)), int(round(13 * k))
     n_lines = max(len(lbl.split("\n")) if lbl else 0 for _, lbl in items)
     line_h = int(round(19 * k))
     label_h = pad // 2 + n_lines * line_h + pad // 2 if n_lines else 0
@@ -530,8 +595,7 @@ def sheet(paths, out_path, labels=None, cols=4, tile_w=320, title=None):
     canvas = Image.new("RGB", (W, H), (22, 22, 28))
     draw = ImageDraw.Draw(canvas)
     if title:
-        draw.text((pad, pad), _ellipsize(draw, title, _font(int(round(20 * k)), "Bold"), W - 2 * pad),
-                  font=_font(int(round(20 * k)), "Bold"), fill=(245, 245, 245))
+        _draw_label(draw, (pad, pad), title, int(round(20 * k)), "Bold", (245, 245, 245), W - 2 * pad)
     for i, (im, lbl) in enumerate(items):
         r, c = divmod(i, cols)
         x0 = pad + c * (tile_w + pad)
@@ -541,10 +605,8 @@ def sheet(paths, out_path, labels=None, cols=4, tile_w=320, title=None):
         tw, th = max(1, int(round(im.width * s))), max(1, int(round(im.height * s)))
         canvas.paste(im.resize((tw, th), Image.LANCZOS), (x0 + (tile_w - tw) // 2, y0 + (tile_h - th) // 2))
         for j, line in enumerate(lbl.split("\n")[:n_lines] if lbl else []):
-            font = f_bold if j == 0 else f_reg
-            color = (255, 229, 0) if j == 0 else (215, 215, 222)
-            draw.text((x0, y0 + tile_h + pad // 2 + j * line_h), _ellipsize(draw, line, font, tile_w),
-                      font=font, fill=color)
+            _draw_label(draw, (x0, y0 + tile_h + pad // 2 + j * line_h), line, s_bold if j == 0 else s_reg,
+                        "Bold" if j == 0 else "Regular", (255, 229, 0) if j == 0 else (215, 215, 222), tile_w)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     canvas.save(out_path, "JPEG", quality=88)
     return out_path

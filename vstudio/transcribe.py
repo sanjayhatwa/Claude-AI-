@@ -11,9 +11,12 @@ Where the words come from, best first:
                     [{"word","start","end"}], {"words": [...]}, whisper-style
                     {"segments": [{"words": [...]}]} or {"segments": [{"start","end","text"}]},
                     or YouTube json3
-    2. captions     an SRT / VTT / json3 captions file (extract.load_captions);
-                    cue text is spread evenly over the cue, so word edges are
-                    approximate (autoedit refines them against the audio)
+    2. captions     an SRT / VTT / json3 captions file (SRT and json3 parsed by
+                    extract.py, WebVTT by parse_vtt here: cue settings, tags,
+                    [Music] and YouTube's rolling repeated lines are not words,
+                    and auto-subs' inline <00:00:01.280> stamps time each word);
+                    otherwise cue text is spread evenly over the cue, so word
+                    edges are approximate (autoedit refines them against the audio)
     3. a sidecar    with neither given: <video>.srt / .vtt / .json3 / .words.json
                     next to the video, the way CapCut and Premiere export them
     4. whisper      local faster-whisper on the media (extract.whisper_words),
@@ -27,9 +30,10 @@ remap() maps source-time words to output time: a word is kept when most of it
 (at least half, or 0.12 s) survives inside one kept segment, clipped to that
 segment; words that fell in a cut disappear. Extra keys on the words are kept.
 
-Limits: captions files only time whole cues, so word timing inside a cue is
-an estimate; whisper needs `pip install faster-whisper` and downloads its
-model (about 500 MB for "small") on first use.
+Limits: SRT files and VTT files without inline stamps only time whole cues,
+so word timing inside a cue is an estimate; whisper needs `pip install
+faster-whisper` and downloads its model (about 500 MB for "small") on first
+use.
 """
 
 import bisect

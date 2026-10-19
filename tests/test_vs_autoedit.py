@@ -510,7 +510,10 @@ class TestReframe(unittest.TestCase):
             if not path:
                 self.skipTest("YuNet model not on disk (set VSTUDIO_NET_TESTS=1 to download it)")
             self.assertTrue(reframe._valid(path))
-            self.assertEqual(reframe.method(), "yunet")
+            how = reframe.method()
+            if reframe._STATE["broken"]:
+                self.skipTest("this OpenCV cannot run the YuNet model (4.8 or newer can)")
+            self.assertEqual(how, "yunet")
             self.assertEqual(reframe.detect_faces(np.full((360, 640, 3), 127, np.uint8)), [])
         finally:
             paths.MODELS = T["models"]
@@ -569,7 +572,7 @@ class TestReframe(unittest.TestCase):
                                 "shape[i] == 1 || outShape[i] == 1 in function 'findCommonShape'")
 
         real = cv2.FaceDetectorYN
-        reframe._STATE.update(yunet=None, yunet_path=None)
+        reframe._STATE.update(yunet=None, yunet_path=None, broken=None)
 
         class FakeYN:
             @staticmethod
@@ -587,7 +590,7 @@ class TestReframe(unittest.TestCase):
                     self.assertEqual(tr["found"], 0)
         finally:
             cv2.FaceDetectorYN = real
-            reframe._STATE.update(yunet=None, yunet_path=None)
+            reframe._STATE.update(yunet=None, yunet_path=None, broken=None)
         self.assertIn("opencv-python", err.getvalue(), "the note says how to get a working detector")
 
     def test_model_download_trusts_certifi(self):

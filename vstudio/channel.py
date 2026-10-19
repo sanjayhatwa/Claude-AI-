@@ -22,7 +22,10 @@ Per channel, in order:
                  which patterns over-index among the outliers
   6 topics       every video tagged with 1-3 topics: TF-IDF keyword topics
                  from title + tags + description, merged when they cover the
-                 same videos; per topic: count, median multiple, trend
+                 same videos; per topic: count, median multiple, trend. Words
+                 in any script (accents folded, Hindi and Japanese included),
+                 with the function words of the common creator languages and
+                 reach hashtags (#fyp, #viral, #foryoupage...) left out
   7 thumbnails   thumbs.analyze_thumb on long-form thumbnails (text, palette,
                  light, busyness, faces, composition), the traits that
                  over-index among outliers, and thumbs_sheet.jpg
@@ -30,7 +33,10 @@ Per channel, in order:
                  videos through viral-extract: caption style, dialogue DNA
                  (pace, word spacing, sentence rhythm, hook, re-hooks) and edit
                  DNA (cuts, shot length); an ENERGY score 0-100 and the
-                 content type (talking head, voice-over + b-roll, ...)
+                 content type (talking head, voice-over + b-roll, ...). The
+                 words come from the platform's captions (json3, VTT or SRT) in
+                 the language spoken, never YouTube's machine translation, else
+                 local faster-whisper (transcript_source names the track)
 
 Writes into --out-dir: CHANNEL_DNA.json (everything), CHANNEL_DNA.md (the
 read), thumbs_sheet.jpg (top outliers; one per channel as
@@ -43,23 +49,33 @@ pause of about a second between calls (longer after a rate limit), with no
 login and no cookies. Instagram and most TikTok profiles need a logged-in
 browser: the report says "not public / needs your browser" and moves on; this
 never asks for a password. For TikTok, a link to one of the account's videos
-often works where the profile page does not (the account is listed by its id).
+(or a share link: vm.tiktok.com/..., tiktok.com/t/...) often works where the
+profile page does not (the account is listed by its id).
 
 Time: the inventory and metadata take about 2 s per looked-up video (the
 polite pause included), thumbnails well under a second each, and each deep
 dive about a minute (download, cut and beat analysis, OCR every 0.3-0.5 s).
 
+The default --out-dir is workspace/channels/<handle> ("video-<id>" for a
+YouTube video link, "channel-<hash>" for a handle no ASCII slug can spell).
+
 Limits, said plainly: public numbers only (no CTR, retention or revenue);
-views of the newest uploads are still growing; topic tags come from words, so
-a channel that titles everything vaguely gets vague topics; the content type
-and energy score are heuristics with their evidence printed next to them; and
-nothing here can say WHY a video travelled, only what the winners share.
+members-only, age-restricted and private videos are listed but cannot be
+looked up or deep-dived logged out (the gaps count them); a channel whose
+median is 0 views gets multiples against the median of its videos that have
+views, said in the report; views of the newest uploads are still growing;
+topic tags come from words, so a channel that titles everything vaguely gets
+vague topics (and none when no word is shared, which the gaps say); the
+content type and energy score are heuristics with their evidence printed next
+to them; and nothing here can say WHY a video travelled, only what the
+winners share.
 """
 
 import argparse
 import collections
 import contextlib
 import datetime as dt
+import hashlib
 import importlib.util
 import io
 import json
@@ -103,7 +119,17 @@ you're you've we're they're doesn't aren't wasn't shouldn't couldn't wouldn't go
 sure ever even still back look looks looking try tried trying see seen good great better best really actually
 literally basically link bio below above sponsor sponsored affiliate code discount amazon available click
 live livestream stream streaming premiere q&a
+fyp fypage foryou foryoupage viral viralvideo viralvideos trending xyzbca xyzabc capcut instagood explorepage
+reelsinstagram ytshorts shortsfeed
 """.split())
+# reach hashtags: tags asking the algorithm for distribution, not saying what the video is about. They sit on
+# every video of a TikTok or Reels profile and would otherwise become its "topics" (matched accent-folded)
+REACH_TAG_RE = re.compile(
+    r"^(?:fy[pf]?\w*|for ?you\w*|for ?your ?page|viral\w*|goviral|trend(?:s|ing|y)\w*|explore\w*|xyz\w*|"
+    r"tiktok\w*|capcut\w*|reels?(?:instagram|video|s?viral|trending|it\w*|daily)\w*|"
+    r"insta(?:good|daily|like\w*|reels?|gram\w*)|parati\w*|pourtoi\w*|fuer?dich|perte|kesfet\w*|"
+    r"follow(?:me|for\w*|back|4\w*)|like(?:4|for)like\w*|f4f|l4l|blowthisup|makemefamous|"
+    r"shorts(?:feed|video|viral|youtube)?|yt ?shorts?|youtube ?shorts?|youtube)$")
 # function words of the languages creators title in most besides English (radar's STOP has English):
 # Spanish, Portuguese, French, German, Italian, Indonesian and Hindi (Devanagari and romanized).
 # Compared after accent folding, so a word with and without its accents is one entry.
@@ -204,6 +230,21 @@ def _is_rate_limit(msg):
     return bool(re.search(r"\b429\b|too many requests|rate.?limit", msg or "", re.I))
 
 
+RESTRICTED = ("subscriber_only", "premium_only", "needs_auth")   # yt-dlp availability no logged-out reader gets
+
+
+def _video_skip(msg):
+    """True when a lookup failed because of this one video (members-only, age-restricted, private,
+    removed, upcoming, geo-blocked), not because of the connection or a rate limit: skip it and go on."""
+    m = (msg or "").lower()
+    if not m or _is_rate_limit(m) or re.search(r"not a bot|unusual traffic", m):
+        return False
+    return bool(re.search(r"members.only|join this channel|confirm your age|age.restrict|inappropriate for some users|"
+                          r"private video|video is private|video unavailable|no longer available|has been removed|"
+                          r"account .*terminated|copyright|premieres? in|live event will begin|"
+                          r"not (?:made )?available in your country|blocked it in your country", m))
+
+
 def _is_missing_tab(msg):
     return bool(re.search(r"does not have an? \w+ tab|no (?:videos|shorts|streams)|playlist does not exist",
                           msg or "", re.I))
@@ -242,7 +283,7 @@ class YtDlpFetch:
     video_meta(url)               -> yt-dlp info dict or None
     download_thumb(url, path)     -> saved JPEG path or None (maxresdefault falls back to hqdefault)
     download_clip(url, path, s)   -> video path (first s seconds) or None
-    captions(url, dir)            -> json3 captions path or None
+    captions(url, dir)            -> captions file path (json3 / vtt / srt) or None
     last_error                    -> the last failure message (None after a success)
 
     At least PAUSE seconds between yt-dlp calls; on a rate limit it backs off and retries twice.
@@ -254,6 +295,7 @@ class YtDlpFetch:
         self.pause = pause
         self.last_error = None
         self._last = 0.0
+        self._lang = {}   # video url -> its spoken language from video_meta (picks the captions track)
 
     @staticmethod
     def available():
@@ -292,7 +334,10 @@ class YtDlpFetch:
         return self._json(["--flat-playlist", "-J", "--playlist-end", str(int(limit)), target], timeout=300)
 
     def video_meta(self, url):
-        return self._json(["-j", "--skip-download", "--no-playlist", url], timeout=120)
+        data = self._json(["-j", "--skip-download", "--no-playlist", url], timeout=120)
+        if isinstance(data, dict) and isinstance(data.get("language"), str):
+            self._lang[url] = data["language"]
+        return data
 
     def download_thumb(self, url, path):
         urls = [url]
@@ -302,7 +347,7 @@ class YtDlpFetch:
             self._wait(THUMB_PAUSE)
             try:
                 req = urllib.request.Request(u, headers={"User-Agent": UA})
-                with urllib.request.urlopen(req, timeout=20) as r:
+                with urllib.request.urlopen(req, timeout=20, context=_ssl_context()) as r:
                     raw = r.read()
                 from PIL import Image
                 im = Image.open(io.BytesIO(raw)).convert("RGB")
@@ -345,19 +390,38 @@ class YtDlpFetch:
         return os.path.join(folder, "%s.mp4" % stem if "%s.mp4" % stem in made else made[0])
 
     def captions(self, url, dir):
+        """The captions file holding what was said (extract.pick_captions: the original-language
+        speech track first, never a machine translation over it), as json3, VTT or SRT."""
         os.makedirs(dir, exist_ok=True)
-        self._run(["--skip-download", "--write-subs", "--write-auto-subs", "--sub-langs", "en.*,en,.*-orig",
-                   "--sub-format", "json3", "-o", os.path.join(dir, "subs"), url], timeout=180)
-        files = sorted(f for f in os.listdir(dir) if f.startswith("subs") and f.endswith(".json3"))
-        if not files:
-            return None
-        best = [f for f in files if f == "subs.en.json3"] or [f for f in files if ".en" in f] or files
-        return os.path.join(dir, best[0])
+        lang = self._lang.get(url)
+        langs = "en.*,en,.*-orig" + (",%s,%s-.*" % (lang, lang) if lang and re.match(r"^[\w-]+$", lang) else "")
+        # TikTok and Instagram offer VTT/SRT only; json3 (YouTube) has a time per word
+        self._run(["--skip-download", "--write-subs", "--write-auto-subs", "--sub-langs", langs,
+                   "--sub-format", "json3/vtt/srt", "-o", os.path.join(dir, "subs"), url], timeout=180)
+        best = paths.load_skill("extract").pick_captions([f for f in os.listdir(dir) if f.startswith("subs.")], lang)
+        return os.path.join(dir, best) if best else None
+
+
+def _ssl_context():
+    """The TLS context fonts.py downloads with: certifi's CA bundle when there is one, because
+    python.org's Python for macOS ships without system certificates (every HTTPS request would fail
+    certificate checks there; yt-dlp is unaffected since it bundles certifi)."""
+    try:
+        from . import fonts
+        return fonts._ssl_context()
+    except Exception:  # fonts unavailable: the default context
+        import ssl
+        return ssl.create_default_context()
+
+
+SSL_HINT = ("the downloads failed TLS certificate checks: on a python.org Python for macOS run \"Install "
+            "Certificates.command\" from its Applications folder (or python -m pip install certifi)")
 
 
 # --------------------------------------------------------------------------- urls
 
 YT_VIDEO_RE = re.compile(r"(?:youtube\.com/(?:watch\?(?:.*&)?v=|shorts/|live/|embed/)|youtu\.be/)([A-Za-z0-9_-]{11})")
+TT_PROFILE_RE = re.compile(r"^https://www\.tiktok\.com/@[^/?#]+/?(?:[?#].*)?$", re.I)
 YT_BASE_RE = re.compile(r"(https?://www\.youtube\.com/(?:@[^/?#]+|channel/[^/?#]+|c/[^/?#]+|user/[^/?#]+))", re.I)
 
 
@@ -397,8 +461,15 @@ def youtube_channel_base(url):
 
 
 def slug(text):
-    s = re.sub(r"[^A-Za-z0-9]+", "-", (text or "").replace("@", "")).strip("-").lower()
-    return s[:48] or "channel"
+    """A folder / file name part: ASCII letters and digits, accents dropped (an accented "Cafe Lab" -> "cafe-lab").
+    A name in a script ASCII cannot spell (Devanagari, CJK, ...) gets a short hash of the name, so two
+    such channels never share "channel" (or one another's folder)."""
+    raw = (text or "").replace("@", "").strip()
+    t = "".join(c for c in unicodedata.normalize("NFD", raw.replace("\u00df", "ss")) if not unicodedata.combining(c))
+    s = re.sub(r"[^A-Za-z0-9]+", "-", t).strip("-").lower()[:48].strip("-")
+    if any(c.isalnum() and not c.isascii() for c in t):
+        s = (s[:39] + "-" if s else "channel-") + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+    return s or "channel"
 
 
 def _safe_id(vid):
@@ -416,16 +487,24 @@ def _r(v, nd=1):
     return None if v is None else round(v, nd)
 
 
+def _int(v):
+    """A median rounded to a whole number, as an int (None stays None): "176 wpm", never "176.0"."""
+    return None if v is None else int(round(v))
+
+
 def _n(v):
-    """1234567 -> 1.2M."""
+    """1234567 -> 1.2M; the unit is picked after rounding, so 999950 is 1M, not 1000K."""
     if v is None:
         return "n/a"
     v = float(v)
-    for div, suf in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
-        if abs(v) >= div:
-            s = "%.1f" % (v / div)
+    if abs(round(v)) < 1000:
+        return str(int(round(v)))
+    units = ((1e3, "K"), (1e6, "M"), (1e9, "B"))
+    for i, (div, suf) in enumerate(units):
+        r = round(v / div, 1)
+        if abs(r) < 1000 or i == len(units) - 1:
+            s = "%.1f" % r
             return (s[:-2] if s.endswith(".0") else s) + suf
-    return str(int(round(v)))
 
 
 def _g(v, nd=1):
@@ -465,8 +544,15 @@ def _cap(text):
 
 
 def _handle_from_url(url):
-    """"@name" from a profile or channel URL (its last path part), or the host."""
+    """"@name" from a profile or channel URL (its last path part, or the "@name" part of a TikTok or
+    Instagram video link), "video-<id>" for a YouTube video link, or the host."""
+    m = YT_VIDEO_RE.search(url or "") if platform_of(url) == "youtube" and not youtube_channel_base(url) else None
+    if m:
+        return "video-%s" % m.group(1)
     parts = [p for p in re.sub(r"^https?://", "", url or "").split("?")[0].split("/") if p]
+    at = [p for p in parts[1:] if p.startswith("@")]
+    if at:
+        return at[0]
     tail = parts[-1] if len(parts) > 1 else (parts[0] if parts else "")
     if tail in ("videos", "shorts", "streams", "featured", "reels") and len(parts) > 2:
         tail = parts[-2]
@@ -517,6 +603,8 @@ def _record(e, fmt, idx, n, platform):
         "timestamp": e.get("timestamp"), "upload_date": e.get("upload_date"),
         "meta": False, "sample": None,
     }
+    if e.get("availability") in RESTRICTED:
+        rec["restricted"] = e["availability"]
     if not rec["upload_date"] and rec["timestamp"]:
         rec["upload_date"] = dt.datetime.fromtimestamp(rec["timestamp"], dt.timezone.utc).strftime("%Y%m%d")
     thumbs = e.get("thumbnails") or []
@@ -616,35 +704,55 @@ def metadata(ch, recs, fetch, max_videos):
             r["sample"] = "top"
             todo.append(r)
     todo = [r for r in todo if r["platform"] == "youtube" or r.get("views") is None or not r.get("upload_date")]
+    locked = [r for r in todo if r.get("restricted")]   # members-only and the like: no logged-out lookup works
+    todo = [r for r in todo if not r.get("restricted")]
     fails = done = 0
     for i, r in enumerate(todo, 1):
         if i == 1 or i % 10 == 0:
             log("  metadata %d/%d" % (i, len(todo)))
         m = fetch.video_meta(r["url"])
         if not m:
-            fails += 1
+            err = getattr(fetch, "last_error", None) or ""
+            if _video_skip(err):   # this video only (members-only, age-restricted...): skip it, keep going
+                r["restricted"] = _cell(err.replace("ERROR:", ""), 120)
+                locked.append(r)
+                continue
+            fails += 1   # only connection trouble and rate limits count towards stopping
             if fails >= 5:
-                err = getattr(fetch, "last_error", None) or "no answer"
                 ch["gaps"].append("Metadata lookups kept failing (%s); stopped after %d of %d to stay polite: "
-                                  "dates, likes and tags are missing for the rest." % (_cell(err, 120), i, len(todo)))
+                                  "dates, likes and tags are missing for the rest." % (_cell(err or "no answer", 120),
+                                                                                      i, len(todo)))
                 break
             continue
         fails = 0
         done += 1
         apply_meta(r, m, ch)
-    return done, len(todo)
+    if locked:
+        ch["gaps"].append("%d video(s) cannot be read without logging in (members-only, age-restricted, private or "
+                          "removed) and were not looked up or deep-dived; their listed views still count." % len(locked))
+    skipped = {id(r) for r in locked}
+    return done, sum(1 for r in todo if id(r) not in skipped)
 
 
 # --------------------------------------------------------------------------- 3. performance
 
 def assign_multiples(recs):
-    """views / the median views of the video's own format; None when the format has < MIN_BASELINE videos."""
+    """views / the median views of the video's own format; None when the format has < MIN_BASELINE videos.
+
+    Returns {format: {"median", "base", "with_views", "zero"}}. A new channel's median can be 0 views
+    (most uploads not seen yet): then the multiples are against the median of the videos that have
+    views ("base"), when at least MIN_BASELINE do, and the report says so; otherwise they are undefined."""
     baselines = {}
     for fmt in ("long", "short", "live"):
         rs = [r for r in recs if r["format"] == fmt]
         views = [r["views"] for r in rs if r.get("views") is not None]
-        base = statistics.median(views) if len(views) >= MIN_BASELINE else None
-        baselines[fmt] = base
+        med = statistics.median(views) if len(views) >= MIN_BASELINE else None
+        base = med
+        if med == 0:
+            seen = [v for v in views if v > 0]
+            base = statistics.median(seen) if len(seen) >= MIN_BASELINE else None
+        baselines[fmt] = {"median": med, "base": base, "with_views": len(views),
+                          "zero": sum(1 for v in views if v == 0)}
         for r in rs:
             r["multiple"] = round(r["views"] / base, 2) if base and r.get("views") is not None else None
     radar = _skill("radar")
@@ -664,9 +772,26 @@ def _brief(r):
             "url": r.get("url"), "topics": r.get("topics") or []}
 
 
+def _baseline_note(b):
+    """What the report says about a format's baseline (None when it is the plain median)."""
+    if b.get("median") is None:
+        return "fewer than %d videos with views: no baseline, so no multiples or outliers for them" % MIN_BASELINE
+    if b["median"] == 0 and b.get("base"):
+        return ("the median is 0 views (%d of %d have none yet), so multiples are against the median of the "
+                "videos with views (%s)" % (b["zero"], b["with_views"], _n(b["base"])))
+    if b["median"] == 0:
+        return ("the median is 0 views (%d of %d have none yet) and fewer than %d have any: multiples are "
+                "undefined" % (b["zero"], b["with_views"], MIN_BASELINE))
+    return None
+
+
 def format_stats(recs, fmt, base):
-    """Baseline, outliers, engagement, velocity, best/worst and momentum for one format."""
+    """Baseline, outliers, engagement, velocity, best/worst and momentum for one format.
+    `base` is the format's entry from assign_multiples (a plain median is accepted too)."""
+    b = base if isinstance(base, dict) else {"median": base, "base": base}
     rs = [r for r in recs if r["format"] == fmt]
+    b.setdefault("with_views", sum(1 for r in rs if r.get("views") is not None))
+    b.setdefault("zero", sum(1 for r in rs if r.get("views") == 0))
     views = sorted(r["views"] for r in rs if r.get("views") is not None)
     ranked = sorted((r for r in rs if r.get("multiple") is not None), key=lambda r: -r["multiple"])
     newest = sorted((r for r in rs if r.get("views") is not None), key=lambda r: r["rank"])
@@ -687,8 +812,9 @@ def format_stats(recs, fmt, base):
     return {
         "listed": len(rs),
         "with_views": len(views),
-        "median_views": round(base) if base else None,
-        "baseline_note": None if base else "fewer than %d videos with views: no baseline" % MIN_BASELINE,
+        "median_views": round(b["median"]) if b["median"] is not None else None,
+        "baseline_views": round(b["base"]) if b.get("base") else None,
+        "baseline_note": _baseline_note(b),
         "mean_views": round(statistics.mean(views)) if views else None,
         "p90_views": views[min(len(views) - 1, int(0.9 * len(views)))] if views else None,
         "max_views": views[-1] if views else None,
@@ -1012,6 +1138,8 @@ def _split_hashtags(recs):
     vocab = {w for t in texts for w in _rx("word").findall(_rx("hashtag").sub(" ", t.lower())) if len(w) >= 2}
 
     def split(tag):
+        if REACH_TAG_RE.match(_fold(tag.lower())):
+            return " . "   # #fyp, #viral, #foryoupage...: a break, never a topic word
         parts = extract.word_break(tag, vocab)
         if len(parts) == 1 and tag.lower().endswith("s"):   # "#budgetmeals" when only "meal" is written out
             parts = extract.word_break(tag[:-1], vocab)
@@ -1212,7 +1340,7 @@ def thumbnails(ch, recs, fetch, out_dir, detector):
             pick.append(r)
     tdir = os.path.join(out_dir, "thumbs")
     os.makedirs(tdir, exist_ok=True)
-    failed = 0
+    failed, ssl_failed = 0, 0
     for i, r in enumerate(pick, 1):
         if i == 1 or i % 10 == 0:
             log("  thumbnails %d/%d" % (i, len(pick)))
@@ -1222,6 +1350,8 @@ def thumbnails(ch, recs, fetch, out_dir, detector):
             got = fetch.download_thumb(url, path) if url else None
             if not got or not os.path.isfile(got):
                 failed += 1
+                if re.search(r"certificate verify failed|ssl", str(getattr(fetch, "last_error", None) or ""), re.I):
+                    ssl_failed += 1
                 continue
             path = got
         try:
@@ -1234,7 +1364,8 @@ def thumbnails(ch, recs, fetch, out_dir, detector):
         r["thumb"] = t
     done = [r for r in pick if r.get("thumb")]
     if failed:
-        ch["gaps"].append("%d of %d thumbnails could not be downloaded or read." % (failed, len(pick)))
+        ch["gaps"].append("%d of %d thumbnails could not be downloaded or read%s." % (
+            failed, len(pick), (": " + SSL_HINT) if ssl_failed >= max(1, failed // 2) else ""))
     if not done:
         return {"analysed": 0}
     T = [r["thumb"] for r in done]
@@ -1619,21 +1750,26 @@ def deep_dive(r, fetch, out_dir, detector):
     if isinstance(cap, list):
         words, source = cap, "captions"
     elif cap and os.path.isfile(cap):
-        words, source = extract.load_captions(cap), "captions file (%s)" % os.path.basename(cap)
+        try:
+            words, source = extract.load_captions(cap), "captions file (%s)" % os.path.basename(cap)
+        except (ValueError, OSError) as e:  # a broken captions file costs the transcript, not the dive
+            out["notes"].append("captions unreadable: %s" % str(e)[:120])
     if words and duration:
         words = [w for w in words if w["s"] < duration]
-    whisper = importlib.util.find_spec("faster_whisper") is not None
-    if not words and whisper:
+    whisper = "not installed" if importlib.util.find_spec("faster_whisper") is None else None
+    if not words and whisper is None:
         try:
-            words, source = extract.whisper_words(clip), "faster-whisper"
+            words = extract.whisper_words(clip)
+            whisper = "ran" if words else "heard no speech"
+            source = "faster-whisper" if words else source
         except Exception as e:  # model download or decode failure: no transcript, said in the notes
-            out["notes"].append("whisper failed: %s" % str(e)[:120])
+            whisper = "failed: %s" % _cell(str(e), 120)
     if words:
         with open(os.path.join(vdir, "transcript.json"), "w", encoding="utf-8") as f:
             json.dump(words, f, indent=1, ensure_ascii=False)
     else:
         out["notes"].append("no transcript (no captions; %s): dialogue not measured" % (
-            "whisper heard no speech" if whisper else "faster-whisper is not installed"))
+            "faster-whisper is not installed" if whisper == "not installed" else "whisper %s" % whisper))
 
     # on-screen text (captions style)
     vocab = {re.sub(r"[^a-z0-9$%]", "", w["w"].lower()) for w in words or []} - {""}
@@ -1719,8 +1855,8 @@ def deep_summary(deep):
         en = [d["energy"]["score"] for d in ds if d.get("energy")]
         out[fmt] = {
             "videos": len(ds),
-            "wpm": _r(_median([x["wpm"] for x in dl]), 0),
-            "wpm_first_10s": _r(_median([x["wpm_first_10s"] for x in dl]), 0),
+            "wpm": _int(_median([x["wpm"] for x in dl])),
+            "wpm_first_10s": _int(_median([x["wpm_first_10s"] for x in dl])),
             "time_to_first_word_s": _r(_median([x["time_to_first_word_s"] for x in dl]), 2),
             "sentence_words": _r(_median([x["sentences"]["mean_words"] for x in dl]), 1),
             "short_sentence_share": _r(_median([x["sentences"]["short_share"] for x in dl]), 2),
@@ -1731,7 +1867,7 @@ def deep_summary(deep):
             "cuts_per_10s": _r(_median([x.get("cuts_per_10s") for x in ed]), 1),
             "mean_shot_s": _r(_median([x.get("mean_shot_s") for x in ed]), 2),
             "first_cut_s": _r(_median([x.get("first_cut_s") for x in ed]), 2),
-            "energy": _r(_median(en), 0),
+            "energy": _int(_median(en)),
             "caption_modes": _top((c.get("mode") for c in caps), 3),
             "caption_y_pct": _r(_median([c.get("center_y_pct") for c in caps]), 1),
             "words_per_card": _r(_median([(c.get("words_per_card") or {}).get("median") for c in caps]), 1),
@@ -1771,14 +1907,17 @@ def analyze_one(url, out_dir, fetch, max_videos=30, deep=4, detector=None):
         tabs = list(FORMATS)
     else:
         base, tabs = url, [("short", None)]
-        tt = re.match(r"(https://www\.tiktok\.com/@[^/?#]+)/video/\d+", url)
-        if tt:
+        if plat == "tiktok" and not TT_PROFILE_RE.match(url):
+            # a video link, including the share links the app makes (vm.tiktok.com/..., tiktok.com/t/...):
             # yt-dlp often cannot open a TikTok profile page, but a video names its account id
+            ch["via_video"] = True
             m = fetch.video_meta(url) or {}
             cid = m.get("channel_id") or m.get("uploader_id")
             if cid:
                 base = "tiktokuser:%s" % cid
-            ch["url"] = tt.group(1)
+            tt = re.match(r"(https://www\.tiktok\.com/@[^/?#]+)/", m.get("webpage_url") or url)
+            handle = m.get("uploader") if re.match(r"^[\w.]+$", str(m.get("uploader") or "")) else None
+            ch["url"] = tt.group(1) if tt else ("https://www.tiktok.com/@%s" % handle if handle else None)
     ch["url"] = ch.get("url") or base
 
     listed = max(60, 4 * max_videos)
@@ -1818,14 +1957,21 @@ def analyze_one(url, out_dir, fetch, max_videos=30, deep=4, detector=None):
 
     if plat == "youtube":
         ch["thumbnails"] = thumbnails(ch, recs, fetch, out_dir, detector)
+    else:
+        ch["gaps"].append("Thumbnails were not measured: they are read for YouTube long-form only.")
 
+    if not deep:
+        ch["gaps"].append("No deep dive (--no-download or --deep 0): dialogue, pace, hooks, energy, caption and "
+                          "edit style were not measured.")
     if deep:
         picks = []
         for fmt in ("short", "long"):
             # by multiple; a format too small for a baseline falls back to raw views
-            fr = sorted((r for r in recs if r["format"] == fmt and r.get("views") is not None),
+            fr = sorted((r for r in recs if r["format"] == fmt and r.get("views") is not None and not r.get("restricted")),
                         key=lambda r: (r.get("multiple") is not None, r.get("multiple") or 0, r["views"]), reverse=True)
             picks += fr[:deep]
+        if not picks:
+            ch["gaps"].append("No deep dive: no readable Short or long-form video has a view count to rank by.")
         for i, r in enumerate(picks, 1):
             log("  deep %d/%d: %s" % (i, len(picks), _cell(r.get("title"), 60)))
             try:
@@ -1852,7 +1998,7 @@ def _channel_gaps(ch, recs):
             ch["gaps"].append("Likes hidden or missing on %d of %d videos looked up." % (hidden, len(meta)))
     for fmt, st in ch["formats"].items():
         if st.get("baseline_note") and st["listed"]:
-            ch["gaps"].append("%s: %s, so no multiples or outliers for them." % (_cap(_fn(ch, fmt)), st["baseline_note"]))
+            ch["gaps"].append("%s: %s." % (_cap(_fn(ch, fmt)), st["baseline_note"]))
     young = [r for r in recs if (r.get("age_days") or 99) < 7]
     if young:
         ch["gaps"].append("%d video(s) are under 7 days old: their views (and multiples) are still growing." % len(young))
@@ -1895,8 +2041,9 @@ def executive_summary(ch):
     if rated:
         f, s = max(rated, key=lambda x: (x[1]["outliers"], x[1]["best"][0]["multiple"] or 0))
         top = s["best"][0]
-        out.append("%d of %d %s (%s) beat their median by 2x or more; the top one, \"%s\", did %s (%s views)." % (
-            s["outliers"], s["with_views"], _fn(ch, f), _pct(s["outlier_share"]), _cell(top["title"], 60),
+        out.append("%d of %d %s (%s) beat their %s by 2x or more; the top one, \"%s\", did %s (%s views)." % (
+            s["outliers"], s["with_views"], _fn(ch, f), _pct(s["outlier_share"]),
+            "baseline" if s.get("baseline_note") else "median", _cell(top["title"], 60),
             _x(top["multiple"]), _n(top["views"])))
     tops = _rated_topics(ch, 3 if len(ch["videos"]) >= 30 else 2)
     if tops:
@@ -2066,7 +2213,7 @@ def playbook(ch, out_dir=""):
                  "`python -m vstudio autoedit raw.mp4 --style %s --energy %s`; script: `/script-forge` at the measured "
                  "pace; packaging: `/yt-package` with the title and thumbnail patterns above. Copy the formula, never "
                  "their footage, words or face." % (_cell(ref.get("title"), 40), _x(ref.get("multiple")),
-                                                    _arg(out_dir, ref.get("clip") or ref["dir"]), ref.get("url"),
+                                                    _arg(out_dir, ref.get("clip") or ref["dir"]), _q(ref.get("url")),
                                                     _arg(out_dir, ref.get("style_dna") or ref["dir"]), energy))
     weak_bits = []
     for f, s in fm.items():
@@ -2086,9 +2233,15 @@ def playbook(ch, out_dir=""):
 
 
 def _arg(root, rel):
-    """A command-line argument for a file under root: full path, quoted when it has spaces."""
-    p = os.path.normpath(os.path.join(root, rel)) if root else rel
-    return '"%s"' % p if " " in p else p
+    """A command-line argument for a file under root: full path, quoted when the shell would split it."""
+    return _q(os.path.normpath(os.path.join(root, rel)) if root else rel)
+
+
+def _q(text):
+    """Quoted for pasting into a shell when it holds a space or a character zsh, bash, PowerShell or
+    cmd would read (a URL's ? and & above all: zsh, the macOS default, answers "no matches found")."""
+    t = str(text or "")
+    return '"%s"' % t if re.search(r"[\s?&*\[\](){}$;|<>'!#`~=%^,]", t) else t
 
 
 # --------------------------------------------------------------------------- comparison
@@ -2185,9 +2338,11 @@ def _status_help(ch):
     if ch["status"] == "needs_browser":
         tip = ("This profile only opens for a logged-in browser. Open it in your own browser (Claude in Chrome, "
                "with you present, at human speed) or paste the numbers; never share a password.")
-        if ch["platform"] == "tiktok" and "/video/" not in ch["input"]:
-            tip += (" For TikTok, passing one of their video links (https://www.tiktok.com/@name/video/...) "
-                    "often works: the account is then listed through that video.")
+        if ch["platform"] == "tiktok" and not ch.get("via_video"):
+            tip += (" For TikTok, passing one of their video links (https://www.tiktok.com/@name/video/... or "
+                    "a share link) often works: the account is then listed through that video.")
+        elif ch["platform"] == "tiktok":
+            tip += " The account could not be listed through this video either."
         return tip
     if ch["status"] == "missing_tool":
         return "Install it and run again."
@@ -2208,7 +2363,7 @@ def _render_formats(ch, h):
         dur_s = "n/a" if dur is None else ("%d:%02d" % divmod(int(dur), 60))
         L.append("| %s | %d%s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
             _fn(ch, f), s["listed"], "+" if (ch["inventory"].get(f) or {}).get("capped") else "",
-            _n(s["median_views"]), "%d (%s)" % (s["outliers"], _pct(s["outlier_share"])) if s["median_views"] else "n/a",
+            _n(s["median_views"]), "%d (%s)" % (s["outliers"], _pct(s["outlier_share"])) if s.get("baseline_views") else "n/a",
             _x(s["best"][0]["multiple"]) if s["best"] else "n/a",
             "%s%%" % s["median_engagement"] if s.get("median_engagement") is not None else "n/a",
             _n(s.get("median_velocity")), dur_s, (cad.get(f) or {}).get("per_week") or "n/a",
@@ -2447,6 +2602,11 @@ def analyze(urls, out_dir, max_videos=30, deep=4, fetch=None):
             ch = _new_channel(url, platform_of(normalize_url(url)))
             ch["status"], ch["status_note"] = "failed", "analysis failed: %s" % str(e)[:200]
         ch["name"] = ch.get("name") or _handle_from_url(ch["input"])
+        if ch["status"] not in ("ok", "partial"):   # the gaps must say it: nothing was read from this channel
+            ch["gaps"].insert(0, "Nothing could be read from this %s (%s): %s%s." % (
+                "profile" if ch["platform"] in ("instagram", "tiktok") else "channel", ch["input"],
+                ch.get("status_note") or ch["status"],
+                "; yt-dlp said: %s" % _cell(ch["error"], 160) if ch.get("error") else ""))
         if ch["status"] in ("ok", "partial") and ch.get("thumbnails"):
             name = "thumbs_sheet.jpg" if len(urls) == 1 else "thumbs_sheet_%s.jpg" % slug(ch.get("name") or url)
             if name in sheet_names:   # two channels with the same name
@@ -2498,7 +2658,18 @@ def _combined_sheet(channels, out_dir):
                                               title="Long-form thumbnails across channels, ranked by multiple") else None
 
 
+def _safe_stdout():
+    """Print without crashing: Windows writes piped stdout (the way Claude Code runs this) as cp1252,
+    which cannot encode emoji or most scripts in channel names and titles; those become '?' there."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, io.UnsupportedOperation):
+            pass
+
+
 def main(argv=None):
+    _safe_stdout()
     ap = argparse.ArgumentParser(prog="python -m vstudio channel", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("urls", nargs="+", help="YouTube channel (URL, @handle or a video link), Instagram or TikTok profile")
