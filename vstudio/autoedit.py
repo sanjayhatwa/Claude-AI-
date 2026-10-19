@@ -338,7 +338,7 @@ def silences(video, noise_db, min_dur):
     """[(start, end)] of silences from ffmpeg's silencedetect."""
     r = subprocess.run([_ffmpeg(), "-nostdin", "-hide_banner", "-i", video, "-vn", "-af",
                         "silencedetect=noise=%.1fdB:d=%.3f" % (noise_db, min_dur), "-f", "null", "-"],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
     out, start = [], None
     for line in r.stderr.splitlines():
         m = re.search(r"silence_start:\s*(-?[\d.]+)", line)
@@ -876,12 +876,12 @@ def fit_captions(style, segs, W, H, E):
     _, T, _, B = safe_zone(W, H)
     if fy1 + m + 2 * half <= B:
         cy = fy1 + m + half
-    elif fy1 + 2 * half <= B:      # under the chin with a thinner gap beats a jump onto the hair
-        cy = B - half
+    elif fy1 + 2 * half + 0.001 * H <= B:   # under the chin with a thinner gap beats a jump onto the hair
+        cy = B - half - 0.0005 * H              # (half a rounding step of center_y_pct inside the safe zone)
     elif fy0 - m - 2 * half >= T:
         cy = fy0 - m - half
-    elif fy0 - 2 * half >= T:
-        cy = T + half
+    elif fy0 - 2 * half - 0.001 * H >= T:
+        cy = T + half + 0.0005 * H
     else:
         return style, "the captions cover part of the face: there is no room above or below it"
     old = float(style.get("center_y_pct") or 68)

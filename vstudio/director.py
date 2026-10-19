@@ -194,7 +194,7 @@ def download(url, dest_stem, log=None, timeout=900):
                "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b",
                "--merge-output-format", "mp4", "-o", dest_stem + ".%(ext)s", url]
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
         except subprocess.TimeoutExpired:
             raise DirectorError("download timed out: %s" % url)
         video = found(planner.VIDEO_EXT)
@@ -207,7 +207,7 @@ def download(url, dest_stem, log=None, timeout=900):
                "--write-subs", "--write-auto-subs", "--sub-langs", "en.*,en", "--sub-format", "json3/vtt/srt/best",
                "-o", dest_stem + ".%(ext)s", url]
         try:
-            subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
             source["captions_tried"] = True     # a video without captions is not asked again on every run
         except subprocess.TimeoutExpired:
             pass

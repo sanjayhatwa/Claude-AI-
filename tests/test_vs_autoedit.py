@@ -425,6 +425,29 @@ class TestPlacement(unittest.TestCase):
             self.assertGreaterEqual(y0, 0.11 * Hd - 1e-6)
             self.assertLessEqual(y1, 0.80 * Hd + 1e-6)
 
+    def test_shot_whose_samples_missed_the_face_still_keeps_text_off_it(self):
+        # the framing holds the face from the take around a shot whose own samples all missed it (a head turn):
+        # graphics are placed around that face too, not over it as if the frame were empty
+        face = [0.42, 0.3, 0.16, 0.37]
+
+        def fake_track(video, times, aspect=None, download=True):
+            pts = [{"t": t, "focus": [0.5, 0.5], "face": list(face), "detected": t < 2.0} for t in times]
+            return {"points": pts, "method": "yunet", "found": sum(p["detected"] for p in pts), "samples": len(pts),
+                    "detector": "yunet"}
+
+        segs = [{"in": 0.0, "out": 2.0}, {"in": 3.0, "out": 5.0}]
+        rep = {"not_done": []}
+        real = autoedit.reframe.track
+        autoedit.reframe.track = fake_track
+        try:
+            autoedit._focus("talk.mp4", segs, (1920, 1080), (1080, 1920), True,
+                            {"graphics": True, "zoom": True, "download_model": False}, rep)
+        finally:
+            autoedit.reframe.track = real
+        self.assertIsNotNone(segs[1]["face"])
+        self.assertEqual(segs[1]["face"], segs[0]["face"])
+        self.assertEqual(rep["focus"]["segments_with_face"], 1, "the report still counts real detections only")
+
     def test_captions_move_off_the_face(self):
         E = autoedit.ENERGY["medium"]
         seg = {"k": 1.0, "F": [540.0, 700.0], "face": [390.0, 520.0, 690.0, 880.0]}

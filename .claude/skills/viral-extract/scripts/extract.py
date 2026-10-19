@@ -988,7 +988,8 @@ def main():
     video = a.src
     if not a.skip_edit:
         print("edit: analysing cuts, beats, camera, look", file=sys.stderr)
-        r = subprocess.run([sys.executable, ANALYZE, a.src, "--out", adir], capture_output=True, text=True)
+        r = subprocess.run([sys.executable, ANALYZE, a.src, "--out", adir], capture_output=True, text=True,
+                           errors="replace")
         if r.returncode != 0:
             print(r.stderr[-800:], file=sys.stderr)
         rp = os.path.join(adir, "report.json")

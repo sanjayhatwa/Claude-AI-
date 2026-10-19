@@ -1120,7 +1120,8 @@ def _coerce(spec, value):
         if t == "str":
             return str(value)
         if t == "int":
-            return int(round(float(value)))
+            v = float(value)
+            return int(round(v)) if math.isfinite(v) else default
         if t == "float":
             v = float(value)
             return default if math.isnan(v) or math.isinf(v) else v
@@ -1136,7 +1137,8 @@ def _coerce(spec, value):
         if t == "list[float]":
             if isinstance(value, str):
                 value = [x for x in re.split(r"[,|\s]+", value.strip()) if x]
-            return [float(x) for x in value]
+            out = [float(x) for x in value]
+            return out if all(math.isfinite(x) for x in out) else default
         if t == "highlight":
             if isinstance(value, (str, int)):
                 value = [value] if isinstance(value, int) else [x for x in re.split(r"\s*[,|]\s*", value) if x]
@@ -1147,7 +1149,7 @@ def _coerce(spec, value):
         if t == "choice":
             v = str(value).strip().lower()
             return v if v in spec["choices"] else default
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     return value
 

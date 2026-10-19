@@ -224,7 +224,8 @@ def probe_size(video):
         sys.exit("no such video: %s" % video)
     try:
         r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-                            "stream=width,height", "-of", "json", video], capture_output=True, text=True)
+                            "stream=width,height", "-of", "json", video], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
     except OSError:
         sys.exit("ffprobe was not found: install ffmpeg (it includes ffprobe), or write only the .ass "
                  "with --ass-only --size WxH")

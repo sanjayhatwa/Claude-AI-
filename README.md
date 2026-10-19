@@ -184,6 +184,10 @@ Environment variables:
 - `VSTUDIO_CLAUDE_BIN`: where the `claude` binary is.
 - `VSTUDIO_WORKSPACE`: the workspace folder.
 - `VSTUDIO_FONTS`: an extra fonts folder.
+- `VSTUDIO_OFFLINE`: set to 1 to never download the face-tracking model.
+- `VSTUDIO_FACE_MODEL`: a YuNet face model (.onnx) for thumbnail analysis.
+- `VSTUDIO_NO_WHISPER`: set to 1 to skip whisper when measuring reference videos.
+(`python -m vstudio help` lists them all.)
 
 Captions and transcripts: put `clip.srt`, `.vtt`, `.json3` or `.words.json`
 next to `clip.mp4` and it gets picked up automatically.

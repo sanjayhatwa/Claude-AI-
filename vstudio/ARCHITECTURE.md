@@ -520,7 +520,9 @@ aspect, still, duration, energy, background}`),
 `POST /api/jobs/<id>/cancel`,
 `GET|PUT /api/projects/<id>/spec?path=...` (PUT: `&version=new` saves a new
 version, `&force=1`), `POST /api/projects/<id>/ask`
-`{message, spec_path}` (Claude edits the spec), `GET /api/templates`,
+`{message, spec_path}` (Claude edits the spec; both write specs only under
+`uploads/` or `jobs/<id>/out/`, never over `job.json` and the other studio
+files in any letter case), `GET /api/templates`,
 `GET /api/doctor[?refresh=1]`, `GET /files/<project>/<path>` (Range support
 for video seeking; `?download=1` to save). Binds 127.0.0.1 only by default. Workspace layout:
 `workspace/studio/projects/<id>/{project.json, uploads/, jobs/<job>/{job.json, log.txt, out/}}`.

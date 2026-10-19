@@ -572,6 +572,22 @@ class TestParams(unittest.TestCase):
                                 errs += check_layer(L, W, H, 0, 3)
                             self.assertEqual(errs, [])
 
+    def test_numbers_that_are_not_finite_fall_back_to_the_default(self):
+        """'1e400', inf and nan (from a hand-edited spec, Ask or a template job) never raise or reach the layers."""
+        for typ in ("int", "float", "list[float]"):
+            for v in ("1e400", float("inf"), "-inf", "nan", float("nan")):
+                with self.subTest(type=typ, value=v):
+                    self.assertEqual(templates._coerce({"type": typ, "default": 7}, v), 7)
+        self.assertEqual(templates._coerce({"type": "list[float]", "default": []}, "1, 2.5"), [1.0, 2.5])
+        for name, params in (("countdown", {"from": "1e400"}), ("bar_chart", {"values": "3, 1e400, 5"}),
+                             ("rating", {"max": float("inf")})):
+            with self.subTest(template=name):
+                layers = templates.build(name, params, 0, 3, {"width": 1080, "height": 1920, "fps": 30})
+                self.assertTrue(layers)
+                if timeline is not None:
+                    self.assertEqual(timeline.validate({"width": 1080, "height": 1920, "fps": 30, "duration": 3,
+                                                        "layers": layers}), [])
+
     def test_errors(self):
         with self.assertRaises(KeyError):
             templates.build("no_such_template", {}, 0, 1, None)
