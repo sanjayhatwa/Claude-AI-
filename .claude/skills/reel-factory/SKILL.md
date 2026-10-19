@@ -47,7 +47,8 @@ director: you write the plan; the engine does the pixels.
    rate, caption font/size/position/colours, pace, palette, hook timing;
    competitor hooks and structure) plus a first heuristic `plan.json`.
 2. Read `BRIEF.md`, the reference `STYLE_DNA.md` and its `fonts_sheet.jpg`.
-   Run `python -m vstudio templates` for the catalog.
+   Run `python -m vstudio templates doc` for the catalog: when to use each
+   template and every param (`python -m vstudio templates` lists only the names).
 3. Write the spoken lines with `/script-forge` (scriptcheck >= 80) if the reel
    is voiced or captioned.
 4. Rewrite `plan.json` as an elite short-form director (schema: section 2 of

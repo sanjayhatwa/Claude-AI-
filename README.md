@@ -172,7 +172,7 @@ after installing a missing piece or pulling an update.
 | `python -m vstudio channel <url>... [--max-videos 30] [--deep 4] [--no-download]` | channel DNA |
 | `python -m vstudio render spec.json --out f.mp4 [--preview]` / `--still 2.0 --out f.png` | render a timeline or one frame |
 | `python -m vstudio plan compile plan.json --out spec.json` | plan -> timeline |
-| `python -m vstudio templates [--json]` / `templates preview <name> --out f.mp4` | the template catalog |
+| `python -m vstudio templates [--json]` / `templates doc` / `templates preview <name> --out f.mp4` | the template catalog (`doc`: when to use each) |
 | `python -m vstudio fonts install "Montserrat" "Anton"` / `fonts list` | free fonts |
 | `python -m vstudio sfx list` | sound effects |
 | `python -m vstudio mimic2d start` | full ReelMimic studio (2D animated remakes) |

@@ -443,6 +443,7 @@ def render(niche, picked, all_clusters, ac, red, gt, gp, n_rows, reachable, sour
 
 
 def main():
+    trends.utf8_stdio()   # RADAR.md is printed: emoji and Hindi titles must not stop it on Windows
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("niche")
     ap.add_argument("--dir", default="workspace/trends/%s" % dt.date.today().isoformat())

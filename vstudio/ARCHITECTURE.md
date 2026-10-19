@@ -78,7 +78,7 @@ Rules for every module:
 
 | module | path | use |
 | --- | --- | --- |
-| `extract` | viral-extract/scripts/extract.py | `parse_json3`, `parse_srt_vtt`, `load_captions`, `whisper_words`, `dialogue_dna`, `text_dna`, `edit_dna`, `youtube_captions`, `ANALYZE` (path to analyze.py) |
+| `extract` | viral-extract/scripts/extract.py | `parse_json3`, `parse_srt_vtt`, `load_captions`, `words_from_json` (every words-JSON shape), `pick_captions` (the spoken-language track among yt-dlp's subs), `whisper_words`, `dialogue_dna`, `text_dna`, `edit_dna`, `youtube_captions`, `ANALYZE` (path to analyze.py) |
 | `captions` | viral-extract/scripts/captions.py | `build_ass(words, cap, W, H, font, pop)`, `DEFAULT_CAPTION`, `caption_style(dna_path)`, `chunk`, `words_from_script(text, wpm, start)` |
 | `trends` | trend-hunt/scripts/trends.py | `ytdlp(args, timeout)` JSON helper, `entry_row` |
 | `radar` | trend-hunt/scripts/radar.py | `classify_format(text)`, `keywords(text)`, `jaccard` |
@@ -404,7 +404,7 @@ DEFAULT_STYLE = {"font": "Montserrat Black", "font_secondary": "Inter Bold", "te
                  "accent": "#FFE500", "bg": "#0E0E12", "bg2": "#1B1B24", "energy": "high"}
 def build(name, params, start, end, canvas, style=None) -> list[dict]   # layer dicts valid per timeline spec
 def catalog_doc() -> str      # markdown for the LLM prompt (names, params, when to use)
-def main(argv=None) -> int    # vstudio templates [--json] | vstudio templates preview <name> --out f.mp4
+def main(argv=None) -> int    # vstudio templates [list] [--json] | doc | build <name> | preview <name> --out f.mp4 [--still S]
 ```
 `canvas = {"width": W, "height": H, "fps": F}`; sizes must scale with W/H
 (design at 1080x1920, multiply by `min(W/1080, H/1920)` or similar), so the

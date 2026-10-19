@@ -64,5 +64,21 @@ class TestTsvFeedsIgViral(unittest.TestCase):
         self.assertIn("40", r.stdout)
 
 
+class TestWindowsPipedStdout(unittest.TestCase):
+    def test_titles_in_any_script_print_through_a_cp1252_pipe(self):
+        """radar.py and trends.py print titles (emoji, Hindi); Windows pipes stdout as cp1252, which cannot
+        encode them, so utf8_stdio() switches stdout to UTF-8 (what Claude Code reads) before printing."""
+        scripts = os.path.join(SKILLS_DIR, "trend-hunt", "scripts")
+        env = dict(os.environ, PYTHONIOENCODING="cp1252")
+        env.pop("PYTHONUTF8", None)
+        code = ("import sys; sys.path.insert(0, %r); import trends; trends.utf8_stdio(); "
+                "trends.save([{'title': '\\U0001F525 \\u0928\\u092e\\u0938\\u094d\\u0924\\u0947'}], None)" % scripts)
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, env=env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr.decode("utf-8", "replace")[-400:])
+        self.assertIn("\U0001F525 नमस्ते", r.stdout.decode("utf-8"))
+        radar = open(os.path.join(scripts, "radar.py"), encoding="utf-8").read()
+        self.assertIn("trends.utf8_stdio()", radar.split("def main():", 1)[1].split("\n", 3)[1])
+
+
 if __name__ == "__main__":
     unittest.main()

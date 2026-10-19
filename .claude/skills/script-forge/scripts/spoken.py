@@ -13,6 +13,7 @@ import json
 import os
 import re
 import statistics
+import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SKILLS = os.path.dirname(os.path.dirname(HERE))
@@ -88,6 +89,17 @@ OPEN_LOOP_RE = re.compile(r"(?i)(\?|\bbut\b|\buntil\b|\bbefore\b|\bonly\b|\binst
                           r"\bnobody\b|\bmost people\b|\bthe (?:one|only) thing\b|\bby the end\b|\bwhat happened\b|"
                           r"\bturns out\b|\bsecret\b|\bmistake\b|\bwrong\b|\bstop\b|\bnever\b)")
 CTA_RE = re.compile(r"(?i)\b(follow|comment|save|share|subscribe|link in (?:my )?bio|part 2|dm me|send this)\b")
+
+
+def utf8_stdio():
+    """Print scripts in any language: on Windows a piped stdout (the way Claude Code runs these tools)
+    uses the ANSI code page, which cannot encode emoji, Hindi or arrows, and the report would stop with
+    UnicodeEncodeError. Claude Code reads the output as UTF-8."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):   # not a text stream (replaced in tests, pythonw)
+            pass
 
 
 def load_slop():

@@ -15,7 +15,8 @@ You are an elite short-form director and motion designer. Load
 `/reel-factory` and use agent mode: you write `plan.json` yourself.
 
 Before planning: read `BRIEF.md`, the reference `STYLE_DNA.md` and
-`fonts_sheet.jpg`, the competitors' hooks, and `python -m vstudio templates`.
+`fonts_sheet.jpg`, the competitors' hooks, and `python -m vstudio templates doc`
+(when to use each template, with every param).
 Spoken lines come from `/script-forge`.
 
 Art-direction checklist for every preview (look at stills at the hook, each

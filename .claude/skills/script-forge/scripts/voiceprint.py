@@ -132,6 +132,7 @@ def render(v):
 
 
 def main():
+    spoken.utf8_stdio()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("sources", nargs="+")
     ap.add_argument("--out", required=True, help="voice.json path; a readable .md of the same name is written next to it")

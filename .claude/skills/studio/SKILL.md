@@ -36,7 +36,7 @@ fix for anything missing.
 | `python -m vstudio render spec.json --out f.mp4 [--preview]` | render a timeline |
 | `python -m vstudio render spec.json --still 2.0 --out f.png` | one frame, to look at |
 | `python -m vstudio plan compile plan.json --out spec.json` | plan -> timeline |
-| `python -m vstudio templates [--json]` / `templates preview <name> --out f.mp4` | motion-graphics catalog |
+| `python -m vstudio templates [--json]` / `templates doc` / `templates preview <name> --out f.mp4 [--still 1.5]` | motion-graphics catalog (`doc`: when to use each, every param) |
 | `python -m vstudio fonts install "Montserrat" "Anton"` | free caption fonts (OFL) |
 | `python -m vstudio sfx list` | built-in sound effects (generated, royalty-free) |
 | `python -m vstudio mimic2d start` | full ReelMimic studio for 2D animated remakes |

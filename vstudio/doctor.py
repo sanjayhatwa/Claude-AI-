@@ -120,6 +120,12 @@ def check_ffmpeg():
     detail = "%s with %s" % (version, ", ".join(k for k, v in have.items() if v) or "no usable encoders")
     if missing:
         detail += "; missing " + ", ".join(missing)
+    # HDR phone footage (iPhone records HLG by default) is tone-mapped with zscale + tonemap (render.color_filters);
+    # without them it renders washed out. Not required: everything else works, so it is said, not failed
+    hdr = [f for f in ("zscale", "tonemap") if not re.search(r"^\s*\S+\s+%s\s" % f, flt or "", re.M)]
+    if hdr and flt:
+        detail += ("; no %s filter, so HDR phone clips (iPhone) will look washed out: a full build has it (%s)"
+                   % (" / ".join(hdr), _ffmpeg_install_hint()))
     fix = ("this ffmpeg build lacks %s (needed for H.264 video, AAC audio, burned-in captions and the audio mix); "
            "install a full build, version 5.0 or newer: %s" % (", ".join(missing), _ffmpeg_install_hint()))
     return _item("ffmpeg", code == 0 and not missing, detail, fix, required=True)
@@ -200,6 +206,26 @@ def face_model():
     return hits[0] if hits else None
 
 
+def _yunet_problem(cv2, model):
+    """Why this OpenCV cannot run the YuNet model (one detection on a blank image), or None when it can.
+
+    OpenCV 4.5.4 to 4.7 load face_detection_yunet_2023mar.onnx and then fail on every detect()."""
+    try:
+        import numpy as np
+        from . import reframe
+        reframe._cv_log_level(cv2, reframe.LOG_SILENT)   # (keep OpenCV's own error dump off the table)
+        try:
+            det = cv2.FaceDetectorYN.create(model, "", (64, 64), 0.7, 0.3, 5000)
+            det.setInputSize((64, 64))
+            det.detect(np.zeros((64, 64, 3), np.uint8))
+        finally:
+            reframe._cv_log_level(cv2, reframe.LOG_ERROR)
+    except Exception as e:  # cv2.error, or a model file OpenCV cannot read
+        lines = [ln.strip() for ln in str(e).strip().splitlines() if ln.strip()]
+        return (lines[-1] if lines else type(e).__name__)[:160]
+    return None
+
+
 def check_face():
     try:
         import cv2
@@ -210,6 +236,11 @@ def check_face():
                      % cv2.__version__, pip_fix("-U", "opencv-python-headless"))
     model = face_model()
     if model:
+        why = _yunet_problem(cv2, model)
+        if why:
+            return _item("Face tracking", False, "OpenCV %s cannot run the YuNet face model (%s); reframing and "
+                         "thumbnail faces fall back to an older detector or centre crops" % (cv2.__version__, why),
+                         pip_fix("-U", "opencv-python-headless"))
         return _item("Face tracking", True, "OpenCV %s, YuNet model %s" % (cv2.__version__, os.path.basename(model)))
     return _item("Face tracking", False, "OpenCV %s; the YuNet face model is not downloaded (16:9 -> 9:16 "
                  "reframing uses centre crops until it is)" % cv2.__version__,

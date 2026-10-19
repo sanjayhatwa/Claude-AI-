@@ -1201,8 +1201,8 @@ class DoctorTest(unittest.TestCase):
     def test_package_fixes_name_only_what_is_missing(self):
         real = importlib.util.find_spec
 
-        def find_spec(name, *a, **kw):
-            return None if name in ("cv2", "scenedetect") else real(name, *a, **kw)
+        def find_spec(name, *a, **kw):   # (the other packages count as installed, whatever this machine has)
+            return None if name in ("cv2", "scenedetect") else (real(name, *a, **kw) or types.SimpleNamespace(name=name))
 
         with mock.patch.object(doctor, "externally_managed", lambda: False), \
                 mock.patch("importlib.util.find_spec", find_spec):
@@ -1222,6 +1222,51 @@ class DoctorTest(unittest.TestCase):
             self.assertIn("source .venv/bin/activate", doctor.pip_fix("numpy"))
         if sys.prefix != sys.base_prefix:
             self.assertFalse(doctor.externally_managed(), "a virtual environment always takes pip installs")
+
+    def test_face_check_runs_the_model_once(self):
+        """OpenCV 4.5.4-4.7 load YuNet 2023mar and fail on every detect(): the check must not say OK there."""
+        class CvError(Exception):
+            pass
+
+        class Detector:
+            def setInputSize(self, size):
+                pass
+
+            def detect(self, img):
+                if self.broken:
+                    raise CvError("OpenCV(4.7.0) net_impl.cpp:275: error: (-204:Requested object was not found)\n"
+                                  "Layer with requested id=-1 not found in function 'getLayerData'")
+                return 1, None
+
+        fake = types.SimpleNamespace(__version__="4.7.0", error=CvError,
+                                     FaceDetectorYN=types.SimpleNamespace(create=lambda *a: Detector()))
+        with mock.patch.dict(sys.modules, {"cv2": fake}), mock.patch.object(doctor, "face_model", lambda: "yunet.onnx"):
+            Detector.broken = True
+            item = doctor.check_face()
+            self.assertFalse(item["ok"])
+            self.assertIn("4.7.0 cannot run the YuNet face model", item["detail"])
+            self.assertIn("getLayerData", item["detail"])
+            self.assertIn("-U opencv-python-headless", item["fix"])
+            Detector.broken = False
+            self.assertTrue(doctor.check_face()["ok"])
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
+    def test_ffmpeg_without_zscale_is_named(self):
+        """No zscale/tonemap: HDR phone clips render washed out; the check says so without failing."""
+        real = doctor._run
+
+        def run(cmd):
+            code, out = real(cmd)
+            if "-filters" in cmd:
+                out = "\n".join(ln for ln in (out or "").splitlines() if " zscale " not in ln)
+            return code, out
+        with mock.patch.object(doctor, "_run", run):
+            item = doctor.check_ffmpeg()
+        self.assertIn("no zscale filter", item["detail"])
+        self.assertIn("washed out", item["detail"])
+        from vstudio import render
+        if {"zscale", "tonemap"} <= render.ffmpeg_filters():
+            self.assertNotIn("zscale", doctor.check_ffmpeg()["detail"])
 
 
 # ----------------------------------------------------------------------------- setup.sh and studio.sh

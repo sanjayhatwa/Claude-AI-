@@ -185,6 +185,17 @@ def report(ranked, unranked):
     return "\n".join(out)
 
 
+def utf8_stdio():
+    """Print titles in any script: on Windows a piped stdout (the way Claude Code runs this) uses the
+    ANSI code page, which cannot encode emoji, Hindi or CJK titles, and the command would stop with
+    UnicodeEncodeError after its files are written. Claude Code reads the output as UTF-8."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):   # not a text stream (replaced in tests, pythonw)
+            pass
+
+
 def save(obj, path):
     if not path:
         print(json.dumps(obj, indent=2, ensure_ascii=False))
@@ -199,6 +210,7 @@ def save(obj, path):
 
 
 def main():
+    utf8_stdio()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 

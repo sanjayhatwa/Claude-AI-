@@ -296,6 +296,7 @@ def render(r, label=None):
 
 
 def main():
+    spoken.utf8_stdio()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("scripts", nargs="+", help="script file(s), or - for stdin")
     ap.add_argument("--seconds", type=int, help="target length")

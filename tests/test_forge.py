@@ -68,5 +68,32 @@ class TestVoiceprint(unittest.TestCase):
         self.assertIn("Voice profile", voiceprint.render(v))
 
 
+class TestWindowsPipedStdout(unittest.TestCase):
+    """Windows writes piped stdout (Claude Code's) as cp1252: the reports must print, as UTF-8."""
+
+    def test_scriptcheck_and_voiceprint_print_any_script(self):
+        import subprocess
+        import sys
+        here = os.path.dirname(os.path.abspath(__file__))
+        scripts = os.path.join(os.path.dirname(here), ".claude", "skills", "script-forge", "scripts")
+        env = dict(os.environ, PYTHONIOENCODING="cp1252")
+        env.pop("PYTHONUTF8", None)
+        tmp = tempfile.mkdtemp()
+        script = os.path.join(tmp, "hi.txt")
+        with open(script, "w", encoding="utf-8") as f:
+            f.write("घर पर पास्ता \U0001F525 → easy.\n"
+                    "Why does nobody tell you this?\n")
+        r = subprocess.run([sys.executable, os.path.join(scripts, "scriptcheck.py"), script], capture_output=True,
+                           env=env, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr.decode("utf-8", "replace")[-400:])
+        self.assertIn("\U0001F525", r.stdout.decode("utf-8"))
+        srt = os.path.join(tmp, "talk.srt")
+        with open(srt, "w", encoding="utf-8") as f:
+            f.write("1\n00:00:00,000 --> 00:00:02,000\nSo here’s the thing \U0001F525 nobody says\n")
+        r = subprocess.run([sys.executable, os.path.join(scripts, "voiceprint.py"), srt, "--out",
+                            os.path.join(tmp, "voice.json")], capture_output=True, env=env, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr.decode("utf-8", "replace")[-400:])
+
+
 if __name__ == "__main__":
     unittest.main()
