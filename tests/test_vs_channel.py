@@ -342,6 +342,49 @@ class TestTitlesAndTopics(unittest.TestCase):
             self.assertTrue(1 <= len(r["topics"]) <= 3)
         self.assertEqual(recs[-1]["topics"], ["other"])
 
+    def _topics(self, titles):
+        recs = [{"id": str(i), "title": t, "tags": [], "description": "", "format": "long", "recency": i / 11.0}
+                for i, t in enumerate(titles)]
+        return quiet(channel.topic_model, recs), recs
+
+    def test_topics_in_spanish_german_and_hindi(self):
+        es = ["Receta de pollo al horno fácil", "Pollo al horno con limón y ajo",
+              "Cómo hacer pan casero sin máquina", "Pan casero de masa madre",
+              "Canción de cuna para bebés", "Canción de cuna relajante",
+              "Tortilla española jugosa", "Tortilla española con cebolla"]
+        topics, _ = self._topics(es)
+        labels = {t["label"] for t in topics}
+        self.assertTrue({"canción", "tortilla española", "pan casero"} <= labels, labels)
+        self.assertFalse({"canci", "espa ola"} & labels, labels)
+        de = ["Größte Fehler beim Kochen", "Größte Fehler im Garten", "Käsespätzle Rezept",
+              "Käsespätzle einfach", "Frühstück für Kinder", "Frühstück schnell",
+              "Über die Brücke", "Über München fliegen"]
+        labels = {t["label"] for t in self._topics(de)[0]}
+        self.assertIn("käsespätzle", labels)
+        self.assertIn("frühstück", labels)
+        self.assertFalse({"ber", "sch", "hst", "sesp tzle", "über"} & labels, labels)   # "über" is a stop word
+        hi = ["आसान चिकन करी रेसिपी",
+              "चिकन करी घर पर",
+              "आलू पराठा आसान तरीका",
+              "आलू पराठा नाश्ता",
+              "गुलाब जामुन मिठाई",
+              "गुलाब जामुन के साथ",
+              "मसाला चाय", "मसाला डोसा"]
+        topics, recs = self._topics(hi)
+        labels = {t["label"] for t in topics}
+        self.assertIn("चिकन करी", labels)        # "chicken curry", whole words
+        self.assertIn("आलू पराठा", labels)
+        self.assertNotIn("के", " ".join(labels).split())                    # a stop word
+        self.assertTrue(sum(r["topics"] != ["other"] for r in recs) >= 6, [r["topics"] for r in recs])
+        self.assertEqual(channel.title_features(hi[1])["words"], 4)
+        self.assertEqual(channel.title_features(es[4])["words"], 5)
+        # Japanese has no spaces: hiragana particles break it into words
+        ja = ["ラーメン 自家製", "ラーメンの作り方",
+              "料理の基本", "料理のコツ", "卵焼き", "卵焼きのコツ"]
+        labels = {t["label"] for t in self._topics(ja)[0]}
+        self.assertIn("ラーメン", labels)   # ramen
+        self.assertIn("料理", labels)               # cooking
+
     def test_over_index(self):
         recs = [{"multiple": m, "flag": m > 2} for m in (5, 4, 3, 1, 1, 0.9, 0.8, 0.5, 0.4, 0.3)]
         res = channel.over_index(recs, [("flag", "flag", lambda r: r["flag"])])
@@ -516,6 +559,54 @@ class TestThumbs(unittest.TestCase):
         finally:
             if old:
                 os.environ["VSTUDIO_FACE_MODEL"] = old
+
+
+class TestFaceDetectorThatCannotRun(unittest.TestCase):
+    """OpenCV 4.5.4-4.7 create a YuNet 2023mar detector but raise on every detect()."""
+
+    class Broken:
+        @classmethod
+        def create(cls, *a, **kw):
+            return cls()
+
+        def setInputSize(self, size):
+            pass
+
+        def detect(self, img):
+            import cv2
+            raise cv2.error("OpenCV(4.7.0) nary_eltwise_layers.cpp:139: error: (-215:Assertion failed) "
+                            "in function 'findCommonShape'")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="vs_face_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_probe_rejects_the_detector_and_says_why(self):
+        import cv2
+        from unittest import mock
+        model = os.path.join(self.tmp, "face_detection_yunet_2023mar.onnx")
+        open(model, "wb").close()
+        saved = dict(thumbs._face)
+        self.addCleanup(lambda: (thumbs._face.clear(), thumbs._face.update(saved)))
+        with mock.patch.dict(os.environ, {"VSTUDIO_FACE_MODEL": model}), \
+                mock.patch.object(cv2, "FaceDetectorYN", self.Broken, create=True):
+            thumbs._face.pop(model, None)
+            det = quiet(thumbs.face_detector)
+        self.assertIsNone(det)
+        self.assertIn("OpenCV %s" % cv2.__version__, thumbs.face_detector_note())
+        self.assertIn("4.8", thumbs.face_detector_note())
+
+    def test_a_failing_detector_costs_only_the_faces(self):
+        p = os.path.join(self.tmp, "t.jpg")
+        draw_thumb(p, "The $20 Air Fryer", True)
+        t = quiet(thumbs.analyze_thumb, p, ocr=False, detector=self.Broken())
+        self.assertIsNone(t["faces"])
+        self.assertGreater(t["brightness"], 0.3)
+        if HAVE_FFMPEG:
+            clip = make_clip(os.path.join(self.tmp, "c.mp4"))
+            fr = quiet(channel.frame_features, clip, self.Broken())
+            self.assertIsNone(fr["face_frames"])
+            self.assertEqual(fr["samples"], 6)
 
 
 class TestTikTokFallback(unittest.TestCase):

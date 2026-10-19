@@ -21,8 +21,9 @@ black bars YouTube pads 4:3 thumbnails (hqdefault.jpg) with:
                colour entropy (a clean thumbnail scores under ~40)
   faces        count, the largest face as a share of the frame and where it
                sits; needs the YuNet face model (workspace/models, fetched by
-               vstudio.reframe.ensure_model). Without it faces are null: a
-               missing detector is reported, never guessed.
+               vstudio.reframe.ensure_model) and an OpenCV that can run it
+               (4.8+). Without one faces are null: a missing or unusable
+               detector is reported, never guessed.
   composition  where the visual weight sits (gradient-energy saliency):
                centre of mass, left / centre / right thirds, and the subject
                side (the largest face when there is one)
@@ -46,7 +47,8 @@ FACE_MIN_SCORE = 0.7
 FACE_MODEL_GLOBS = ("*yunet*.onnx", "face_detection*.onnx")
 
 _ocr = None                # lazily created RapidOCR engine (False = not installed)
-_face = {}                 # model path -> cv2.FaceDetectorYN
+_face = {}                 # model path -> (cv2.FaceDetectorYN or None, why it is None)
+_face_note = [None]        # why the last face_detector() call returned None (None after a success)
 
 
 # --------------------------------------------------------------------------- loading
@@ -346,19 +348,51 @@ def face_model_path(allow_download=False):
     return None
 
 
+NO_FACE_MODEL = ("no face model (python -m vstudio autoedit or reframe.ensure_model() downloads YuNet into "
+                 "workspace/models)")
+
+
 def face_detector(allow_download=False):
-    """A cv2.FaceDetectorYN for the YuNet model, or None (no model, or OpenCV without FaceDetectorYN)."""
+    """A working cv2.FaceDetectorYN for the YuNet model, or None: no model, OpenCV without
+    FaceDetectorYN, or an OpenCV that loads the model but cannot run it (YuNet 2023mar needs
+    OpenCV 4.8+; 4.5.4-4.7 raise on every detect). face_detector_note() says which."""
     p = face_model_path(allow_download)
     if not p:
+        _face_note[0] = NO_FACE_MODEL
         return None
     if p not in _face:
-        try:
-            import cv2
-            _face[p] = _quiet_cv(lambda: cv2.FaceDetectorYN.create(p, "", (320, 320), FACE_MIN_SCORE, 0.3, 5000))
-        except Exception as e:
-            print("face detector failed to load (%s): %s" % (p, str(e)[:120]), file=sys.stderr)
-            _face[p] = None
-    return _face[p]
+        _face[p] = _load_detector(p)
+    det, _face_note[0] = _face[p]
+    return det
+
+
+def face_detector_note():
+    """Why the last face_detector() call returned None, in words for a report (None after a success)."""
+    return _face_note[0]
+
+
+def _load_detector(p):
+    """(detector, None) or (None, reason). Creating a detector can succeed where running it fails,
+    so one detect on a small blank image proves it works before any thumbnail or video relies on it."""
+    try:
+        import numpy as np
+        import cv2
+    except ImportError as e:
+        return None, "OpenCV is not installed (%s)" % e
+    version = getattr(cv2, "__version__", "?")
+    if not hasattr(cv2, "FaceDetectorYN"):
+        return None, "OpenCV %s has no FaceDetectorYN (python -m pip install -U opencv-python-headless)" % version
+    try:
+        det = _quiet_cv(lambda: cv2.FaceDetectorYN.create(p, "", (320, 320), FACE_MIN_SCORE, 0.3, 5000))
+        det.setInputSize((64, 64))
+        _quiet_cv(lambda: det.detect(np.zeros((64, 64, 3), "uint8")))
+    except Exception as e:  # cv2.error: e.g. 'findCommonShape' on OpenCV < 4.8 with YuNet 2023mar
+        msg = str(e).strip().splitlines()
+        print("face detector unusable (%s): %s" % (os.path.basename(p), (msg[-1] if msg else "")[:160]),
+              file=sys.stderr)
+        return None, ("OpenCV %s cannot run the face model %s (YuNet 2023mar needs OpenCV 4.8 or newer: "
+                      "python -m pip install -U opencv-python-headless)" % (version, os.path.basename(p)))
+    return det, None
 
 
 def _quiet_cv(fn):
@@ -392,12 +426,17 @@ def detect_faces(bgr, detector=None, min_score=FACE_MIN_SCORE):
 
 
 def faces_summary(rgb, detector):
-    """{"count", "largest_share", "position", "x", "y"} for an RGB image, or None without a detector."""
+    """{"count", "largest_share", "position", "x", "y"} for an RGB image, or None without a detector
+    (or when the detector fails on this image: that costs the faces field, never the thumbnail)."""
     import cv2
     if detector is None:
         return None
     h, w = rgb.shape[:2]
-    found = detect_faces(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), detector)
+    try:
+        found = detect_faces(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), detector)
+    except Exception as e:  # cv2.error inside the DNN: faces not measured for this image
+        print("face detection failed: %s" % (str(e).strip().splitlines() or [""])[-1][:120], file=sys.stderr)
+        return None
     if not found:
         return {"count": 0, "largest_share": 0.0, "position": None, "x": None, "y": None}
     x, y, fw, fh, _ = found[0]

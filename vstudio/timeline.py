@@ -183,11 +183,14 @@ _PROBE_CACHE = {}
 
 
 def probe(path):
-    """ffprobe facts about a media file: {duration, width, height, fps, has_audio, has_video,
+    """ffprobe facts about a media file: {duration, width, height, fps, base_fps, has_audio, has_video,
     color_transfer, color_primaries, color_space}.
 
     Returns None when the file or ffprobe is missing or unreadable. Cached by
     path + modification time. Width/height account for phone rotation tags.
+    fps is the average frame rate; base_fps is the rate whose grid every frame
+    sits on (ffprobe's r_frame_rate): the same for constant-rate video, higher
+    for variable-rate phone footage (27.2 average on a 30 fps grid).
     The colour fields are ffprobe's names ("arib-std-b67" = HLG, "smpte2084"
     = PQ, "bt2020"...) or None when the file does not say.
     """
@@ -212,7 +215,7 @@ def probe(path):
             dur = (data.get("format") or {}).get("duration")
             info = {"duration": float(dur) if dur not in (None, "N/A") else None,
                     "has_audio": any(s.get("codec_type") == "audio" for s in streams),
-                    "has_video": vs is not None, "width": None, "height": None, "fps": None,
+                    "has_video": vs is not None, "width": None, "height": None, "fps": None, "base_fps": None,
                     "color_transfer": None, "color_primaries": None, "color_space": None}
             if vs:
                 for k in ("color_transfer", "color_primaries", "color_space"):
@@ -227,11 +230,13 @@ def probe(path):
                 if rot % 180:
                     w, h = h, w
                 info["width"], info["height"] = w, h
+                rates = {}
                 for k in ("avg_frame_rate", "r_frame_rate"):
                     num, _, den = str(vs.get(k) or "0/0").partition("/")
                     if den and float(den) > 0 and float(num) > 0:
-                        info["fps"] = float(num) / float(den)
-                        break
+                        rates[k] = float(num) / float(den)
+                info["fps"] = rates.get("avg_frame_rate") or rates.get("r_frame_rate")
+                info["base_fps"] = rates.get("r_frame_rate") or rates.get("avg_frame_rate")
                 if info["duration"] is None and vs.get("duration") not in (None, "N/A"):
                     info["duration"] = float(vs["duration"])
     except (OSError, ValueError, subprocess.SubprocessError):

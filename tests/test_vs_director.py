@@ -419,6 +419,10 @@ class PlannerTest(unittest.TestCase):
         self.assertIn("versus", [(b["visual"] or {}).get("template") for b in plan["beats"]])
         self.assertEqual(planner.headline("iPhone vs. Android"), "iPhone vs. Android")    # not "IPhone"
         self.assertEqual(planner.headline("stop posting at night"), "Stop posting at night")
+        plan = planner.heuristic_plan("iPhone vs. Android is the question. Here is the answer.", None, None, 12)
+        self.assertEqual(plan["beats"][0]["say"], "iPhone vs. Android is the question.")  # the spoken line too
+        plan = planner.heuristic_plan("Best phones: iPhone, Pixel and eBay deals", None, None, 12)
+        self.assertIn("iPhone.", " ".join(b["say"] or "" for b in plan["beats"]))
         words = [{"w": w, "s": i * 0.4, "e": i * 0.4 + 0.3} for i, w in enumerate("We hit 2.5M views. Dr. Lee said so.".split())]
         self.assertEqual([len(s) for s in planner.sentences_from_words(words)], [4, 4])
 

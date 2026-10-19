@@ -482,6 +482,44 @@ class TextRender(unittest.TestCase):
         self.assertEqual(mixed.shape, direct.shape)      # boxes: (35, 140) against (38, 94)
         self.assertLess(np.abs(mixed - direct).mean(), 2.0)
 
+    def test_bitmap_only_fonts_are_never_fallbacks(self):
+        # Apple Color Emoji (macOS) has bitmap strikes only (20, 32, 40 ... px): probed at 32 px it looked fine,
+        # then drawing a 57 px title with it raised "invalid pixel size" and the whole render failed
+        warned = set(fonts._warned)
+        with contextlib.redirect_stderr(io.StringIO()):
+            found, _ = fonts.glyph_fallbacks("DejaVu Sans Bold", "OK न")
+        if "न" not in found:
+            fonts._warned.intersection_update(warned)
+            self.skipTest("no installed font draws Devanagari")
+        strike_only = found["न"]["path"]
+        real = fonts.ImageFont.truetype
+
+        def truetype(font=None, size=10, *a, **kw):
+            if font == strike_only and size not in (20, 32, 40):
+                raise OSError("invalid pixel size")
+            return real(font, size, *a, **kw)
+        saved = (dict(fonts._probes), dict(fonts._glyph_choice), dict(fonts._font_cache))
+        for c in (fonts._probes, fonts._glyph_choice, fonts._font_cache):
+            c.clear()
+        fonts.ImageFont.truetype = truetype
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                found, _ = fonts.glyph_fallbacks("DejaVu Sans Bold", "OK न")
+                self.assertNotIn(strike_only, [e["path"] for e in found.values()])
+                a = alpha(textrender.render_text(text_layer(text="OK न", size=57)))
+            self.assertGreater(a.max(), 0)
+        finally:
+            fonts.ImageFont.truetype = real
+            for c, old in zip((fonts._probes, fonts._glyph_choice, fonts._font_cache), saved):
+                c.clear()
+                c.update(old)
+            fonts._warned.clear()
+            fonts._warned.update(warned)
+        # the real colour emoji fonts are rejected the same way
+        for e in fonts.installed():
+            if "color emoji" in e["family"].lower():
+                self.assertIsNone(fonts._probe(e), e["path"])
+
     def test_glyphs_no_font_has_are_named(self):
         saved = fonts._index
         dejavu = [e for e in fonts.installed() if e["family"] == "DejaVu Sans"]

@@ -55,6 +55,15 @@ def setUpModule():
     counter30 = "nullsrc=s=32x32:r=30:d=2,format=gray,geq=lum='N*4'"
     _ff("-f", "lavfi", "-i", counter30, "-c:v", "ffv1", os.path.join(d, "counter30.mov"))
     _ff("-f", "lavfi", "-i", counter30, "-c:v", "ffv1", os.path.join(d, "counter30.mkv"))
+    # variable frame rate, as phones record in low light: the 30 fps grid with every 10th frame missing
+    # (average about 27.3 fps, r_frame_rate 30)
+    for mode in (["-fps_mode", "vfr"], ["-vsync", "vfr"]):  # -fps_mode is ffmpeg 5.1+
+        try:
+            _ff("-f", "lavfi", "-i", counter30, "-vf", r"select='not(eq(mod(n\,10)\,9))'", *mode,
+                "-c:v", "ffv1", "-video_track_timescale", "600", os.path.join(d, "vfr.mov"))
+            break
+        except subprocess.CalledProcessError:
+            continue
     # a recording whose picture starts 0.3 s after its sound (screen recorders, some cameras)
     _ff("-itsoffset", "0.3", "-i", os.path.join(d, "counter30.mov"), "-f", "lavfi", "-i",
         "sine=frequency=440:sample_rate=48000:duration=2.3", "-map", "0:v", "-map", "1:a", "-c:v", "copy",
@@ -344,6 +353,21 @@ class Video(unittest.TestCase):
         for src in ("counter30.mov", "counter30.mkv"):
             got = self.counter_frames({"start": 1.05}, 30, 32 / 30.0, 24, src)
             self.assertEqual(np.diff(got).tolist(), [1] * 23, (src, got))
+            # its first drawn frame (1.0667 s, half a frame in) shows the in-point frame, not the one after it
+            self.assertEqual(got[0], 0, (src, got))
+
+    def test_variable_frame_rate_footage_keeps_every_frame(self):
+        # phone footage in low light: frames on a 30 fps grid with gaps, so its average rate (27.3) is not a
+        # grid any frame sits on. Snapping to that average dropped and doubled frames all through the clip;
+        # only the missing frames may repeat the one before them
+        info = timeline.probe(os.path.join(T["tmp"], "vfr.mov"))
+        self.assertEqual(info["base_fps"], 30.0)
+        self.assertAlmostEqual(info["fps"], 27.3, delta=0.5)      # the average: not a grid any frame is on
+        got = self.counter_frames({"src": "vfr.mov"}, 30, 0.0, 40)
+        want = [n - 1 if n % 10 == 9 else n for n in range(40)]
+        self.assertEqual(got, want)
+        self.assertEqual(self.counter_frames({"src": "vfr.mov", "speed": 2.0}, 30, 0.0, 12),
+                         [n - 1 if n % 10 == 9 else n for n in range(0, 24, 2)])
 
     def test_ms_rounded_in_points_start_on_their_own_frame(self):
         # word times are whole milliseconds: in = 0.067 s means frame 2 (at 0.0667 s), not frame 3

@@ -71,6 +71,7 @@ import statistics
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.request
 
 from . import paths
@@ -103,8 +104,76 @@ sure ever even still back look looks looking try tried trying see seen good grea
 literally basically link bio below above sponsor sponsored affiliate code discount amazon available click
 live livestream stream streaming premiere q&a
 """.split())
+# function words of the languages creators title in most besides English (radar's STOP has English):
+# Spanish, Portuguese, French, German, Italian, Indonesian and Hindi (Devanagari and romanized).
+# Compared after accent folding, so a word with and without its accents is one entry.
+INTL_STOP = set("""
+de la que el en los se del las un por con no una su para es al lo como mas pero sus le ya este si porque esta
+entre cuando muy sin sobre tambien me hasta hay donde quien desde todo nos durante todos uno les contra otros ese
+eso ante ellos esto antes algunos unos yo otro otras otra tanto esa estos mucho nada muchos cual poco ella estas
+ nosotros mis tus ellas mio mia aqui asi hacer como cuando parte
+do da em um para com nao uma os no na mais as dos foi ao ele das tem seu sua ou ser quando muito nos ja esta
+eu tambem so pelo pela ate isso ela depois sem mesmo aos ter seus quem nas esse eles estao voce voces essa
+num nem suas meu minha numa pelos elas qual sera nos tenho lhe deles dele dela essas esses este isto fazer
+le les des une du est qui dans par sur au pas plus ce il je vous nous on avec sa ses mais ou comme
+tout aux elle cette ete etre fait faire tres sans leur leurs mon ma mes ton ta tes notre nos votre vos ca cela
+ces ceux celle celui quoi quand comment pourquoi
+der die das und zu den von mit ist des sich im dem nicht ein eine als auch es an werden aus er dass sie nach
+wird bei einer um am sind noch wie einem uber so zum haben nur oder aber vor zur bis mehr durch sein
+wurde sei ins einen ihre ich du wir ihr mein dein unser was wer wo wann warum fur auf beim mal schon ganz kein
+keine dieser diese dieses diesem diesen jetzt hier heute folge teil
+di da il lo gli una ed che non come piu ma anche mi ti ci vi del della dei delle al alla ai alle nel nella sono
+questo questa questi quello quella mio mia tuo tua suo sua nostro vostro loro chi cosa dove perche
+yang dan di ke dari ini itu untuk dengan pada adalah tidak ada juga akan atau saya kamu kita kami mereka dia aku
+bisa sudah belum lagi jadi karena seperti dalam bagaimana apa cara buat sama banget aja
+hai hain tha thi the yeh woh bhi toh nahi nahin kya kaise kyu kyun kab kaha jab tak liye sath saath baad kuch
+bahut hum aap tum mera meri mere apna apni apne karo karna kiya hota hoti gaya gayi wala wali wale raha rahi
+rahe sakte sakta mein aur ka ke ki ko se par ek ye wo
+\u0915\u093E \u0915\u0947 \u0915\u0940 \u0915\u094B \u092E\u0947\u0902 \u0938\u0947 \u092A\u0930 \u0914\u0930 \u0939\u0948 \u0939\u0948\u0902 \u0925\u093E \u0925\u0947 \u0925\u0940 \u0928\u0947 \u090F\u0915 \u092F\u0939 \u092F\u0947 \u0935\u0939 \u0935\u094B \u092D\u0940 \u0924\u094B \u0939\u0940 \u0928\u0939\u0940\u0902 \u0928\u093E \u0915\u094D\u092F\u093E \u0915\u0948\u0938\u0947 \u0915\u094D\u092F\u094B\u0902 \u0915\u092C \u0915\u0939\u093E\u0901 \u0915\u0939\u093E\u0902 \u091C\u094B \u091C\u092C
+\u0924\u0915 \u0932\u093F\u090F \u0932\u093F\u092F\u0947 \u0938\u093E\u0925 \u092C\u093E\u0926 \u0905\u092C \u0915\u0941\u091B \u0938\u092C \u092C\u0939\u0941\u0924 \u092E\u0948\u0902 \u0939\u092E \u0906\u092A \u0924\u0941\u092E \u092E\u0947\u0930\u093E \u092E\u0947\u0930\u0940 \u092E\u0947\u0930\u0947 \u0939\u092E\u093E\u0930\u093E \u0939\u092E\u093E\u0930\u0940 \u0905\u092A\u0928\u093E \u0905\u092A\u0928\u0940 \u0905\u092A\u0928\u0947 \u0909\u0928\u0915\u093E \u0909\u0928\u0915\u0940 \u0907\u0938 \u0909\u0938
+\u0907\u0928 \u0909\u0928 \u0915\u0930 \u0915\u0930\u0947\u0902 \u0915\u0930\u0947 \u0915\u0930\u0928\u093E \u0915\u0930\u0924\u0947 \u0915\u093F\u092F\u093E \u0939\u094B\u0924\u093E \u0939\u094B\u0924\u0940 \u0939\u094B\u0924\u0947 \u0939\u094B \u0917\u092F\u093E \u0917\u0908 \u0917\u090F \u0935\u093E\u0932\u093E \u0935\u093E\u0932\u0940 \u0935\u093E\u0932\u0947 \u0930\u0939\u093E \u0930\u0939\u0940 \u0930\u0939\u0947 \u0938\u0915\u0924\u0947 \u0938\u0915\u0924\u093E \u092D\u093E\u0917 \u0935\u0940\u0921\u093F\u092F\u094B
+""".split())
 EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F]")
-WORD_RE = re.compile(r"[A-Za-z0-9$%'\u2019]+")
+_RX = {}   # regexes built on first use (see _rx)
+
+
+def _rx(name):
+    """Unicode-aware regexes: "word" (a word in any script), "token" (a word or a break character).
+
+    Python's \\w leaves out combining marks, which would cut Devanagari, Bengali, Tamil or Thai words
+    at every vowel sign (a Hindi "recipe" became three one-letter pieces), so the marks join the word class."""
+    if not _RX:
+        ranges, start, prev = [], None, None
+        for cp in range(0x300, 0x20000):
+            if unicodedata.category(chr(cp))[0] == "M":
+                if start is None:
+                    start = cp
+                elif cp != prev + 1:
+                    ranges.append((start, prev))
+                    start = cp
+                prev = cp
+        if start is not None:
+            ranges.append((start, prev))
+        marks = "".join(re.escape(chr(a)) + ("-" + re.escape(chr(b)) if b > a else "") for a, b in ranges)
+        _RX["marks"] = marks
+        _RX["word"] = re.compile(r"[^\W_][\w%s]*(?:['\u2019+&][\w%s]+)*" % (marks, marks))
+        _RX["token"] = re.compile(r"[^\W_][\w%s'+&]*|[.,!?;:()\[\]|/\-\u2013\u2014#\u3001\u3002\uFF01\uFF1F]" % marks)
+        _RX["hashtag"] = re.compile(r"#([^\W_][\w%s]*)" % marks)
+    return _RX[name]
+
+
+def _fold(word):
+    """Accents off for Latin-script words (Spanish "cancion" with or without its accent, German
+    sharp s as "ss"), so both spellings count as one term; other scripts are returned unchanged."""
+    if word.isascii():
+        return word
+    f = "".join(c for c in unicodedata.normalize("NFD", word) if not unicodedata.combining(c))
+    f = f.replace("\u00DF", "ss")
+    return f if f.isascii() else unicodedata.normalize("NFC", word)
+
+
+def _letters(word):
+    return sum(1 for c in word if c.isalnum())
 
 
 def log(msg):
@@ -681,7 +750,7 @@ def title_features(title):
     t = title or ""
     low = t.lower().replace("\u2019", "'")
     letters = [c for c in t if c.isalpha()]
-    words = WORD_RE.findall(t)
+    words = _rx("word").findall(t)
     return {
         "chars": len(t),
         "words": len(words),
@@ -817,29 +886,79 @@ def titles(recs):
 # --------------------------------------------------------------------------- 6. topics
 
 def _stem(t):
-    return t[:-1] if len(t) > 4 and t.endswith("s") and not t.endswith("ss") else t
+    """English plural stemmer, for ASCII words only ("recipes" -> "recipe")."""
+    return t[:-1] if t.isascii() and len(t) > 4 and t.endswith("s") and not t.endswith("ss") else t
+
+
+CJK_RE = re.compile("[\u3040-\u30FF\u31F0-\u31FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\uFF66-\uFF9F"
+                    "\U00020000-\U0002FFFF]")
+
+
+def _script(c):
+    o = ord(c)
+    if 0x3040 <= o <= 0x309F:
+        return "hira"
+    if 0x30A0 <= o <= 0x30FF or 0x31F0 <= o <= 0x31FF or 0xFF66 <= o <= 0xFF9F:
+        return "kata"
+    if 0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF or 0xF900 <= o <= 0xFAFF or 0x20000 <= o <= 0x2FFFF:
+        return "han"
+    return "other"
+
+
+def _cjk_pieces(raw):
+    """A token holding Chinese or Japanese (written without spaces) as [(piece, joinable)] or None
+    for a break: hiragana runs (particles, endings) break, katakana runs are words, a run of up to
+    3 Han characters is a word and a longer one becomes overlapping character pairs (no dictionary
+    to cut it into words; pairs still repeat across videos on one subject)."""
+    runs, cur, kind = [], "", None
+    for c in raw:
+        k = _script(c)
+        if k != kind and cur:
+            runs.append((kind, cur))
+            cur = ""
+        kind, cur = k, cur + c
+    if cur:
+        runs.append((kind, cur))
+    out = []
+    for k, run in runs:
+        if k == "hira":
+            out.append(None)
+        elif k == "han" and len(run) > 3:
+            out.extend((run[i:i + 2], False) for i in range(len(run) - 1))
+        else:
+            out.append((run, True))
+    return out
 
 
 def _tokens(text, stop, surface):
-    """Lower-case content tokens with None at every break (stop word, number, punctuation run)."""
-    text = (text or "").lower().replace("\u2019", "'")
+    """Lower-case content tokens (t, written form, joinable) with None at every break (stop word,
+    number, punctuation run), in any script. t is the accent-folded, plural-stemmed key."""
+    text = unicodedata.normalize("NFC", (text or "").lower().replace("\u2019", "'"))
     text = re.sub(r"https?://\S+|www\.\S+|\S+@\S+", " . ", text)
     text = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?\b", " . ", text)
     out = []
-    for raw in re.findall(r"[a-z0-9][a-z0-9'+&]*|[.,!?;:()\[\]|/\-\u2013\u2014#]", text):
+    for raw in _rx("token").findall(text):
         if not raw[0].isalnum():
             out.append(None)
             continue
-        t = raw.strip("'")
-        if t.endswith("'s"):
-            t = t[:-2]
-        word = t
-        t = _stem(t)
-        if len(t) < 3 or t.isdigit() or t in stop or raw in stop:
-            out.append(None)
-            continue
-        surface[t][word] += 1
-        out.append((t, word))
+        pieces = _cjk_pieces(raw) if CJK_RE.search(raw) else [(raw, True)]
+        for piece in pieces:
+            if piece is None:
+                out.append(None)
+                continue
+            t, joinable = piece
+            t = t.strip("'")
+            if t.endswith("'s"):
+                t = t[:-2]
+            word = t
+            key = _fold(t)
+            t = _stem(key)
+            short = len(t) < 3 if key.isascii() else _letters(t) < 2
+            if short or t.isdigit() or key in stop or t in stop or raw in stop:
+                out.append(None)
+                continue
+            surface[t][word] += 1
+            out.append((t, word, joinable))
     return out
 
 
@@ -857,9 +976,10 @@ def _doc_terms(r, stop, surface):
             t = tok[0]
             found = [t]
             nxt = toks[i + 1] if i + 1 < len(toks) else None
-            if is_strong and nxt is not None and nxt[0] != t:
+            if is_strong and nxt is not None and nxt[0] != t and tok[2] and nxt[2]:
                 found.append(t + " " + nxt[0])
-                surface[found[-1]][tok[1] + " " + nxt[1]] += 1
+                cjk = _script(tok[1][-1]) != "other" and _script(nxt[1][0]) != "other"
+                surface[found[-1]][tok[1] + ("" if cjk else " ") + nxt[1]] += 1
             for term in found:
                 counts[term] += w
                 if is_strong:
@@ -888,7 +1008,8 @@ def _split_hashtags(recs):
     writes elsewhere (viral-extract's word_break); a hashtag that does not split stays one word."""
     extract = _skill("extract")
     texts = [" ".join([r.get("title") or "", r.get("description") or ""] + list(r.get("tags") or [])) for r in recs]
-    vocab = {w for t in texts for w in re.findall(r"(?<![#\w])[a-z]{2,}", t.lower())}
+    # words written out (not as hashtags), in any script
+    vocab = {w for t in texts for w in _rx("word").findall(_rx("hashtag").sub(" ", t.lower())) if len(w) >= 2}
 
     def split(tag):
         parts = extract.word_break(tag, vocab)
@@ -900,7 +1021,7 @@ def _split_hashtags(recs):
     def fix(text):
         if not text or "#" not in text or extract is None:
             return text
-        return re.sub(r"#(\w+)", lambda m: split(m.group(1)), text)
+        return _rx("hashtag").sub(lambda m: split(m.group(1)), text)
 
     return [{"title": fix(r.get("title")), "tags": [fix(t) for t in r.get("tags") or []],
              "description": fix(r.get("description"))} for r in recs]
@@ -921,6 +1042,7 @@ def topic_model(recs, max_topics=None):
     """
     radar = _skill("radar")
     stop = (getattr(radar, "STOP", set()) if radar else set()) | TOPIC_STOP
+    stop = stop | {_fold(w) for w in stop | INTL_STOP}
     jaccard = radar.jaccard if radar else (lambda a, b: len(a & b) / float(len(a | b)) if a and b else 0.0)
     surface = collections.defaultdict(collections.Counter)
     docs = [_doc_terms(r, stop, surface) for r in _split_hashtags(recs)]
@@ -1127,8 +1249,9 @@ def thumbnails(ch, recs, fetch, out_dir, detector):
                "all": _thumb_profile(T), "winners": _thumb_profile([r["thumb"] for r in winners]) if winners else None,
                "winners_rule": rule, "over_index": over}
     if not have_faces:
-        ch["gaps"].append("Faces on thumbnails were not measured: no face model (python -m vstudio autoedit or "
-                          "reframe.ensure_model() downloads YuNet into workspace/models).")
+        why = (thumbs.face_detector_note() or thumbs.NO_FACE_MODEL) if detector is None else \
+            "the face detector failed on every thumbnail"
+        ch["gaps"].append("Faces on thumbnails were not measured: %s." % why)
     if not have_text:
         ch["gaps"].append("Thumbnail text was not read: OCR is not installed (pip install rapidocr-onnxruntime).")
     return summary
@@ -1265,8 +1388,14 @@ def frame_features(video, detector=None, fps=FRAME_FPS, max_seconds=SHORT_CLIP_S
                 diffs.append(float(np.abs(gray.astype("int16") - prev).mean()) / 255.0)
             prev = gray.astype("int16")
             if detector is not None:
-                found = thumbs.detect_faces(small, detector)
-                faces.append(bool(found))
+                try:
+                    found = thumbs.detect_faces(small, detector)
+                except Exception as e:  # the detector cannot run here: faces not measured, the rest stays
+                    log("  face detection failed, faces not measured: %s" % (str(e).strip().splitlines() or [""])[-1][:120])
+                    detector, faces, sizes, xs = None, [], [], []
+                    found = None
+                if detector is not None:
+                    faces.append(bool(found))
                 if found:
                     x, y, fw, fh, _ = found[0]
                     sizes.append(fw * fh / float(small.shape[0] * small.shape[1]))
@@ -1678,6 +1807,10 @@ def analyze_one(url, out_dir, fetch, max_videos=30, deep=4, detector=None):
     ch["titles"] = titles(recs)
     ch["topic_list"] = topic_model(recs)
     ch["topics"] = topic_stats(recs, ch["topic_list"])
+    if not ch["topic_list"] and len(recs) >= 4:
+        ch["gaps"].append("No topics could be derived: no word or phrase in the titles and tags is shared by at "
+                          "least two videos without being on more than half of them, so every video is tagged "
+                          "\"other\". Read the titles by hand for the subjects.")
     for fmt in ("long", "short", "live"):
         if any(r["format"] == fmt for r in recs):
             ch["formats"][fmt] = format_stats(recs, fmt, baselines.get(fmt))
@@ -2105,7 +2238,8 @@ def _render_formats(ch, h):
 
 def _render_topics(ch, h):
     L = ["%s Topics" % h, "",
-         "Every video carries 1-3 topic tags (`videos[].topics` in CHANNEL_DNA.json).", "",
+         "Every video carries 1-3 topic tags (`videos[].topics` in CHANNEL_DNA.json)." + (
+             "" if ch.get("topic_list") else " No topics could be derived from the words (see data gaps)."), "",
          "| topic | videos | share | formats | median multiple | median views | outliers | trend (recent third) | best video |",
          "| --- | ---: | ---: | --- | ---: | ---: | ---: | --- | --- |"]
     for t in ch["topics"]:
@@ -2183,7 +2317,7 @@ def _render_thumbs(ch, h, data):
         row("text position", lambda x: _counts(x["text_positions"]))
         row("text colours (approx.)", lambda x: _counts(x["text_styles"], "; "))
     row("faces", lambda x: "%s, median size %s" % (_pct(x["face_share"]), _pct(x["median_face_size"]))
-        if x["face_share"] is not None else "not measured (no face model)")
+        if x["face_share"] is not None else "not measured (see data gaps)")
     row("dominant colour", lambda x: _counts(x["dominant_hues"]))
     row("subject sits", lambda x: _counts(x["subjects"]))
     row("palette", lambda x: " ".join("`%s`" % c for c in x["palette"][:6]))
@@ -2300,7 +2434,8 @@ def analyze(urls, out_dir, max_videos=30, deep=4, fetch=None):
     from . import thumbs
     detector = thumbs.face_detector(allow_download=online)
     if detector is None:
-        run_gaps.append("No face model: faces on thumbnails and in videos were not measured.")
+        run_gaps.append("Faces on thumbnails and in videos were not measured: %s."
+                        % (thumbs.face_detector_note() or thumbs.NO_FACE_MODEL))
     if thumbs.ocr_engine() is None:
         run_gaps.append("OCR is not installed (pip install rapidocr-onnxruntime): text on thumbnails and in videos was not read.")
     channels, sheet_names = [], set()

@@ -142,6 +142,43 @@ class TestTranscribe(unittest.TestCase):
         self.assertIn("next to the video", src)
         self.assertEqual(len(w), 3)
 
+    def test_youtube_vtt_rolling_cues_and_inline_times(self):
+        # yt-dlp's auto-subs: cue settings on the timing line, every cue repeats the line before it (rolling
+        # display), 10 ms "transition" cues, and the new words carry their own start times
+        vtt = ("\ufeffWEBVTT\nKind: captions\nLanguage: en\n\n"
+               "00:00:00.320 --> 00:00:02.270 align:start position:0%\n \n"
+               "so<00:00:00.640><c> today</c><00:00:00.960><c> I'm</c><00:00:01.280><c> going</c>"
+               "<00:00:01.600><c> to</c>\n\n"
+               "00:00:02.270 --> 00:00:02.280 align:start position:0%\nso today I'm going to\n \n\n"
+               "00:00:02.280 --> 00:00:04.550 align:start position:0%\nso today I'm going to\n"
+               "show<00:00:02.600><c> you</c><00:00:02.900><c> three</c><00:00:03.300><c> settings</c>\n\n"
+               "00:00:04.550 --> 00:00:04.560 align:start position:0%\nshow you three settings\n \n\n"
+               "00:00:04.560 --> 00:00:06.800 align:start position:0%\nshow you three settings\n"
+               "[Music] &gt;&gt; that<00:00:04.900><c> cost</c><00:00:05.200><c> you</c><00:00:05.600><c> views</c>\n")
+        path = os.path.join(T["tmp"], "auto.en.vtt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(vtt)
+        words = transcribe.load_captions(path)
+        self.assertEqual(" ".join(w["w"] for w in words),
+                         "so today I'm going to show you three settings that cost you views")
+        starts = {w["w"] + str(k): w["s"] for k, w in enumerate(words)}
+        self.assertEqual((starts["so0"], starts["today1"], starts["to4"], starts["show5"], starts["settings8"],
+                          starts["that9"], starts["views12"]), (0.32, 0.64, 1.6, 2.28, 3.3, 4.56, 5.6))
+        self.assertEqual(words[4]["e"], 2.27, "the last word of a cue ends with the cue")
+        # a plain VTT: cue ids, settings, voice and style tags, two lines in one cue, entities
+        vtt = ("WEBVTT - talk\n\nNOTE written by hand\n\nintro\n00:01.000 --> 00:02.000 line:90% align:center\n"
+               "<v Sam>Hello <i>there</i>,\nfriends &amp; family</v>\n\n2\n00:00:03.000 --> 00:00:03.500\nbye\n")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(vtt)
+        words = transcribe.load_captions(path)
+        self.assertEqual([w["w"] for w in words], ["Hello", "there,", "friends", "&", "family", "bye"])
+        self.assertEqual((words[0]["s"], words[4]["e"], words[5]["s"]), (1.0, 2.0, 3.0))
+        # the same line said twice in two real cues is speech, not a rolling repeat
+        vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:01.600\nNo.\n\n00:00:01.700 --> 00:00:02.300\nNo.\n"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(vtt)
+        self.assertEqual([w["w"] for w in transcribe.load_captions(path)], ["No.", "No."])
+
     def test_nothing_available(self):
         words, src, notes = transcribe.load_words(None)
         self.assertIsNone(words)
@@ -196,6 +233,45 @@ class TestCutDecisions(unittest.TestCase):
         # three takes keep the last
         ws = W("my first tip my first tip my first tip is hooks", gaps={3: 0.5, 6: 0.5})
         self.assertEqual(sorted(autoedit.mark_retakes(ws, {})), list(range(6)))
+
+    def test_parallel_phrasing_is_not_a_retake(self):
+        # a comma closes a clause: repeated openings that each say something new are rhetoric, even with a breath
+        for text, gaps in (("If you want views, if you want followers, if you want money, post every day.", {}),
+                           ("If you want views, if you want followers, if you want money, post every day.",
+                            {4: 0.4, 8: 0.4}),
+                           ("You need to post daily, you need to reply fast, you need to collab.", {}),
+                           ("I love you, I love you", {}),
+                           # unpunctuated captions: three phrases with one opening that each go on differently
+                           ("if you want views if you want followers if you want money post every day",
+                            {4: 0.4, 8: 0.4})):
+            self.assertEqual(autoedit.mark_retakes(W(text, gaps=gaps), {}), {}, text)
+        # a phrase cut short on a word no phrase ends with is still a flub, comma or not
+        self.assertEqual(sorted(autoedit.mark_retakes(W("the best way to, the best way to grow"), {})), [0, 1, 2, 3])
+        ws = W("the best way to, um, the best way to grow")
+        drop = autoedit.mark_fillers(ws)
+        self.assertEqual(sorted(autoedit.mark_retakes(ws, drop)), [0, 1, 2, 3])
+        # a dash or an ellipsis marks a cut-off take
+        ws = W("so the first thing you... so the first thing you need is light")
+        self.assertEqual(sorted(autoedit.mark_retakes(ws, {})), [0, 1, 2, 3, 4])
+
+    def test_head_and_tail_cuts_name_what_they_remove(self):
+        E = autoedit.ENERGY["high"]
+        ws = W("the best way to the best way to grow is focus um", t0=0.5, gaps={4: 0.5, 11: 0.06})
+        drop = autoedit.mark_fillers(ws)
+        drop.update(autoedit.mark_retakes(ws, drop))
+        self.assertEqual(sorted(drop), [0, 1, 2, 3, 11])
+        ranges, between, head, tail = autoedit.keep_ranges(ws, drop, 6.0, E)
+        self.assertEqual(head["kind"], "RETAKE")
+        self.assertIn('first take of "the best way to"', head["why"])
+        self.assertNotIn("silence", head["why"])
+        self.assertGreaterEqual(head["out"], ws[3]["e"], "nothing of the dropped take is left at the start")
+        self.assertEqual(tail["kind"], "FILLER")
+        self.assertIn('"um"', tail["why"])
+        self.assertLessEqual(tail["in"], ws[11]["s"], "the dropped filler at the end is not heard")
+        # plain silence is still called silence
+        _, _, head, tail = autoedit.keep_ranges(W("one two", t0=0.5), {}, 3.0, E)
+        self.assertEqual((head["kind"], head["why"]), ("DEAD", "silence before the first word"))
+        self.assertEqual((tail["kind"], tail["why"]), ("DEAD", "silence after the last word"))
 
     def test_keep_ranges(self):
         E = autoedit.ENERGY["high"]
@@ -253,6 +329,16 @@ class TestCutDecisions(unittest.TestCase):
         self.assertEqual(spans("a million views"), [("1,000,000", "count")])
         self.assertEqual(spans("the 2nd step"), [("2nd", "ordinal")])
         self.assertEqual(spans("no numbers here"), [])
+        # the currency that was said is the currency on screen
+        self.assertEqual(spans("I paid \u20ac500 for it"), [("\u20ac500", "money")])
+        self.assertEqual(spans("It costs \u00a320 now"), [("\u00a320", "money")])
+        self.assertEqual(spans("it was 500 euros"), [("\u20ac500", "money")])
+        self.assertEqual(spans("I made \u20b950,000 last month"), [("\u20b950,000", "money")])
+        self.assertEqual(spans("two thousand rupees a day"), [("\u20b92,000", "money")])
+        self.assertEqual(spans("I lost 20 pounds"), [("20", "count")], "pounds may be weight")
+        sent = {"words": W("I paid \u20ac1,200 for this camera."), "e": 2.0}
+        call = autoedit._number_callouts(sent)[0]
+        self.assertEqual((call["template"], call["params"]["prefix"]), ("counter_reveal", "\u20ac"))
 
 
 class TestSpeechGraphics(unittest.TestCase):
@@ -440,6 +526,96 @@ class TestReframe(unittest.TestCase):
         frames = reframe.sample_frames(T["video"], [0.5, 2.0, 9.0])
         self.assertEqual(sorted(frames), [0.5, 2.0, 9.0])
         self.assertEqual(frames[0.5].shape, (180, 320, 3))
+
+    @unittest.skipUnless(HAVE_FFMPEG, "ffmpeg not installed")
+    def test_portrait_frames_are_small_and_never_all_held(self):
+        video = os.path.join(T["tmp"], "portrait.mp4")
+        _ff("-f", "lavfi", "-i", "testsrc2=s=400x720:r=10:d=4", "-c:v", "libx264", "-pix_fmt", "yuv420p", video)
+        times = [0.1 + 0.25 * i for i in range(15)]
+        frames = reframe.sample_frames(video, times)
+        self.assertEqual(len(frames), len(times))
+        self.assertEqual({f.shape for f in frames.values()}, {(640, 356, 3)}, "640 px on the long side")
+        # detection runs while the frames are decoded: at most the frame in hand and the one before it are alive
+        import weakref
+        seen, alive = [], []
+
+        def fake_detect(frame):
+            alive.append(sum(1 for r in seen if r() is not None))
+            seen.append(weakref.ref(frame))
+            return []
+
+        old = reframe.detect_faces, reframe.method
+        reframe.detect_faces, reframe.method = fake_detect, (lambda: "yunet")
+        try:
+            tr = reframe.track(video, times, aspect=(9, 16), download=False)
+        finally:
+            reframe.detect_faces, reframe.method = old
+        self.assertEqual(tr["samples"], len(times))
+        self.assertGreaterEqual(len(seen), 10)
+        self.assertLessEqual(max(alive), 1, alive)
+
+    def test_detector_that_cannot_run_falls_back(self):
+        """OpenCV 4.5.4-4.7 create a YuNet detector for the 2023mar model but every detect() raises cv2.error."""
+        import cv2
+        if not hasattr(cv2, "FaceDetectorYN") or not os.path.isfile(reframe.model_path()):
+            self.skipTest("needs FaceDetectorYN and the YuNet model on disk")
+
+        class Broken:
+            def setInputSize(self, size):
+                pass
+
+            def detect(self, img):
+                raise cv2.error("OpenCV(4.7.0) nary_eltwise_layers.cpp:139: error: (-215:Assertion failed) "
+                                "shape[i] == 1 || outShape[i] == 1 in function 'findCommonShape'")
+
+        real = cv2.FaceDetectorYN
+        reframe._STATE.update(yunet=None, yunet_path=None)
+
+        class FakeYN:
+            @staticmethod
+            def create(*a, **k):
+                return Broken()
+
+        cv2.FaceDetectorYN = FakeYN
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                self.assertNotEqual(reframe.method(), "yunet")
+                self.assertEqual(reframe.detect_faces(np.full((360, 640, 3), 127, np.uint8)), [])
+                if HAVE_FFMPEG:
+                    tr = reframe.track(T["video"], [0.5, 2.0], aspect=(9, 16), download=False)
+                    self.assertEqual(tr["found"], 0)
+        finally:
+            cv2.FaceDetectorYN = real
+            reframe._STATE.update(yunet=None, yunet_path=None)
+        self.assertIn("opencv-python", err.getvalue(), "the note says how to get a working detector")
+
+    def test_model_download_trusts_certifi(self):
+        """python.org builds on macOS have no system certificates until 'Install Certificates.command' runs."""
+        try:
+            import certifi  # noqa: F401
+        except ImportError:
+            self.skipTest("certifi not installed")
+        import ssl
+        import urllib.request
+        from unittest import mock
+        seen = []
+
+        def fake_urlopen(url, timeout=None, context=None, **kw):
+            seen.append(context)
+            raise OSError("offline in tests")
+
+        models = os.path.join(T["tmp"], "models_ssl")
+        env = {k: v for k, v in os.environ.items() if k not in ("SSL_CERT_FILE", "SSL_CERT_DIR", "VSTUDIO_OFFLINE")}
+        with mock.patch.object(ssl.SSLContext, "load_default_certs", lambda self, purpose=None: None), \
+                mock.patch.object(urllib.request, "urlopen", fake_urlopen), \
+                mock.patch.dict(os.environ, env, clear=True), mock.patch.object(paths, "MODELS", models), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(reframe.ensure_model(download=True))
+        self.assertTrue(seen)
+        for ctx in seen:
+            self.assertIsInstance(ctx, ssl.SSLContext)
+            self.assertGreater(ctx.cert_store_stats()["x509_ca"], 0, "certifi's roots are trusted")
 
 
 # =========================================================================== the plan on a real file
@@ -667,6 +843,18 @@ class TestModes(unittest.TestCase):
         self.assertEqual(spec["meta"]["edit"]["graphics"][0]["text"], "THE ONE SECRET")
         info = timeline.probe(os.path.join(out, "edited.mp4"))
         self.assertLess(info["duration"], DUR - 3.0)
+
+    def test_cli_prints_non_ascii_paths_through_a_legacy_pipe(self):
+        """On Windows a piped stdout uses the ANSI code page (cp1252), which cannot encode a Hindi folder name."""
+        out = os.path.join(T["tmp"], "\u0915\u0941\u091b \u0935\u0940\u0921\u093f\u092f\u094b", "edit")
+        env = dict(os.environ, PYTHONIOENCODING="cp1252", PYTHONUTF8="0")
+        r = subprocess.run([sys.executable, "-m", "vstudio", "autoedit", T["video"], "--words", T["words_json"],
+                            "--out-dir", out, "--size", "216x384", "--fps", "12", "--no-sfx"],
+                           cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))), env=env,
+                           capture_output=True, timeout=300)
+        self.assertEqual(r.returncode, 0, r.stderr.decode("utf-8", "replace")[-2000:])
+        self.assertIn(out, r.stdout.decode("utf-8"))
+        self.assertTrue(os.path.isfile(os.path.join(out, "EDIT_REPORT.md")))
 
 
 if __name__ == "__main__":

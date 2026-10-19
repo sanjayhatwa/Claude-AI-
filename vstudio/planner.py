@@ -1317,13 +1317,13 @@ def _units(text):
 def _prompt_units(prompt):
     """A bare prompt -> units: 'X: a, b and c' becomes a hook and three list items."""
     p = _REQUEST.sub("", clean_say(prompt)).strip()
-    p = p[:1].upper() + p[1:] if p else p
+    p = _cap_first(p) if p else p                   # "iPhone vs. Android" keeps its own casing
     m = re.match(r"^(?P<head>[^:]{6,}):\s*(?P<rest>.+)$", p)
     if m:
         items = [x.strip(" .") for x in re.split(r",\s*(?:and\s+|or\s+)?|\s+and\s+|;\s*", m.group("rest")) if x.strip(" .")]
         if 2 <= len(items) <= 8:
             return [{"text": m.group("head").strip() + ".", "list_no": None}] + \
-                [{"text": it[:1].upper() + it[1:] + ".", "list_no": k + 1} for k, it in enumerate(items)]
+                [{"text": _cap_first(it) + ".", "list_no": k + 1} for k, it in enumerate(items)]
     return _units(p)
 
 

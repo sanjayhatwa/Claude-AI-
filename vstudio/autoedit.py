@@ -113,7 +113,12 @@ SOFT_FILLERS = {"like", "so", "ah"}
 FILLER_PAIRS = {("you", "know"), ("i", "mean")}
 STUTTER = {"i", "i'm", "the", "a", "an", "and", "to", "it", "it's", "is", "we", "you", "my", "in", "of", "but",
            "this", "if", "he", "she", "they", "what", "for", "on", "with", "be", "can", "just", "there"}
-CUTOFF = ("-", "\u2014", "\u2013", "...", "\u2026", ",")
+CUTOFF = ("-", "\u2014", "\u2013", "...", "\u2026")   # a word cut off mid-phrase ("to-", "the...")
+CLAUSE_END = (",", ";", ":")                           # a finished clause ("if you want views,")
+# words no phrase ends with: a take that stops on one was cut short, even when the transcript put a comma after it
+OPEN_ENDED = {"a", "an", "the", "and", "or", "but", "to", "of", "for", "with", "at", "by", "from", "in", "on",
+              "into", "about", "as", "than", "if", "because", "my", "your", "our", "their", "his", "is", "are",
+              "was", "were", "i", "we", "they", "he", "she"}
 
 STOP = set("""a an the and or but so of to in on for with at by from is are was were be been being it its it's
 this that these those i i'm i've i'd me my mine you you're your yours we we're our they they're their them he she
@@ -416,7 +421,10 @@ def mark_fillers(words):
 
 
 def _hesitation(words, prev, nxt, drop):
-    """True when the speaker hesitated between words prev and nxt (pause, dropped filler, cut-off mark)."""
+    """True when the speaker hesitated between words prev and nxt (pause, dropped filler, cut-off mark).
+
+    A comma is not a hesitation: it closes a clause ("if you want views, if you want followers").
+    """
     gap = words[nxt]["s"] - words[prev]["e"]
     if gap >= 0.3:
         return True
@@ -425,16 +433,39 @@ def _hesitation(words, prev, nxt, drop):
     return words[prev]["w"].rstrip().endswith(CUTOFF)
 
 
+def _parallel(toks, i, j, m, window):
+    """True when the opening toks[j:j+m] starts three or more phrases that each go on differently.
+
+    That is a spoken list ("if you want views if you want followers if you
+    want money"), even in captions without punctuation; three takes of one
+    flubbed phrase restart where the last one began ("my first tip my
+    first tip my first tip is hooks").
+    """
+    opening = toks[j:j + m]
+    starts = [k for k in range(max(0, i - window), min(len(toks) - m, j + window) + 1) if toks[k:k + m] == opening]
+    if len(starts) < 3:
+        return False
+    nexts = [toks[k + m] if k + m < len(toks) else "" for k in starts]
+    return len(set(nexts)) == len(nexts) and opening[0] not in nexts and "" not in nexts[:-1]
+
+
 def mark_retakes(words, drop, window=30):
     """{index: ("RETAKE", why)} for false starts: a phrase restarted with the same 3+ words keeps the last take.
 
-    The restart must follow a hesitation, or repeat the whole unfinished
-    first take back to back ("the first mistake is the first mistake is
-    lighting..."). A first take that is a complete sentence counts only
-    when what followed its opening comes back too (so deliberate repetition
-    such as "We will fight on the beaches. We will fight on the landing
-    grounds." stays); an unfinished one counts when it was cut short, is
-    mostly repeated, or a long pause separates them.
+    The restart must follow a hesitation (a pause of 0.3 s or more, a
+    dropped filler, or a cut-off mark: dash or ellipsis), or repeat the
+    whole unfinished first take back to back ("the first mistake is the
+    first mistake is lighting..."). A first take that is a complete
+    sentence, or a clause closed by a comma, counts only when what followed
+    its opening comes back too, so deliberate repetition and parallel
+    phrasing stay ("We will fight on the beaches. We will fight on the
+    landing grounds.", "if you want views, if you want followers, ...",
+    "I love you, I love you"). A comma after a word no phrase ends with
+    ("the best way to, the best way to grow") does not close anything.
+    An unfinished first take counts when it was cut short (at most two
+    words past the opening), is mostly repeated, or a long pause separates
+    them; three or more phrases with one opening that each go on
+    differently are a list and stay.
     """
     seq = [i for i in range(len(words)) if i not in drop]
     toks = [_tok(words[i]["w"]) for i in seq]
@@ -442,14 +473,17 @@ def mark_retakes(words, drop, window=30):
     j = 3
     while j < len(seq):
         found = None
+        last1 = words[seq[j - 1]]["w"].rstrip()
+        complete = bool(_SENT_END.search(last1))
+        clause = not complete and last1.endswith(CLAUSE_END) and toks[j - 1] not in OPEN_ENDED
         for i in range(j - 3, max(-1, j - window - 1), -1):
             if seq[i] in out or not toks[i]:
                 continue
             m = 0
             while j + m < len(seq) and i + m < j and toks[i + m] and toks[i + m] == toks[j + m]:
                 m += 1
-            # the same phrase twice in a row, mid-sentence, is a restart even without a pause
-            back_to_back = j - i == m and not _SENT_END.search(words[seq[j - 1]]["w"])
+            # the same unfinished phrase twice in a row, mid-sentence, is a restart even without a pause
+            back_to_back = j - i == m and not complete and not clause
             if m < 3 or not (back_to_back or _hesitation(words, seq[j - 1], seq[j], drop)):
                 continue
             take1 = toks[i:j]
@@ -458,8 +492,11 @@ def mark_retakes(words, drop, window=30):
             rest2 = set(toks[j + m:j + m + len(rest1) + 2])
             sim = len(rest1 & rest2) / float(len(rest1)) if rest1 else 1.0
             gap = words[seq[j]]["s"] - words[seq[j - 1]]["e"]
-            complete = bool(_SENT_END.search(words[seq[j - 1]]["w"]))
-            ok = sim >= 0.6 if complete else (len(take1) <= m + 4 or sim >= 0.5 or gap >= 0.8)
+            if complete or clause:
+                ok = sim >= 0.6
+            else:
+                ok = (len(take1) <= m + 2 or sim >= 0.5 or gap >= 0.8) and (
+                    not rest1 or sim >= 0.5 or not _parallel(toks, i, j, m, window))
             if ok:
                 found = (i, m)
                 break
@@ -476,9 +513,13 @@ def mark_retakes(words, drop, window=30):
 # =========================================================================== numbers
 
 _YEAR = re.compile(r"^(19|20)\d\d$")
-_NUM_RE = re.compile(r"^(?P<cur>[$\u20ac\u00a3])?(?P<num>\d{1,3}(?:,\d{3})+|\d+)(?:\.(?P<dec>\d+))?"
+_NUM_RE = re.compile(r"^(?P<cur>[$\u20ac\u00a3\u20b9])?(?P<num>\d{1,3}(?:,\d{3})+|\d+)(?:\.(?P<dec>\d+))?"
                      r"(?P<mag>[kKmMbB]|bn)?(?P<pct>%)?(?P<x>[xX])?$")
 _ORD_RE = re.compile(r"^(\d+)(st|nd|rd|th)$")
+# currency words after a number ("500 euros"); "pounds" is left out, it is as often a weight
+CURRENCY_WORDS = {"dollars": "$", "dollar": "$", "bucks": "$", "usd": "$", "euros": "\u20ac", "euro": "\u20ac",
+                  "eur": "\u20ac", "quid": "\u00a3", "gbp": "\u00a3", "rupees": "\u20b9", "rupee": "\u20b9",
+                  "inr": "\u20b9"}
 
 
 def _fmt(value, decimals=0, sep=","):
@@ -501,7 +542,9 @@ def number_spans(words):
     "prefix", "suffix", "decimals", "unit"}; kind is percent, money,
     multiplier, count, year or ordinal. Understands digits ("$4.2M", "73%",
     "10,000", "3x", "2nd") and number words ("seventy three percent",
-    "ten thousand dollars", "a million").
+    "ten thousand dollars", "a million"). Money keeps the currency that was
+    said: $, \u20ac, \u00a3 or \u20b9 before the digits, or a currency word after the
+    number (CURRENCY_WORDS: "500 euros" is \u20ac500).
     """
     toks = [_tok(w["w"]) for w in words]
     raws = [_bare(w["w"]) for w in words]
@@ -524,7 +567,7 @@ def number_spans(words):
                 decimals = len(m.group("dec"))
             mag = (m.group("mag") or "").lower()
             value *= {"k": 1e3, "m": 1e6, "b": 1e9, "bn": 1e9}.get(mag, 1)
-            cur = "$" if m.group("cur") == "$" else (m.group("cur") or "")
+            cur = m.group("cur") or ""
             if m.group("pct"):
                 kind = "percent"
             elif m.group("x"):
@@ -571,8 +614,8 @@ def number_spans(words):
             if u in ("percent", "per") or raws[j] == "%":
                 kind = "percent"
                 j += 2 if u == "per" and j + 1 < n and toks[j + 1] == "cent" else 1
-            elif u in ("dollars", "dollar", "bucks", "usd"):
-                cur, j = "$", j + 1
+            elif u in CURRENCY_WORDS:
+                cur, j = cur or CURRENCY_WORDS[u], j + 1
             elif u in ("x", "times") and value >= 2:
                 kind, j = "multiplier", j + 1
         if j < n:
@@ -589,7 +632,7 @@ def number_spans(words):
         elif kind == "multiplier":
             display, prefix, suffix = "%sx" % _fmt(value, decimals), "", "x"
         elif kind == "money":
-            display, prefix, suffix = "$" + _short_money(value), "$", ""
+            display, prefix, suffix = cur + _short_money(value), cur, ""
         elif kind == "year":
             display, prefix, suffix = "%d" % value, "", ""
         else:
@@ -613,16 +656,18 @@ def keep_ranges(words, drop, duration, E, env=None, end_tail=END_TAIL):
     if not kept:
         return [[0.0, duration]], [], None, None
     first, last = words[kept[0]], words[kept[-1]]
-    start = max(0.0, first["s"] - LEAD_IN)
+    # words dropped before the first kept one (a first take, a filler) go with the head cut, so it ends after them
+    lo = words[kept[0] - 1]["e"] if kept[0] > 0 else 0.0
+    start = max(0.0, first["s"] - min(LEAD_IN, max(0.0, first["s"] - lo)))
     head = None
     if start > 0.05:
-        start = _quietest(env, max(0.0, start - 0.03), min(first["s"] - 0.02, start + 0.03), start)
-        head = {"kind": "DEAD", "in": 0.0, "out": _r3(start), "why": "silence before the first word"}
+        start = _quietest(env, max(lo, start - 0.03), min(first["s"] - 0.02, start + 0.03), start)
+        kind, why = _drop_reason(range(kept[0]), drop, "silence before the first word")
+        head = {"kind": kind, "in": 0.0, "out": _r3(start), "why": why}
     else:
         start = 0.0
     ranges, between = [], []
     cur = start
-    rank = {"RETAKE": 3, "TRIM": 2, "FILLER": 1}
     for a, b in zip(kept, kept[1:]):
         wa, wb = words[a], words[b]
         gap = wb["s"] - wa["e"]
@@ -631,13 +676,7 @@ def keep_ranges(words, drop, duration, E, env=None, end_tail=END_TAIL):
             d0, d1 = words[dropped[0]]["s"], words[dropped[-1]]["e"]
             g1, g2 = max(0.0, d0 - wa["e"]), max(0.0, wb["s"] - d1)
             c0, c1 = wa["e"] + min(E["tail"], g1), wb["s"] - min(E["lead"], g2)
-            kinds = [drop[i][0] for i in dropped]
-            kind = max(kinds, key=lambda k: rank.get(k, 0))
-            whys = []
-            for i in sorted(dropped, key=lambda i: drop[i][0] != kind):   # the main reason first
-                if drop[i][1] not in whys:
-                    whys.append(drop[i][1])
-            why = "; ".join(whys[:3]) + (" (+%d more)" % (len(whys) - 3) if len(whys) > 3 else "")
+            kind, why = _drop_reason(dropped, drop)
         elif gap > E["gap"]:
             c0, c1 = wa["e"] + E["tail"], wb["s"] - E["lead"]
             kind, why = "DEAD", "%.2f s pause" % gap
@@ -652,14 +691,37 @@ def keep_ranges(words, drop, duration, E, env=None, end_tail=END_TAIL):
         ranges.append([_r3(cur), _r3(c0)])
         between.append({"kind": kind, "in": _r3(c0), "out": _r3(c1), "why": why})
         cur = c1
-    end = min(duration, last["e"] + end_tail)
+    after = list(range(kept[-1] + 1, len(words)))
+    # the breath after the last kept word stops where a dropped word after it begins
+    end = min(duration, last["e"] + (min(end_tail, max(0.0, words[after[0]]["s"] - last["e"])) if after
+                                     else end_tail))
     tail = None
     if duration - end > 0.05:
-        tail = {"kind": "DEAD", "in": _r3(end), "out": _r3(duration), "why": "silence after the last word"}
+        kind, why = _drop_reason(after, drop, "silence after the last word")
+        tail = {"kind": kind, "in": _r3(end), "out": _r3(duration), "why": why}
     else:
         end = duration
     ranges.append([_r3(cur), _r3(end)])
     return ranges, between, head, tail
+
+
+_RANK = {"RETAKE": 3, "TRIM": 2, "FILLER": 1}
+
+
+def _drop_reason(dropped, drop, silence=None):
+    """(kind, why) of a cut that removes the words `dropped`: the weightiest kind, its reasons first.
+
+    With no words in it the cut is ("DEAD", silence).
+    """
+    dropped = [i for i in dropped if i in drop]
+    if not dropped:
+        return "DEAD", silence
+    kind = max((drop[i][0] for i in dropped), key=lambda k: _RANK.get(k, 0))
+    whys = []
+    for i in sorted(dropped, key=lambda i: drop[i][0] != kind):   # the main reason first
+        if drop[i][1] not in whys:
+            whys.append(drop[i][1])
+    return kind, "; ".join(whys[:3]) + (" (+%d more)" % (len(whys) - 3) if len(whys) > 3 else "")
 
 
 def merge_short(ranges, between, min_len=MIN_SEGMENT, max_undo=0.7):
@@ -2144,7 +2206,18 @@ def _size(text):
     return int(m.group(1)), int(m.group(2))
 
 
+def _utf8_console():
+    """Print paths, hooks and transcripts in any script: on Windows a piped stdout uses the ANSI code page
+    (cp1252), which cannot encode a Hindi folder name or an emoji and would stop the command after its work."""
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):   # not a text stream (redirected in tests, pythonw)
+            pass
+
+
 def main(argv=None):
+    _utf8_console()
     ap = argparse.ArgumentParser(prog="vstudio autoedit",
                                  description="Edit a raw talking video like a short-form editor: cuts, reframing, "
                                              "zooms, captions, graphics, b-roll, sound.")

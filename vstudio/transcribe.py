@@ -33,8 +33,10 @@ model (about 500 MB for "small") on first use.
 """
 
 import bisect
+import html
 import json
 import os
+import re
 import sys
 
 from . import paths
@@ -149,13 +151,101 @@ def load_words_json(path):
     raise ValueError("%s: not a words file" % path)
 
 
+_VTT_TIME = re.compile(r"^\s*((?:\d+:)?\d{1,2}:\d{2}[.,]\d{1,3})\s*-->\s*((?:\d+:)?\d{1,2}:\d{2}[.,]\d{1,3})")
+_VTT_STAMP = re.compile(r"<((?:\d+:)?\d{1,2}:\d{2}[.,]\d{1,3})>")
+
+
+def _vtt_seconds(t):
+    parts = [float(p) for p in t.replace(",", ".").split(":")]
+    return sum(p * 60 ** k for k, p in enumerate(reversed(parts)))
+
+
+def _vtt_line(line):
+    """[(start or None, text)] chunks of a cue line: inline <hh:mm:ss.mmm> stamps start chunks, tags dropped."""
+    chunks, t = [], None
+    for k, part in enumerate(_VTT_STAMP.split(line)):
+        if k % 2:
+            t = _vtt_seconds(part)
+            continue
+        text = html.unescape(re.sub(r"<[^>]*>", "", part))
+        text = re.sub(r"\[[^\]]*\]", " ", text)                 # [Music], [Applause]: sounds, not speech
+        if text.strip():
+            chunks.append((t, text))
+    if chunks:   # ">>" (a new speaker) and a dialogue dash at the start of a line are not words
+        t0, text = chunks[0]
+        chunks[0] = (t0, re.sub(r"^\s*(?:>>\s*|-\s+)", "", text))
+    return [(t, text) for t, text in chunks if text.strip()]
+
+
+def _norm(text):
+    return " ".join(text.lower().split())
+
+
+def parse_vtt(text):
+    """Words [{"w", "s", "e"}] of a WebVTT file, including YouTube's auto-subs.
+
+    Cue settings ("align:start position:0%") and tags are not words; a line
+    that repeats the previous cue's last line is the rolling display of
+    auto-subs, not new speech (and a cue under 0.15 s holding only such a
+    line is a display transition); inline <hh:mm:ss.mmm> stamps time the
+    words after them. Other words are spread evenly up to the next timed
+    word or the cue end.
+    """
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff").split("\n")
+    words, prev_last, k = [], None, 0
+    while k < len(lines):
+        m = _VTT_TIME.match(lines[k])
+        k += 1
+        if not m:
+            continue
+        a, z = _vtt_seconds(m.group(1)), _vtt_seconds(m.group(2))
+        body = []
+        while k < len(lines) and lines[k] and not lines[k].strip():
+            k += 1                                   # auto-subs put a " " line above the new words
+        if k + 1 < len(lines) and _VTT_TIME.match(lines[k + 1]):
+            continue                                 # an empty cue: that line is the next cue's id
+        while k < len(lines) and lines[k].strip() and not _VTT_TIME.match(lines[k]):
+            body.append(lines[k])
+            k += 1
+        plain = [_norm(" ".join(t for _, t in _vtt_line(b))) for b in body]
+        keep = list(zip(body, plain))
+        if prev_last is not None:
+            while len(keep) > 1 and keep[0][1] == prev_last:
+                keep.pop(0)                          # the rolling line above the new words
+            if len(keep) == 1 and keep[0][1] == prev_last and z - a < 0.15:
+                keep = []
+        if any(p for _, p in keep):
+            prev_last = [p for _, p in keep if p][-1]
+        if z <= a:
+            continue
+        # runs of words that start at one time: the cue start, then each inline stamp
+        runs = []
+        for b, _ in keep:
+            for t, chunk in _vtt_line(b):
+                if t is not None or not runs:
+                    start = min(max(a if t is None else t, runs[-1][0] if runs else a), z)
+                    runs.append((start, []))
+                runs[-1][1].extend(chunk.split())
+        for n, (s, toks) in enumerate(runs):
+            e = runs[n + 1][0] if n + 1 < len(runs) else z
+            step = (e - s) / len(toks)
+            for q, w in enumerate(toks):
+                words.append({"w": w, "s": round(s + q * step, 3), "e": round(s + (q + 1) * step, 3)})
+    return words
+
+
 def load_captions(path):
-    """Words from an SRT / VTT / json3 / words-json captions file (cleaned), parsed by extract.py."""
+    """Words from an SRT / VTT / json3 / words-json captions file (cleaned).
+
+    WebVTT is parsed here (parse_vtt); SRT and json3 by extract.py.
+    """
     if path.lower().endswith(".json"):
         return load_words_json(path)
-    ex = paths.load_skill("extract")
-    with open(path, encoding="utf-8", errors="replace") as f:   # read here so the file is always closed
+    with open(path, encoding="utf-8-sig", errors="replace") as f:   # read here so the file is always closed
         raw = f.read()
+    if path.lower().endswith(".vtt") or raw.lstrip().startswith("WEBVTT"):
+        return clean(parse_vtt(raw))
+    ex = paths.load_skill("extract")
     if path.lower().endswith(".json3") or raw.lstrip().startswith("{"):
         return clean(ex.parse_json3(json.loads(raw)))
     return clean(ex.parse_srt_vtt(raw))

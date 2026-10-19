@@ -448,8 +448,11 @@ def _probe(e):
     if key not in _probes:
         try:
             f = ImageFont.truetype(e["path"], 32, index=e.get("index", 0))
+            # colour bitmap emoji fonts (Apple Color Emoji, Noto Color Emoji) load only at their own strike
+            # sizes (20, 32, 40, 109 ...): a font that cannot load at an odd size cannot draw text at any size
+            ImageFont.truetype(e["path"], 37, index=e.get("index", 0))
             _probes[key] = (f, _glyph_sig(f, NOTDEF_PROBE), {})
-        except (OSError, ValueError):  # colour bitmap emoji fonts only load at their own strike size
+        except (OSError, ValueError):
             _probes[key] = None
     return _probes[key]
 
@@ -507,7 +510,7 @@ def glyph_fallbacks(name_or_path, text):
     found = {c: _glyph_choice[(c, weight, italic)] for c in lacking if _glyph_choice[(c, weight, italic)]}
     nobody = [c for c in lacking if not _glyph_choice[(c, weight, italic)]]
     used = sorted({f["family"] for f in found.values()})
-    key = ("glyphs", e["path"], tuple(lacking))
+    key = ("glyphs", e["path"], tuple(lacking), tuple(used), tuple(nobody))
     if key not in _warned:
         _warned.add(key)
         if used:

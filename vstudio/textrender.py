@@ -261,10 +261,17 @@ def _layout(layer, scale):
     text = _apply_case(str(layer.get("text") or ""), layer.get("case"))
     found, _ = fonts.glyph_fallbacks(layer.get("font"), text + str(layer.get("_reserve") or ""))
     faces = {}
-    for ch, e in found.items():  # one Pillow font per fallback face, shared by its characters
+    for ch, e in list(found.items()):  # one Pillow font per fallback face, shared by its characters
         key = (e["path"], e.get("index", 0))
-        faces[key] = faces.get(key) or fonts.load_face(e, size)
-        found[ch] = faces[key]
+        if key not in faces:
+            try:
+                faces[key] = fonts.load_face(e, size)
+            except (OSError, ValueError):  # cannot load at this size: the character keeps the layer's font
+                faces[key] = None
+        if faces[key] is None:
+            del found[ch]
+        else:
+            found[ch] = faces[key]
     font = _FontRuns(fonts.load(layer.get("font"), size), found)
     ls = float(layer.get("letter_spacing") or 0) * scale
     measure = _Measure(font, ls, bool(layer.get("_tabular")))

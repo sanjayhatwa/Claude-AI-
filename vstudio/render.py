@@ -544,11 +544,13 @@ class VideoReader:
         sw, sh = self.scaled
         speed = float(L["speed"])
         vf = []
-        src_fps = self.info.get("fps")
-        if src_fps and 1.0 <= src_fps <= 300.0:  # (not a container's 1000/1 "frame rate")
+        grid = self.info.get("base_fps") or self.info.get("fps")
+        if grid and 1.0 <= grid <= 300.0:  # (not a container's 1000/1 "frame rate")
             # snap timestamps to the source's frame grid first: MKV/WebM store whole milliseconds
-            # (33, 67, 100 ...), and that rounding would otherwise decide which frame fills a slot
-            vf.append("fps=%s" % _fps_str(src_fps))
+            # (33, 67, 100 ...), and that rounding would otherwise decide which frame fills a slot.
+            # The grid is the base rate (r_frame_rate), never the average: variable-rate phone footage
+            # averages 27.2 fps on a 30 fps grid, and snapping to the average drops and doubles frames
+            vf.append("fps=%s" % _fps_str(grid))
         # time every frame against the target, then pick the frame nearest each output slot; the tiny
         # bias (1/1000 of a slot) breaks exact ties the same way every time (towards the frame on screen)
         vf += ["settb=AVTB", "setpts=(PTS-%.1f)/%r+%.1f" % (offset * 1e6, speed, 1000.0 / self.fps),
@@ -910,8 +912,9 @@ class Compositor:
         if st["opacity"] <= 0.002 or st["scale"] <= 1e-4:
             return
         # the reader frame nearest lt; a layer starting on a half frame puts every lt*fps on x.5, so ties
-        # must always go the same way (round() rounds halves to even: frames 0, 2, 2, 4, 4 ... judder)
-        k_frame = int(math.floor(lt * self.fps + 0.5 + 1e-6))
+        # must always go the same way (round() rounds halves to even: frames 0, 2, 2, 4, 4 ... judder).
+        # They go to the earlier frame, the one already on screen, as in the reader: the in-point shows first
+        k_frame = max(0, int(math.floor(lt * self.fps + 0.5 - 1e-6)))
         spr, box, R = self._sprite(L, lt, st, k_frame)
         cached = spr
         spr, box = _apply_looks(spr, box, st, R, L, frame_idx)
