@@ -120,8 +120,8 @@ Preview any template with `python -m vstudio templates preview stat --out stat.m
    "key" this needs: no API keys.
 3. **Get this repo.** Either:
    - Download the ZIP (green **Code** button on GitHub, then **Download ZIP**)
-     and unzip it, e.g. to `D:iral-hyper-agent`, or
-   - `git clone https://github.com/sanjayhatwa/Claude-AI-.git D:iral-hyper-agent`
+     and unzip it, e.g. to `D:\viral-hyper-agent`, or
+   - `git clone https://github.com/sanjayhatwa/Claude-AI-.git D:\viral-hyper-agent`
 4. **Double-click `setup.bat`** in that folder. It checks Python, FFmpeg and
    Git, offers to install anything missing with `winget`, installs the Python
    packages, downloads the free caption fonts and the face-tracking model,
