@@ -58,19 +58,16 @@ director: you write the plan; the engine does the pixels.
    `style.caption_style`, templates chosen for what each beat says, sfx on
    transitions, CTA last. Only use listed templates and the user's assets.
    Never reuse competitor wording.
-5. Render a preview, look, fix, then render final. Repeat step 1's
-   `--prompt`, `--ref`, `--competitor`, `--asset` and `--duration` with
-   `--plan`: the measured inputs are reused (no re-analysis), and `BRIEF.md`
-   and `analysis.json` are rewritten from the arguments given, so a bare
-   `--plan` run leaves a brief with no prompt, inputs or assets and the
-   default 30 s length.
+5. Render a preview, look, fix, then render final. A bare `--plan` run on
+   the project folder keeps what step 1 saved in `analysis.json` (prompt,
+   measured inputs, assets, length and aspect), so nothing is analyzed
+   again and the brief stays complete. Pass `--asset`, `--duration` or
+   `--aspect` only to change them.
 
    ```bash
-   python -m vstudio reel --plan workspace/reels/<slug>/plan.json --out-dir workspace/reels/<slug> \
-     --prompt "<prompt>" --ref <ref> --competitor <comp> --asset <file> --duration 30 --preview
+   python -m vstudio reel --plan workspace/reels/<slug>/plan.json --out-dir workspace/reels/<slug> --preview
    python -m vstudio render workspace/reels/<slug>/spec.json --still 1.0 --out /tmp/s1.png   # look at 4-6 stills
-   python -m vstudio reel --plan workspace/reels/<slug>/plan.json --out-dir workspace/reels/<slug> \
-     --prompt "<prompt>" --ref <ref> --competitor <comp> --asset <file> --duration 30
+   python -m vstudio reel --plan workspace/reels/<slug>/plan.json --out-dir workspace/reels/<slug>
    ```
 
 6. Read `QA.md` (output re-measured against the reference) and fix any

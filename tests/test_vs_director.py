@@ -680,9 +680,21 @@ class DirectorFlowTest(unittest.TestCase):
         self.assertIn("| Length |", qa)
         self.assertTrue(os.path.isfile(res["contact_sheet"]))
         # agent mode: the same folder re-rendered from the written plan, targets reused, no render
-        res2 = director.make_reel("", plan=os.path.join(out, "plan.json"), out_dir=out, render=False, log=None)
+        saved = json.loads(_read(os.path.join(out, "analysis.json")))
+        res2 = director.make_reel("", plan=os.path.join(out, "plan.json"), out_dir=out, render=False, log=None,
+                                  aspect=None, duration=None)
         self.assertEqual(res2["planner"], "file")
         self.assertEqual(res2["plan_errors"], [])
+        # ... and it keeps step 1's prompt, measured inputs, assets, length and frame instead of an empty brief
+        again = json.loads(_read(os.path.join(out, "analysis.json")))
+        for k in ("prompt", "inputs", "assets", "duration", "aspect"):
+            self.assertEqual(again[k], saved[k], k)
+        self.assertTrue(again["prompt"] and again["assets"] and again["inputs"])
+        brief2 = _read(res2["brief"])
+        self.assertIn(saved["prompt"], brief2)
+        self.assertIn(asset, brief2)
+        for it in saved["inputs"]:
+            self.assertIn(it["name"], brief2)
 
     def test_failing_llm_falls_back_and_cli(self):
         out = os.path.join(T["tmp"], "reel2")

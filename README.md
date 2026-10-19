@@ -79,6 +79,12 @@ from v2. Details are in [What's inside](#whats-inside).
 46 templates in 9 groups. Every one scales to 9:16, 1:1, 4:5 and 16:9 and
 keeps to the platform safe zones:
 
+![All 46 motion-graphics templates, each shown with its built-in demo text](docs/templates-gallery.jpg)
+
+The words and numbers above are each template's demo values, used only for
+previews. In a real reel a template shows only what you or your script give
+it: a stat without a real number is left out, never filled with a sample one.
+
 | group | templates |
 | --- | --- |
 | hooks | hook_title, title_card, chapter_marker, question, alert_banner |

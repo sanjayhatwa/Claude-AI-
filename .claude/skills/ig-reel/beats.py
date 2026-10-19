@@ -27,7 +27,9 @@ import re
 import sys
 
 WORD_RE = re.compile(r"[A-Za-z0-9$%'’-]+")
-SENT_RE = re.compile(r"[^.!?]+[.!?]*")
+# a sentence ends at . ! or ? (plus any closing quote or bracket) followed by a space,
+# so "1.5 seconds" and "$4.99" stay in one piece
+SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|(?<=[.!?][\"'”’)\]])\s+")
 CONCRETE_RE = re.compile(r"\$\s?\d|\b\d[\d,.]*\b|(?<!^)\b[A-Z][a-z]{2,}\b", re.MULTILINE)
 STOPWORDS = {
     "the", "a", "an", "and", "or", "but", "if", "of", "to", "in", "on", "for",
@@ -68,7 +70,7 @@ def split_beats(raw, wps):
             continue
         # Long paragraph: break it at sentence ends so the timings mean
         # something, and let the report say it was split.
-        parts = [p.strip() for p in SENT_RE.findall(line) if p.strip()]
+        parts = [p.strip() for p in SENT_SPLIT_RE.split(line) if p.strip()]
         buf = ""
         for part in parts:
             candidate = (buf + " " + part).strip()

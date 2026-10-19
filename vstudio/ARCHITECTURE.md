@@ -492,9 +492,10 @@ def main(argv=None) -> int
 ```
 A `--ref` / `--competitor` folder (extract.py's output, e.g. `workspace/dna/<slug>`)
 or `style_dna.json` is reused as it is, not measured again. `--plan` uses the
-given plan; `BRIEF.md` and `analysis.json` are rebuilt from the arguments of
-that run, so agent mode passes step 1's prompt, inputs and duration again
-(their analysis is reused). `--no-qa` skips the QA pass.
+given plan. With no `--ref`/`--competitor` and an `analysis.json` in the
+folder, the run keeps its saved prompt, measured inputs, style targets and
+assets, and its duration and aspect unless `--duration`/`--aspect` are given
+(`make_reel(aspect=None, duration=None)`). `--no-qa` skips the QA pass.
 Writes `DIR/BRIEF.md`, `DIR/plan.json`, `DIR/spec.json`, `DIR/reel.mp4`,
 `DIR/QA.md` (output re-extracted and compared to the reference DNA).
 Compiled specs carry `meta.beats` (beat times and lines) and

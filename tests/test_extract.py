@@ -245,6 +245,17 @@ class TestCaptions(unittest.TestCase):
         self.assertGreater(n, 3)
         self.assertIn("NOBODY", ass)
 
+    def test_ass_words_are_literal_text(self):
+        # a transcript word with braces or a backslash must print, not restyle the card or break the line
+        words = [{"w": "{\\fs300}big", "s": 0.0, "e": 0.4}, {"w": "a\\nb", "s": 0.5, "e": 0.9}]
+        for hl in (None, "#FFE500"):
+            cap = dict(captions.DEFAULT_CAPTION, highlight=hl, case="upper")
+            ass, _ = captions.build_ass(words, cap, 1080, 1920, "Montserrat Black")
+            body = "\n".join(l for l in ass.splitlines() if l.startswith("Dialogue:"))
+            self.assertIn("\\{\\⁠FS300\\}BIG", body)
+            self.assertIn("A\\⁠NB", body)
+            self.assertNotIn("{\\FS300}", body)
+
     def test_script_timing(self):
         w = captions.words_from_script("one two three. four", wpm=120)
         self.assertEqual(len(w), 4)

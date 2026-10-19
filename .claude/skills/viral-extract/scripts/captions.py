@@ -86,6 +86,13 @@ def display_token(word):
     return re.sub(r"[.,;:]+$", "", word) or word
 
 
+def ass_text(word):
+    """A caption word as literal ASS text (same rule as vstudio's renderer): "{" would open an override
+    block and a backslash would start an escape, so braces become \\{ \\} and a backslash gets an
+    invisible word joiner after it."""
+    return str(word).replace("\\", "\\\u2060").replace("{", "\\{").replace("}", "\\}")
+
+
 def apply_case(text, case):
     if case == "upper":
         return text.upper()
@@ -184,7 +191,7 @@ def build_ass(words, cap, W, H, font, pop=False):
         else:
             end = hold
         end = max(end, start + 0.25)
-        tokens = [apply_case(display_token(w["w"]), cap.get("case")) for w in card]
+        tokens = [ass_text(apply_case(display_token(w["w"]), cap.get("case"))) for w in card]
         prefix = "{\\an%d\\pos(%d,%d)%s}" % (
             an, x, y, "\\fscx80\\fscy80\\t(0,90,\\fscx100\\fscy100)" if pop else "")
         if cap.get("highlight") and len(card) > 1:

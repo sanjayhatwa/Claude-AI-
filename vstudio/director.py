@@ -1181,11 +1181,13 @@ def make_reel(prompt, refs=(), competitors=(), assets=(), script=None, voice=Non
     or LLMUnavailable), "none" (offline heuristic), or an object with
     complete_json(prompt, schema=, system=, timeout=, retries=, check=) (tests,
     other front ends; `client=` does the same). plan: a PLAN dict or plan.json
-    path used as it is (agent mode). qa=False skips the QA pass.
+    path used as it is (agent mode). qa=False skips the QA pass. aspect or
+    duration None: the project's saved value on a plan-only re-run, else
+    9:16 and 30 s.
     """
     t_start = time.time()
     timings = {}
-    if aspect not in planner.ASPECTS:
+    if aspect is not None and aspect not in planner.ASPECTS:
         raise DirectorError("aspect must be one of %s" % ", ".join(planner.ASPECTS))
     plan_path_in = plan if isinstance(plan, str) else None
     if plan_path_in and not os.path.isfile(plan_path_in):
@@ -1225,6 +1227,24 @@ def make_reel(prompt, refs=(), competitors=(), assets=(), script=None, voice=Non
     t0 = time.time()
     ref_items, comp_items = analyze_inputs(list(refs), list(competitors), out_dir, log)
     saved = _read_json(os.path.join(out_dir, "analysis.json"), {}) or {}
+    if not isinstance(saved, dict):
+        saved = {}
+    # a plan-only re-run (`reel --plan plan.json` and nothing else) keeps what step 1 saved: the prompt, the
+    # measured inputs, the assets, the length and the frame, so the brief and the allowed assets stay the same
+    rerun = plan is not None and not ref_items and not comp_items and bool(saved)
+    saved_inputs = []
+    if rerun:
+        prompt = prompt or str(saved.get("prompt") or "")
+        if not assets:
+            asset_rows = [r for r in saved.get("assets") or []
+                          if isinstance(r, dict) and isinstance(r.get("path"), str) and os.path.isfile(r["path"])]
+        saved_inputs = [it for it in saved.get("inputs") or [] if isinstance(it, dict) and it.get("name")]
+        if aspect is None and saved.get("aspect") in planner.ASPECTS:
+            aspect = saved["aspect"]
+        if duration is None and isinstance(saved.get("duration"), (int, float)) and 3 <= saved["duration"] <= 600:
+            duration = float(saved["duration"])
+    aspect = aspect or "9:16"
+    duration = 30.0 if duration is None else duration
     if not ref_items and saved.get("targets") and plan is not None:
         targets = saved["targets"]                 # a re-run on a finished brief keeps its targets
         comp_rows, beat_lines = saved.get("competitors") or [], saved.get("beat") or []
@@ -1252,14 +1272,14 @@ def make_reel(prompt, refs=(), competitors=(), assets=(), script=None, voice=Non
     sc = None
     if script_text:
         sc = score_script(script_text, duration, (targets.get("style") or {}).get("wpm") or planner.DEFAULT_WPM)
-    inputs = ref_items + comp_items
+    inputs = ref_items + comp_items or saved_inputs
     brief = brief_md(prompt, targets, comp_rows, beat_lines, inputs, sc, asset_rows, duration, aspect, notes)
     brief_path = os.path.join(out_dir, "BRIEF.md")
     _write_text(brief_path, brief)
     _write_json(os.path.join(out_dir, "analysis.json"), {
         "version": ANALYSIS_VERSION, "prompt": prompt, "targets": targets, "competitors": comp_rows, "beat": beat_lines,
         "inputs": [{k: it.get(k) for k in ("role", "name", "src", "video", "dna_dir", "error")} for it in inputs],
-        "assets": asset_rows})
+        "assets": asset_rows, "duration": duration, "aspect": aspect})
     _say(log, "brief written: %s" % brief_path, 20)
 
     # ----- 3. plan
@@ -1426,8 +1446,10 @@ def main(argv=None):
     ap.add_argument("--script", help="script file (your spoken lines)")
     ap.add_argument("--voice", help="voiceover recording (audio or video)")
     ap.add_argument("--music", help="music track (ducked under the voice)")
-    ap.add_argument("--aspect", default="9:16", choices=list(planner.ASPECTS))
-    ap.add_argument("--duration", type=float, default=30.0, help="target length in seconds (default 30)")
+    ap.add_argument("--aspect", choices=list(planner.ASPECTS),
+                    help="9:16 (default), 1:1, 4:5 or 16:9; a bare --plan re-run keeps the project's")
+    ap.add_argument("--duration", type=float,
+                    help="target length in seconds (default 30; a bare --plan re-run keeps the project's)")
     ap.add_argument("--out-dir", help="project folder (default workspace/reels/<slug>-<time>)")
     ap.add_argument("--llm", default="auto", choices=["auto", "claude", "none"],
                     help="plan with Claude Code (auto when installed), or offline (none)")
@@ -1438,7 +1460,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if not (a.prompt or a.script or a.plan):
         ap.error("give --prompt (or --script, or --plan)")
-    if not 3 <= a.duration <= 600:
+    if a.duration is not None and not 3 <= a.duration <= 600:
         ap.error("--duration must be 3..600 seconds")
 
     def log(msg):
