@@ -417,6 +417,8 @@ class PlannerTest(unittest.TestCase):
         plan = planner.heuristic_plan("", "Which phone shoots better video? iPhone vs. Android. Here is the answer.",
                                       None, 12)
         self.assertIn("versus", [(b["visual"] or {}).get("template") for b in plan["beats"]])
+        self.assertEqual(planner.headline("iPhone vs. Android"), "iPhone vs. Android")    # not "IPhone"
+        self.assertEqual(planner.headline("stop posting at night"), "Stop posting at night")
         words = [{"w": w, "s": i * 0.4, "e": i * 0.4 + 0.3} for i, w in enumerate("We hit 2.5M views. Dr. Lee said so.".split())]
         self.assertEqual([len(s) for s in planner.sentences_from_words(words)], [4, 4])
 
@@ -734,6 +736,24 @@ class DirectorFlowTest(unittest.TestCase):
                                      out_dir=tempfile.mkdtemp(dir=T["tmp"]), render=False, log=None)
             self.assertEqual((res["planner"], len(calls)), ("claude", 2), (name, res["notes"]))
             self.assertIn("# Your previous answer had these problems", calls[1], name)
+        # a check that fails on a shape nobody foresaw sends the error back instead of crashing the reel
+        old_copied, hits = director.copied_lines, []
+
+        def flaky(*a, **kw):
+            hits.append(1)
+            if len(hits) == 1:
+                raise TypeError("unhashable type: 'list'")
+            return old_copied(*a, **kw)
+        director.copied_lines = flaky
+        try:
+            run, calls = self._runner(base, base)
+            llm.set_runner(run)
+            res = director.make_reel("Stop posting at night. Post at lunch instead.", duration=6, llm="claude",
+                                     out_dir=tempfile.mkdtemp(dir=T["tmp"]), render=False, log=None)
+        finally:
+            director.copied_lines = old_copied
+        self.assertEqual((res["planner"], len(calls)), ("claude", 2), res["notes"])
+        self.assertIn("could not be checked (TypeError", calls[1])
         # a plan file with the same faults is reported, never a traceback
         for name, bad in cases.items():
             d = tempfile.mkdtemp(dir=T["tmp"])
@@ -772,6 +792,14 @@ class DirectorFlowTest(unittest.TestCase):
             res = director.make_reel("Stop posting at night", voice=voice, duration=10, llm="none", render=False,
                                      out_dir=os.path.join(d, "out_" + name), log=None)
             self.assertAlmostEqual(json.loads(_read(res["plan"]))["duration"], 1.6 + 0.5 + 2.2, delta=0.6)
+        # a transcript file that cannot be read: the reel is still made, and the brief says why it was not used
+        voice = self._wav(os.path.join(d, "broken.wav"))
+        with open(os.path.join(d, "broken.words.json"), "w", encoding="utf-8") as f:
+            f.write("{not json")
+        self.assertIsNone(director._voice_words(voice))
+        res = director.make_reel("Stop posting at night", voice=voice, duration=10, llm="none", render=False,
+                                 out_dir=os.path.join(d, "out_broken"), log=None)
+        self.assertTrue(any("broken.words.json" in n and "could not be used" in n for n in res["notes"]), res["notes"])
 
     def test_download_follows_the_link(self):
         d = tempfile.mkdtemp(dir=T["tmp"])
@@ -799,6 +827,12 @@ class DirectorFlowTest(unittest.TestCase):
             v2, caps = director.download("https://www.youtube.com/shorts/COMPLETELY_DIFFERENT", stem)
             self.assertEqual(_read(v2), "https://www.youtube.com/shorts/COMPLETELY_DIFFERENT")
             self.assertIsNone(caps)                                            # the old link's captions are gone
+            # a file from before the link was recorded next to it could be any video: it is fetched again
+            os.remove(stem + ".source.json")
+            with open(stem + ".mp4", "w", encoding="utf-8") as f:
+                f.write("an older download")
+            v3, _ = director.download("https://www.youtube.com/shorts/BBB", stem)
+            self.assertEqual(_read(v3), "https://www.youtube.com/shorts/BBB")
         finally:
             director.subprocess.run, director._have_ytdlp = old_run, old_have
 
@@ -814,6 +848,23 @@ class DirectorFlowTest(unittest.TestCase):
         self.assertTrue(any("broken.mp4" in n and "could not be read" in n for n in res["notes"]), res["notes"])
         plan = json.loads(_read(res["plan"]))
         self.assertTrue(all((b["background"] or {}).get("asset") == good for b in plan["beats"]))
+
+    def test_relative_music_and_voice_paths(self):
+        d = tempfile.mkdtemp(dir=T["tmp"])
+        self._wav(os.path.join(d, "song.wav"), 3.0)
+        self._wav(os.path.join(d, "voice.wav"), 3.0)
+        old = os.getcwd()
+        os.chdir(d)                          # the CLI passes paths as typed, relative to where it runs
+        try:
+            res = director.make_reel("Stop posting at night", music="song.wav", voice="voice.wav", duration=5,
+                                     llm="none", render=False, out_dir=os.path.join(d, "project"), log=None)
+        finally:
+            os.chdir(old)
+        self.assertEqual(res["plan_errors"], [])
+        spec = timeline.load(res["spec"])
+        srcs = {a["role"]: os.path.realpath(a["src"]) for a in spec["audio"] if a.get("role") in ("music", "voice")}
+        self.assertEqual(srcs, {"music": os.path.realpath(os.path.join(d, "song.wav")),     # macOS: /var -> /private/var
+                                "voice": os.path.realpath(os.path.join(d, "voice.wav"))})
 
     def test_offline_plans_are_validated_too(self):
         res = director.make_reel("🔥🔥🔥", duration=6, llm="none", render=False, out_dir=tempfile.mkdtemp(dir=T["tmp"]),

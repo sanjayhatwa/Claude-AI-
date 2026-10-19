@@ -42,8 +42,18 @@ heuristic_plan() splits a script (or the prompt) into one beat per spoken
 unit, sizes beats by syllables at the style's words per minute, fits them to
 the target length, picks a template from what each line says (numbers,
 lists, questions, versus, quotes, warnings, short punches), alternates the
-given assets as backgrounds and assigns transitions, sfx and camera moves
-by energy. It only ever puts numbers on screen that are in the text.
+given assets as backgrounds (a file ffprobe or Pillow cannot read is
+skipped with a note) and assigns transitions, sfx and camera moves by
+energy. It only ever puts numbers on screen that are in the text. Lines
+are split at . ! ? only where a sentence ends, so decimals ("3.5x",
+"$1,250.50"), domains and abbreviations ("vs.", "Dr.") stay whole; timing
+counts syllables in any script (Latin, Cyrillic, Greek, Indic, CJK).
+
+validate_plan never raises on a malformed plan (wrong types anywhere): it
+reports each problem. compile_plan leaves out the parts it cannot draw
+(a template call that is not an object, a number that is not finite, a
+colour that is not a colour) and raises ValueError when nothing usable is
+left.
 
 Limits: the heuristic reads English cues; it cannot judge meaning the way
 an LLM plan can. Collision avoidance between templates and captions works
@@ -56,6 +66,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 import unicodedata
 
@@ -101,6 +112,8 @@ SAFE_FILL = {"cta": {"text": "FOLLOW FOR MORE"}}
 FULL_TEMPLATES = {"title_card", "word_stack", "versus", "before_after", "split_screen", "myth_vs_fact", "pros_cons",
                   "ranking", "timeline_steps", "bar_chart", "poll", "text_message", "post_card", "checklist",
                   "percent_ring", "rating", "price_tag", "countdown", "quote", "kinetic_text", "image_card"}
+# caption_style keys that are numbers (captions.py reads them as such)
+_CAPTION_NUMBERS = {"font_size_pct", "center_x_pct", "center_y_pct", "max_width_pct", "outline_pct", "lines_per_card"}
 Y_FRACTION_PARAMS = {"alert_banner": "y", "emphasis_word": "y", "list_item": "y", "icon_badge": "y"}
 
 # seconds from an sfx's start to its peak, so the peak lands on the cut
@@ -115,6 +128,45 @@ TRANSITION_D = {"whip": 0.2, "slide": 0.32, "zoom": 0.28, "fade": 0.36, "glitch"
 
 def _isnum(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _finite(v):
+    """v as a finite float (numbers and numeric text such as "12.5"), else None ("1e400", inf, "1,250", True).
+
+    Text the templates could not convert ("1,250", "12%") counts as not a number: drawing it would fall back
+    to the catalog's sample value.
+    """
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        return None
+    try:
+        f = float(v.strip() if isinstance(v, str) else v)
+    except (ValueError, OverflowError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _bad_number(ptype, v):
+    """True when v cannot be a template param of catalog type ptype (int, float, list[float]) as a finite number."""
+    if ptype in ("int", "float"):
+        return _finite(v) is None
+    if ptype == "list[float]":
+        items = [x for x in re.split(r"[,|\s]+", v.strip()) if x] if isinstance(v, str) else v
+        return not isinstance(items, list) or any(_finite(x) is None for x in items)
+    return False
+
+
+def _call_params(call):
+    """A template call's params as a dict, without numbers that are not finite (they fall back to the default).
+
+    Only for drawing: validate_plan reports the same values as problems.
+    """
+    params = call.get("params") if isinstance(call, dict) else None
+    if not isinstance(params, dict):
+        return {}
+    spec = templates.CATALOG.get(call.get("template"), {}).get("params", {}) \
+        if isinstance(call.get("template"), str) else {}
+    return {k: v for k, v in params.items()
+            if not (k in spec and v is not None and _bad_number(spec[k]["type"], v))}
 
 
 def _hex_ok(c):
@@ -344,18 +396,25 @@ def _template_problems(where, call, errors):
         errors.append("%s must be {\"template\": name, \"params\": {...}}, got %r" % (where, call))
         return
     name = call.get("template")
+    if not isinstance(name, str):
+        errors.append("%s: template must be a template name (text), got %r" % (where, name))
+        return
     if name not in templates.CATALOG:
         errors.append("%s: unknown template %r%s (see the catalog)" % (where, name, _suggest(name, templates.CATALOG)))
         return
     params = call.get("params") or {}
     if not isinstance(params, dict):
-        errors.append("%s (%s): params must be an object" % (where, name))
+        errors.append("%s (%s): params must be an object {\"name\": value}, got %r" % (where, name, params))
         return
     known = templates.CATALOG[name]["params"]
     for k in params:
         if k not in known:
             errors.append("%s (%s): unknown param %r%s; it takes: %s"
                           % (where, name, k, _suggest(k, known), ", ".join(known)))
+        elif params[k] is not None and _bad_number(known[k]["type"], params[k]):
+            errors.append("%s (%s): params.%s must be %s, got %r" % (
+                where, name, k, "a list of finite numbers" if known[k]["type"].startswith("list") else
+                "a finite number", params[k]))
     for k in REQUIRED_NUMBERS.get(name, []):
         if _blank(params.get(k)):
             errors.append("%s (%s): params.%s is required (a real number from the script; never invent one)"
@@ -396,8 +455,9 @@ def validate_plan(plan, base_dir=None, assets=None):
             m = _suggest(k, PLAN_KEYS)
             if m:
                 errs.append("unknown plan field %r%s" % (k, m))
-    if plan.get("aspect", "9:16") not in ASPECTS:
-        errs.append("aspect must be one of %s, got %r" % (", ".join(ASPECTS), plan.get("aspect")))
+    aspect = plan.get("aspect", "9:16")
+    if not isinstance(aspect, str) or aspect not in ASPECTS:
+        errs.append("aspect must be one of %s, got %r" % (", ".join(ASPECTS), aspect))
     if plan.get("fps") is not None and not (_isnum(plan["fps"]) and 5 <= plan["fps"] <= 60):
         errs.append("fps must be a number 5..60, got %r" % plan.get("fps"))
     dur = plan.get("duration")
@@ -424,6 +484,9 @@ def validate_plan(plan, base_dir=None, assets=None):
             for k in cs:
                 if k not in timeline.CAPTION_STYLE_KEYS:
                     errs.append("style.caption_style: unknown key %r%s" % (k, _suggest(k, timeline.CAPTION_STYLE_KEYS)))
+                elif k in _CAPTION_NUMBERS and cs[k] is not None and not (_isnum(cs[k]) and cs[k] >= 0):
+                    errs.append("style.caption_style.%s must be a number (copy the measured value), got %r"
+                                % (k, cs[k]))
     gr = st.get("grade")
     if gr is not None and not (isinstance(gr, dict) and all(k in ("contrast", "saturation", "brightness", "warmth")
                                                          and _isnum(v) for k, v in gr.items())):
@@ -443,14 +506,17 @@ def validate_plan(plan, base_dir=None, assets=None):
         elif allowed is not None and not any(_same_file(full, a) for a in allowed):
             errs.append("%s: %s is not one of the listed assets (use only those, by their exact path)" % (where, path))
 
-    for key, kinds in (("voiceover", ("audio", "video")), ("music", ("audio",))):
+    # music may be a video file too: its soundtrack is mixed (a song saved as .mp4 or .webm)
+    for key, kinds in (("voiceover", ("audio", "video")), ("music", ("audio", "video"))):
         v = plan.get(key)
         if v is None:
             continue
         if not isinstance(v, dict):
             errs.append("%s must be an object or null" % key)
             continue
-        if v.get("src"):
+        if v.get("src") and not isinstance(v["src"], str):
+            errs.append("%s.src must be a file path or null, got %r" % (key, v["src"]))
+        elif v.get("src"):
             full = resolve_path(v["src"], base_dir)
             if not os.path.isfile(full):
                 errs.append("%s.src: file not found: %s" % (key, v["src"]))
@@ -557,9 +623,10 @@ def resolve_assets(plan, assets, base_dir=None):
     by_name = {}
     for a in full:
         by_name.setdefault(os.path.basename(a).lower(), a)
-    for b in plan.get("beats") or []:
+    beats = plan.get("beats") if isinstance(plan, dict) else None
+    for b in beats if isinstance(beats, list) else []:
         bg = b.get("background") if isinstance(b, dict) else None
-        if isinstance(bg, dict) and isinstance(bg.get("asset"), str):
+        if isinstance(bg, dict) and isinstance(bg.get("asset"), str) and bg["asset"].strip():
             p = resolve_path(bg["asset"], base_dir)
             if not os.path.isfile(p):
                 hit = by_name.get(os.path.basename(bg["asset"].replace("\\", "/")).lower())
@@ -572,7 +639,8 @@ def resolve_assets(plan, assets, base_dir=None):
 
 def _style(plan):
     st = dict(STYLE_DEFAULTS)
-    for k, v in (plan.get("style") or {}).items():
+    given = plan.get("style") if isinstance(plan.get("style"), dict) else {}
+    for k, v in given.items():
         if v is not None:
             st[k] = v
     for k in ("text", "accent", "bg", "bg2"):
@@ -585,11 +653,15 @@ def _style(plan):
 
 def _beats(plan, duration):
     """Beats sorted, gaps closed, the last one reaching the duration; returns (beats, duration)."""
-    bs = [dict(b) for b in plan.get("beats") or [] if isinstance(b, dict)
+    beats = plan.get("beats") if isinstance(plan.get("beats"), list) else []
+    bs = [dict(b) for b in beats if isinstance(b, dict)
           and _isnum(b.get("start")) and _isnum(b.get("end")) and b["end"] > b["start"]]
     bs.sort(key=lambda b: b["start"])
     if not bs:
         raise ValueError("the plan has no beats with a start and an end")
+    for b in bs:
+        if not isinstance(b.get("say"), str):
+            b["say"] = None            # only text is spoken (validate_plan reports anything else)
     if bs[0]["start"] <= 0.3:
         bs[0]["start"] = 0.0
     for a, b in zip(bs, bs[1:]):
@@ -603,15 +675,21 @@ def _beats(plan, duration):
 
 def caption_band(style, H, W):
     """(centre %, half height %) of the caption line, kept inside the safe zone."""
-    cs = style.get("caption_style") or {}
+    cs = style.get("caption_style") if isinstance(style.get("caption_style"), dict) else {}
     try:
         cap_mod = paths.load_skill("captions")
         base = dict(cap_mod.DEFAULT_CAPTION)
     except Exception:
         base = {"center_y_pct": 68.0, "font_size_pct": 4.6, "lines_per_card": 1}
-    cy = float(cs.get("center_y_pct") or base.get("center_y_pct") or 68.0)
-    size = float(cs.get("font_size_pct") or base.get("font_size_pct") or 4.6)
-    lines = int(cs.get("lines_per_card") or base.get("lines_per_card") or 1)
+
+    def num(key, default):
+        for v in (cs.get(key), base.get(key)):
+            if _isnum(v) and v > 0:
+                return float(v)
+        return default
+    cy = num("center_y_pct", 68.0)
+    size = num("font_size_pct", 4.6)
+    lines = int(num("lines_per_card", 1))
     half = size * 1.25 * max(1, lines) / 2.0 + 0.6
     top, bottom = (11.0, 80.0) if H / float(W) >= 1.5 else (8.0, 88.0) if W > H else (7.0, 88.0)
     cy = max(top + half, min(bottom - half, cy))
@@ -625,7 +703,8 @@ def _caption_style_for(style, H, W):
         cs = {}
     # None is meaningful for the colour keys ("no box"), elsewhere it means "use the default"
     cs = {k: v for k, v in cs.items()
-          if k in timeline.CAPTION_STYLE_KEYS and (v is not None or k in ("highlight", "outline", "box"))}
+          if k in timeline.CAPTION_STYLE_KEYS and (v is not None or k in ("highlight", "outline", "box"))
+          and (k not in _CAPTION_NUMBERS or v is None or _isnum(v))}
     if H / float(W) < 1.5 and "font_size_pct" not in cs:
         cs["font_size_pct"] = 6.2       # the default size is tuned for 9:16; wider frames need more of the height
     cy, _ = caption_band(dict(style, caption_style=cs), H, W)
@@ -700,7 +779,7 @@ def _overlap_share(say, calls):
         return 0.0
     shown = set()
     for c in calls:
-        for v in (c.get("params") or {}).values():
+        for v in _call_params(c).values():
             vals = v if isinstance(v, list) else [v]
             for x in vals:
                 if isinstance(x, str):
@@ -785,17 +864,21 @@ def _bg_layer(i, bg, s, e, W, H, st, base_dir, cut_every, cursor):
     """Background layers (a list: video beats may be cut into sub-shots) for one beat."""
     if not isinstance(bg, dict):
         return []
-    if bg.get("asset"):
+
+    def pair(v, lo, hi):
+        return list(v) if isinstance(v, list) and len(v) == 2 and all(_isnum(x) and lo <= x <= hi for x in v) else None
+
+    if isinstance(bg.get("asset"), str) and bg["asset"].strip():
         src = resolve_path(bg["asset"], base_dir)
         kind = media_kind(src)
-        zoom = list(bg.get("zoom") or [1.0, 1.06 if i % 2 == 0 else 1.0])
+        zoom = pair(bg.get("zoom"), 0.5, 3) or [1.0, 1.06 if i % 2 == 0 else 1.0]
         if zoom == [1.0, 1.0]:
             zoom = None
-        focus = list(bg.get("focus") or [0.5, 0.5])
+        focus = pair(bg.get("focus"), 0, 1) or [0.5, 0.5]
         if kind == "image":
             return [{"type": "image", "id": "bg.%d" % i, "src": src, "fit": "cover", "w": W, "h": H, "focus": focus,
                      "kenburns": zoom or [1.0, 1.05], "start": s, "end": e}]
-        speed = float(bg.get("speed") or 1.0)
+        speed = float(bg["speed"]) if _isnum(bg.get("speed")) and 0.1 <= bg["speed"] <= 4 else 1.0
         src_len = media_duration(src)
         length = e - s
         n = 1
@@ -818,15 +901,17 @@ def _bg_layer(i, bg, s, e, W, H, st, base_dir, cut_every, cursor):
             kb = zoom if k == 0 else ([1.06, 1.0] if k % 2 else [1.0, 1.06])
             shots.append({"type": "video", "id": "bg.%d%s" % (i, "" if n == 1 else ".%d" % (k + 1)), "src": src,
                           "in": round(t_in, 3), "speed": speed, "fit": "cover", "focus": focus, "w": W, "h": H,
-                          "volume": float(bg.get("volume") or 0.0), "kenburns": kb, "loop": loop,
+                          "volume": float(bg["volume"]) if _isnum(bg.get("volume")) and bg["volume"] >= 0 else 0.0,
+                          "kenburns": kb, "loop": loop,
                           "start": round(a, 3), "end": round(b, 3)})
             t_in += need + (0.35 if n > 1 else 0.0)        # a small jump between sub-shots reads as a cut
         cursor[src] = t_in
         return shots
-    if bg.get("color"):
+    if _hex_ok(bg.get("color")):
         return [{"type": "shape", "id": "bg.%d" % i, "shape": "rect", "w": W, "h": H, "x": W / 2.0, "y": H / 2.0,
                  "color": bg["color"].strip()[:9], "start": s, "end": e}]
-    if bg.get("gradient"):
+    grad = bg.get("gradient")
+    if isinstance(grad, list) and len(grad) >= 2 and all(_hex_ok(c) for c in grad):
         angle = float(bg.get("angle", 90) if _isnum(bg.get("angle", 90)) else 90)
         diag = math.ceil(math.hypot(W, H)) + 4
         return [{"type": "shape", "id": "bg.%d" % i, "shape": "rect", "w": diag, "h": diag, "x": W / 2.0,
@@ -926,7 +1011,7 @@ def _camera(beats, cuts, transitions, W, energy, effects):
 
 def _cta_call(plan):
     cta = plan.get("cta")
-    if not isinstance(cta, dict) or cta.get("template") not in templates.CATALOG:
+    if not isinstance(cta, dict) or not isinstance(cta.get("template"), str) or cta["template"] not in templates.CATALOG:
         return None
     for b in plan.get("beats") or []:
         for c in visual_calls(b.get("visual") if isinstance(b, dict) else None):
@@ -943,7 +1028,7 @@ def compile_plan(plan, base_dir=None):
     """
     if not isinstance(plan, dict):
         raise ValueError("the plan must be a JSON object")
-    aspect = plan.get("aspect") if plan.get("aspect") in ASPECTS else "9:16"
+    aspect = plan.get("aspect") if isinstance(plan.get("aspect"), str) and plan["aspect"] in ASPECTS else "9:16"
     W, H = ASPECTS[aspect]
     fps = int(plan["fps"]) if _isnum(plan.get("fps")) and 5 <= plan["fps"] <= 60 else 30
     st = _style(plan)
@@ -955,7 +1040,7 @@ def compile_plan(plan, base_dir=None):
     cut_every = st.get("cut_every") if _isnum(st.get("cut_every")) and st["cut_every"] >= 0.4 else None
 
     # ----- transitions, cut times
-    transitions = [None] + [b.get("transition") or "cut" for b in beats[1:]]
+    transitions = [None] + [b.get("transition") if b.get("transition") in TRANSITIONS else "cut" for b in beats[1:]]
     cuts = [b["start"] for b in beats]
     durs = []
     for i, tr in enumerate(transitions):
@@ -1011,7 +1096,7 @@ def compile_plan(plan, base_dir=None):
     for i, b in enumerate(beats):
         s, e = b["start"], b["end"]
         calls = [c for c in visual_calls(b.get("visual")) if isinstance(c, dict)
-                 and c.get("template") in templates.CATALOG]
+                 and isinstance(c.get("template"), str) and c["template"] in templates.CATALOG]
         if cta is not None and i == len(beats) - 1:
             if calls and e - s >= 2.4:
                 split = round(s + (e - s) * 0.5, 3)
@@ -1028,13 +1113,14 @@ def compile_plan(plan, base_dir=None):
             cap_words.extend(beat_words[i])
         for j, c in enumerate(calls):
             name = c["template"]
-            missing = [k for k in REQUIRED_NUMBERS.get(name, []) if _blank((c.get("params") or {}).get(k))]
+            given = _call_params(c)            # numbers that are not finite count as not given
+            missing = [k for k in REQUIRED_NUMBERS.get(name, []) if _blank(given.get(k))]
             if missing:
                 notes.append("beat %d: %s dropped (no %s given; numbers are never invented)"
                              % (i + 1, name, ", ".join(missing)))
                 continue
             ctx = {"words": beat_words[i]}
-            params = _fill_params(name, c.get("params") or {}, ctx)
+            params = _fill_params(name, given, ctx)
             if show_caps and not hide:
                 params = _avoid_captions(name, params, cy, half, H, W)
             ts = s + (float(c["start"]) if _isnum(c.get("start")) else 0.0)
@@ -1060,7 +1146,7 @@ def compile_plan(plan, base_dir=None):
         layers += _ambient_layers(_ranges(flags), W, H, st)
     layers += bg_layers
     footage = _ranges([(s, e, not f) for s, e, f in flags])
-    layers += _scrim_layers(footage, W, H, float(st.get("scrim") or 0.0))
+    layers += _scrim_layers(footage, W, H, float(st["scrim"]) if _isnum(st.get("scrim")) else 0.0)
     layers += tpl_layers
     if st.get("progress_bar"):
         for L in templates.build("progress_bar", {"position": "top"}, 0.0, D, canvas, tstyle):
@@ -1087,10 +1173,10 @@ def compile_plan(plan, base_dir=None):
         at = max(0.0, cuts[i] - SFX_LEAD.get(name, 0.0))
         audio.append({"sfx": name, "start": round(at, 3), "volume": round(SFX_VOLUME.get(name, 0.5) * vol_k, 3),
                       "role": "sfx"})
-    if vo.get("src"):
+    if isinstance(vo.get("src"), str) and vo["src"].strip():
         audio.append({"src": resolve_path(vo["src"], base_dir), "start": 0.0, "role": "voice", "volume": 1.0})
     mu = plan.get("music") if isinstance(plan.get("music"), dict) else {}
-    if mu.get("src"):
+    if isinstance(mu.get("src"), str) and mu["src"].strip():
         audio.append({"src": resolve_path(mu["src"], base_dir), "start": 0.0, "role": "music", "duck": True, "loop": True,
                       "volume": float(mu["volume"]) if _isnum(mu.get("volume")) else 0.22,
                       "in": float(mu["in"]) if _isnum(mu.get("in")) else 0.0,
@@ -1292,7 +1378,15 @@ def headline(text, max_words=7, cap=True):
             cut = max((i for i in range(2, max_words + 1) if _clause_start(words, i)), default=max_words)
             s = " ".join(_trim_dangling(words[:cut]))
         s = re.sub(r"[,;:]+$", "", s)
-    return s[:1].upper() + s[1:] if cap else s
+    return _cap_first(s) if cap else s
+
+
+def _cap_first(s):
+    """s with its first letter upper case, except a word that has its own casing ("iPhone", "eBay")."""
+    first = s.split(" ", 1)[0]
+    if any(c.isupper() for c in first[1:]):
+        return s
+    return s[:1].upper() + s[1:]
 
 
 def cta_text(text, max_words=7):
@@ -1312,7 +1406,7 @@ def cta_text(text, max_words=7):
             break
     words = _trim_dangling(words[:max_words], keep=1)
     out = re.sub(r"[.;,:!?]+$", "", " ".join(words)).strip()
-    return out[:1].upper() + out[1:] if out else headline(text, 5)
+    return _cap_first(out) if out else headline(text, 5)
 
 
 def _power_words(text):
@@ -1463,13 +1557,48 @@ _KIND_SFX = {"hook": "boom", "number": "hit", "list": "pop", "question": "pop", 
              "cta": "ding", "versus": "hit", "quote": None, "plain": None}
 
 
-def asset_rows(assets):
-    """[{"path", "kind", "duration"}] for the existing video and image files among `assets`."""
+def unreadable_reason(path, kind):
+    """Why a video or image file cannot be drawn ("no video stream ffprobe can read"), or None when it can.
+
+    Videos are probed with ffprobe (when ffprobe is missing nothing is
+    claimed: the file is kept); images are opened and verified with Pillow.
+    """
+    if kind == "image":
+        try:
+            from PIL import Image
+            with Image.open(path) as im:
+                im.verify()
+        except ImportError:
+            return None
+        except Exception as e:                 # Pillow raises many kinds for a broken or unsupported file
+            return "not an image Pillow can open (%s)" % (str(e).splitlines()[0][:120] if str(e) else type(e).__name__)
+        return None
+    if kind == "video":
+        if not shutil.which("ffprobe"):
+            return None
+        info = timeline.probe(path)
+        if not info or not info.get("has_video"):
+            return "no video stream ffprobe can read (a damaged, unfinished or renamed file?)"
+    return None
+
+
+def asset_rows(assets, skipped=None):
+    """[{"path", "kind", "duration"}] for the existing, readable video and image files among `assets`.
+
+    A file that exists with a media extension but cannot be decoded is left
+    out (it would fail the whole render); `skipped`, a list, gets a
+    (path, reason) for each.
+    """
     rows = []
     for a in assets or []:
         p = os.path.abspath(a)
         k = media_kind(p)
         if k in ("video", "image") and os.path.isfile(p):
+            why = unreadable_reason(p, k)
+            if why:
+                if skipped is not None:
+                    skipped.append((p, why))
+                continue
             rows.append({"path": p, "kind": k, "duration": media_duration(p) if k == "video" else None})
     return rows
 
@@ -1510,8 +1639,9 @@ def heuristic_plan(prompt, script=None, style=None, duration=30, assets=None, as
     energy = st["energy"]
     wpm = st["wpm"] if _isnum(st.get("wpm")) and 80 <= st["wpm"] <= 320 else DEFAULT_WPM
     target = float(duration) if _isnum(duration) and duration > 0 else 30.0
-    rows = asset_rows(assets)
-    notes = []
+    skipped = []
+    rows = asset_rows(assets, skipped)
+    notes = ["asset %s could not be read, skipped: %s" % (os.path.basename(p), why) for p, why in skipped]
 
     if words:
         sents = sentences_from_words(words)

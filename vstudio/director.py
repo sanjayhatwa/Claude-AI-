@@ -12,15 +12,17 @@ a brief, a plan, a timeline, a rendered reel and a QA report out.
 The five stages (each prints one status line, as PROGRESS n% for the studio):
 
  1. Analyze every input. A link is downloaded with yt-dlp (one video, mp4,
-    plus its captions when the platform has them) into DIR/inputs; a file
-    is used in place (a caption file next to it with the same name, .srt,
-    .vtt, .json3 or .words.json, is its transcript); a folder or a
-    style_dna.json from an earlier analysis is reused as it is. viral-extract
-    (extract.py, run as a subprocess) measures each one into
-    DIR/analysis/<ref|competitor>N/: on-screen text (caption font look,
-    size, position, colours, words per card) and dialogue (pace, hook,
-    re-hooks); ReelMimic's analyze.py, run alongside, gives the edit (cuts,
-    shots, camera, BPM, look), read here by edit_from_report().
+    plus its captions when the platform has them) into DIR/inputs, with the
+    link recorded next to it (a re-run with the same link reuses the file,
+    a new link replaces it); a file is used in place (a caption file next
+    to it with the same name, .srt, .vtt, .json3 or .words.json, is its
+    transcript); a folder or a style_dna.json from an earlier analysis is
+    reused as it is. viral-extract (extract.py, run as a subprocess)
+    measures each one into DIR/analysis/<ref|competitor>N/: on-screen text
+    (caption font look, size, position, colours, words per card) and
+    dialogue (pace, hook, re-hooks); ReelMimic's analyze.py, run
+    alongside, gives the edit (cuts, shots, camera, BPM, look), read here
+    by edit_from_report().
  2. BRIEF.md: style targets merged from the references (cut rate, shot
     length, caption style -> plan.style.caption_style, font, palette from
     the footage's dominant colours and the caption colours, words per
@@ -47,6 +49,11 @@ The five stages (each prints one status line, as PROGRESS n% for the studio):
 
 References and competitors are only measured: their footage, audio and
 words never go into the reel (backgrounds may only be the given assets).
+An asset that cannot be decoded (a damaged, unfinished or renamed file) is
+skipped with a note instead of failing the render. --music and --voice may
+be audio or video files (their sound is used); a voiceover's words come
+from a captions or words file next to it (transcribe.load_words: SRT, VTT,
+json3, {w,s,e} / {word,start,end} lists, whisper segments) or faster-whisper.
 
 Limits: measuring needs ffmpeg (and OCR for text); downloads need yt-dlp and
 a platform that serves the video without a login; a transcript needs a
@@ -58,7 +65,6 @@ import argparse
 import collections
 import colorsys
 import concurrent.futures
-import importlib
 import importlib.util
 import json
 import math
@@ -144,21 +150,44 @@ def _sidecar(video):
     return None
 
 
+def _have_ytdlp():
+    return importlib.util.find_spec("yt_dlp") is not None
+
+
 def download(url, dest_stem, log=None, timeout=900):
-    """One video from a link as mp4 (yt-dlp), plus its captions when available: (video, captions or None)."""
-    if importlib.util.find_spec("yt_dlp") is None:
-        raise DirectorError("downloading links needs yt-dlp (pip install yt-dlp); or download the video yourself "
-                            "and pass the file")
+    """One video from a link as mp4 (yt-dlp), plus its captions when available: (video, captions or None).
+
+    The files are kept as <dest_stem>.mp4 (and .vtt/.srt/.json3) with the
+    link in <dest_stem>.source.json, so a re-run with the same link reuses
+    them (captions are fetched once) and a different link replaces them.
+    """
     folder = os.path.dirname(dest_stem)
     os.makedirs(folder, exist_ok=True)
     base = os.path.basename(dest_stem)
+    source_file = dest_stem + ".source.json"
 
     def found(exts):
         hits = [os.path.join(folder, f) for f in sorted(os.listdir(folder))
                 if f.startswith(base + ".") and f.lower().endswith(exts) and not f.endswith(".part")]
         return hits[0] if hits else None
 
+    source = _read_json(source_file, {}) or {}
+    if not isinstance(source, dict) or source.get("url") != url:
+        # files from another link (or from a version that did not record it): never measure those for this one
+        for f in os.listdir(folder):
+            if f.startswith(base + "."):
+                try:
+                    os.remove(os.path.join(folder, f))
+                except OSError:
+                    pass
+        source = {"url": url}
     video = found(planner.VIDEO_EXT)
+    caps = found((".json3", ".vtt", ".srt"))
+    if video and (caps or source.get("captions_tried") or not _have_ytdlp()):
+        return video, caps
+    if not _have_ytdlp():
+        raise DirectorError("downloading links needs yt-dlp (pip install yt-dlp); or download the video yourself "
+                            "and pass the file")
     if not video:
         _say(log, "  downloading %s" % url)
         cmd = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--no-warnings", "--quiet", "-f",
@@ -172,16 +201,18 @@ def download(url, dest_stem, log=None, timeout=900):
         if r.returncode != 0 or not video:
             msg = (r.stderr or r.stdout or "").strip().splitlines()
             raise DirectorError("could not download %s: %s" % (url, msg[-1] if msg else "no file"))
-    caps = found((".json3", ".vtt", ".srt"))
+        _write_json(source_file, source)
     if not caps:
         cmd = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--no-warnings", "--quiet", "--skip-download",
                "--write-subs", "--write-auto-subs", "--sub-langs", "en.*,en", "--sub-format", "json3/vtt/srt/best",
                "-o", dest_stem + ".%(ext)s", url]
         try:
             subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            source["captions_tried"] = True     # a video without captions is not asked again on every run
         except subprocess.TimeoutExpired:
             pass
         caps = found((".json3", ".vtt", ".srt"))
+        _write_json(source_file, source)
     return video, caps
 
 
@@ -680,11 +711,13 @@ PLAN_SCHEMA = {
             "type": "object", "required": ["start", "end", "say", "visual", "background", "transition", "sfx", "camera"],
             "properties": {
                 "start": {"type": "number"}, "end": {"type": "number"}, "say": {"type": ["string", "null"]},
-                "visual": {"type": ["object", "array", "null"]}, "background": {"type": ["object", "null"]},
+                "visual": {"type": ["object", "array", "null"], "required": ["template", "params"],
+                           "properties": _CALL["properties"], "items": _CALL},
+                "background": {"type": ["object", "null"]},
                 "transition": {"type": ["string", "null"], "enum": planner.TRANSITIONS + [None]},
                 "sfx": {"type": ["string", "null"], "enum": list(sfx.NAMES) + [None]},
                 "camera": {"type": ["string", "null"], "enum": planner.CAMERAS + [None]}}}},
-        "cta": {"type": ["object", "null"]},
+        "cta": {"type": ["object", "null"], "required": ["template", "params"], "properties": _CALL["properties"]},
         "notes": {"type": "string"},
     },
 }
@@ -744,30 +777,58 @@ def _ngrams(tokens, n=7):
     return {" ".join(tokens[i:i + n]) for i in range(len(tokens) - n + 1)}
 
 
+_NUMBER_TOKEN = re.compile(r"\d[\d,]*(?:\.\d+)?")
+# number-typed template params that put a number on screen; every other number param is layout or timing
+# (x, y, w, h, size, tilt, times, duration, decimals...) and says nothing about the creator's results
+_NUMERIC_PARAMS = {"value", "from", "values", "results", "price", "old_price", "number", "likes", "comments"}
+_LAYOUT_EXCEPTIONS = {("progress_bar", "from"), ("progress_bar", "to")}     # fill fractions, never drawn as text
+_PATH_PARAMS = {"image", "src"}                                             # file names, not on-screen text
+
+
+def _shows_content(template, key):
+    """True when a template param is something the viewer reads (text, or a number shown as a fact)."""
+    spec = templates.CATALOG.get(template, {}).get("params", {}).get(key) if isinstance(template, str) else None
+    if spec is None:
+        return False                    # unknown template or param: never drawn, and validate_plan reports it
+    t = spec["type"]
+    if t in ("str", "list[str]", "highlight"):
+        return key not in _PATH_PARAMS
+    if t in ("int", "float", "list[float]"):
+        return key in _NUMERIC_PARAMS and (template, key) not in _LAYOUT_EXCEPTIONS
+    return False                        # colours, choices, switches
+
+
 def _plan_texts(plan):
-    """(where, text) of every spoken line and every template string in a plan."""
+    """(where, text) of every spoken line and every on-screen template value in a plan.
+
+    Layout and style params (positions, sizes, word times, colours, choices)
+    are left out: they are not content, so they are never "invented numbers".
+    Malformed parts (params that are not an object) are skipped: validate_plan reports them.
+    """
     out = []
-    for i, b in enumerate(plan.get("beats") or []):
+
+    def call_texts(prefix, c):
+        if not isinstance(c, dict) or not isinstance(c.get("params"), dict):
+            return
+        name = c.get("template")
+        for k, v in c["params"].items():
+            if not _shows_content(name, k):
+                continue
+            for x in (v if isinstance(v, list) else [v]):
+                if isinstance(x, (str, int, float)) and not isinstance(x, bool):
+                    out.append(("%s %s.%s" % (prefix, name, k), str(x)))
+
+    beats = plan.get("beats") if isinstance(plan, dict) else None
+    for i, b in enumerate(beats if isinstance(beats, list) else []):
         if not isinstance(b, dict):
             continue
         if isinstance(b.get("say"), str):
             out.append(("beats[%d].say" % i, b["say"]))
         for c in planner.visual_calls(b.get("visual")):
-            if isinstance(c, dict):
-                for k, v in (c.get("params") or {}).items():
-                    for x in (v if isinstance(v, list) else [v]):
-                        if isinstance(x, (str, int, float)) and not isinstance(x, bool):
-                            out.append(("beats[%d].visual %s.%s" % (i, c.get("template"), k), str(x)))
-    cta = plan.get("cta")
-    if isinstance(cta, dict):
-        for k, v in (cta.get("params") or {}).items():
-            if isinstance(v, str):
-                out.append(("cta.%s" % k, v))
+            call_texts("beats[%d].visual" % i, c)
+    if isinstance(plan, dict):
+        call_texts("cta", plan.get("cta"))
     return out
-
-
-_NUMBER_TOKEN = re.compile(r"\d[\d,]*(?:\.\d+)?")
-_NUMERIC_PARAMS = {"value", "from", "values", "results", "price", "old_price", "number", "likes", "comments"}
 
 
 def invented_numbers(plan, sources):
@@ -776,9 +837,6 @@ def invented_numbers(plan, sources):
     have |= {str(int(float(x))) for x in have if re.fullmatch(r"\d+(\.0+)?", x)}
     errs = []
     for where, text in _plan_texts(plan):
-        key = where.rsplit(".", 1)[-1]
-        if ".visual " in where and key not in _NUMERIC_PARAMS and not re.search(r"\d", text):
-            continue
         for tok in _NUMBER_TOKEN.findall(text):
             t = tok.replace(",", "").rstrip(".")
             try:
@@ -909,7 +967,8 @@ def _apply_targets(plan, targets, aspect, voice=None, voice_words=None, music=No
     if voice:
         plan["voiceover"] = {"src": voice, "words": voice_words or None}
     if music:
-        plan["music"] = {"src": music, "volume": (plan.get("music") or {}).get("volume") or 0.22}
+        vol = (plan.get("music") if isinstance(plan.get("music"), dict) else {}).get("volume")
+        plan["music"] = {"src": music, "volume": vol if _num(vol) is not None and 0 < vol <= 2 else 0.22}
     return plan
 
 
@@ -1078,31 +1137,30 @@ def qa_report(video, spec, spec_path, plan, targets, out_dir, duration, preview=
 
 # =========================================================================== the whole flow
 
-def _voice_words(voice, log=None):
-    """Timed words of a voiceover: a caption file next to it, vstudio.transcribe, or faster-whisper; else None."""
-    side = _sidecar(voice)
+def _voice_words(voice, log=None, notes=None):
+    """Timed words [{"w", "s", "e"}] of a voiceover, or None.
+
+    transcribe.load_words reads them: a captions or words file next to the
+    recording (.srt, .vtt, .json3, .words.json in any documented shape:
+    {w,s,e}, {word,start,end}, whisper segments), else faster-whisper. The
+    words come back cleaned (sorted, non-overlapping, no blanks). What was
+    tried and failed goes to the log; a transcript file that is there but
+    could not be read also goes to `notes` (a list), for the brief.
+    """
+    from . import transcribe
+    side = transcribe.find_sidecar(voice)
     try:
-        ex = paths.load_skill("extract")
-    except Exception:
-        ex = None
-    if side and ex is not None:
-        try:
-            return ex.load_captions(side) or None
-        except Exception:
-            pass
-    try:
-        tr = importlib.import_module("vstudio.transcribe")
-        words = tr.get_words(media=voice)
-        if words:
-            return words
-    except Exception:
-        pass
-    if ex is not None:
-        try:
-            return ex.whisper_words(voice) or None
-        except Exception:
-            return None
-    return None
+        words, source, problems = transcribe.load_words(media=voice)
+    except Exception as e:               # whisper's own failures are caught inside; this is anything else
+        words, source, problems = None, None, ["could not read the voiceover's words: %s" % e]
+    for p in problems:
+        _say(log, "  voiceover: %s" % p)
+        if notes is not None and side and side in p:
+            notes.append("the voiceover's transcript could not be used: %s" % p)
+    if not words:
+        return None
+    _say(log, "  voiceover words from %s" % source)
+    return transcribe.strip(words)
 
 
 def _read_script(script):
@@ -1139,16 +1197,26 @@ def make_reel(prompt, refs=(), competitors=(), assets=(), script=None, voice=Non
     os.makedirs(out_dir, exist_ok=True)
     notes = []
     script_text = _read_script(script)
-    asset_rows = planner.asset_rows(assets)
+    unreadable = []
+    asset_rows = planner.asset_rows(assets, unreadable)
     for a in assets or []:
         if not os.path.isfile(a):
             notes.append("asset not found, skipped: %s" % a)
         elif planner.media_kind(a) not in ("video", "image"):
             notes.append("asset %s is not a video or image (pass music with --music), skipped" % a)
-    if music and not os.path.isfile(music):
-        raise DirectorError("music file not found: %s" % music)
-    if voice and not os.path.isfile(voice):
-        raise DirectorError("voice file not found: %s" % voice)
+    for a, why in unreadable:
+        notes.append("asset %s could not be read, skipped: %s" % (a, why))
+    # the director owns the music and voice tracks: check them once here, never in Claude's answers; absolute,
+    # because the plan's paths resolve against the project folder, not the folder the command ran in
+    music = os.path.abspath(music) if music else None
+    voice = os.path.abspath(voice) if voice else None
+    for what, f in (("music", music), ("voice", voice)):
+        if not f:
+            continue
+        if not os.path.isfile(f):
+            raise DirectorError("%s file not found: %s" % (what, f))
+        if planner.media_kind(f) not in ("audio", "video"):
+            raise DirectorError("%s must be an audio file (or a video with sound), got %s" % (what, f))
     if not (prompt or script_text or plan):
         raise DirectorError("give a prompt, a script or a plan")
 
@@ -1171,7 +1239,7 @@ def make_reel(prompt, refs=(), competitors=(), assets=(), script=None, voice=Non
     # ----- voice and length
     voice_words = None
     if voice:
-        voice_words = _voice_words(voice, log)
+        voice_words = _voice_words(voice, log, notes)
         vlen = planner.media_duration(voice)
         if voice_words:
             duration = max(voice_words[-1]["e"] + 0.5, 1.0)
@@ -1205,7 +1273,8 @@ def make_reel(prompt, refs=(), competitors=(), assets=(), script=None, voice=Non
             raise DirectorError("the plan is not a JSON object: %s" % plan)
         base = os.path.dirname(os.path.abspath(plan_path_in)) if plan_path_in else out_dir
         planner.resolve_assets(the_plan, allowed or [], base)
-        for b in the_plan.get("beats") or []:           # make asset paths absolute so plan.json moves safely
+        for b in the_plan.get("beats") if isinstance(the_plan.get("beats"), list) else []:
+            # make asset paths absolute so plan.json moves safely
             bg = b.get("background") if isinstance(b, dict) else None
             if isinstance(bg, dict) and isinstance(bg.get("asset"), str):
                 bg["asset"] = planner.resolve_path(bg["asset"], base)
@@ -1232,6 +1301,13 @@ def make_reel(prompt, refs=(), competitors=(), assets=(), script=None, voice=Non
             def check(p):
                 if not isinstance(p, dict):
                     return ["the answer must be one JSON object (the plan)"]
+                try:
+                    return plan_problems(p)
+                except Exception as e:        # a shape no check foresaw: it goes back to Claude, never a crash
+                    return ["the plan could not be checked (%s: %s); follow the PLAN format exactly"
+                            % (type(e).__name__, str(e)[:200])]
+
+            def plan_problems(p):
                 _apply_targets(p, targets, aspect, voice, voice_words, music)
                 planner.resolve_assets(p, allowed, out_dir)
                 errs = planner.validate_plan(p, base_dir=out_dir, assets=allowed)
@@ -1271,6 +1347,9 @@ def make_reel(prompt, refs=(), competitors=(), assets=(), script=None, voice=Non
             hstyle = dict(targets.get("style") or {})
             the_plan = planner.heuristic_plan(prompt, script_text, hstyle, duration, allowed, aspect, words=voice_words)
             _apply_targets(the_plan, targets, aspect, voice, voice_words, music)
+            plan_errors = planner.validate_plan(the_plan, base_dir=out_dir, assets=allowed)
+            for e in plan_errors:
+                notes.append("offline plan: " + e)
             # the offline planner never writes content of its own: say so when the reel comes out short
             if "shorter than" in str(the_plan.get("notes") or ""):
                 notes.append("%s. For a full-length reel give the spoken lines with --script FILE, or plan with "
@@ -1284,6 +1363,11 @@ def make_reel(prompt, refs=(), competitors=(), assets=(), script=None, voice=Non
         spec = planner.compile_plan(the_plan, base_dir=out_dir)
     except ValueError as e:
         raise DirectorError("the plan could not be compiled: %s" % e)
+    except Exception as e:
+        if not plan_errors:
+            raise                          # a valid plan that does not compile is a bug: keep the traceback
+        raise DirectorError("the plan could not be compiled (%s: %s); fix these first:\n- %s"
+                            % (type(e).__name__, e, "\n- ".join(plan_errors)))
     spec_errors = timeline.validate(spec)
     spec_path = os.path.join(out_dir, "spec.json")
     timeline.save(spec, spec_path)
